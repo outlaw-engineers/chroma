@@ -902,3 +902,67 @@ async fn late_joining_node_downloads_history_in_order() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// A restarted node must come back with the same chain and balances, without
+/// revalidating every block it already accepted.
+#[tokio::test]
+async fn node_restart_restores_chain_and_balances() {
+    let secret = SecretKey32::generate();
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let payout = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+
+    let dir = temp_dir("restart");
+    let params = chroma_consensus::ChainParams::regtest();
+    let build = |mining: bool| {
+        NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+            .with_params(params)
+            .with_data_dir(dir.clone())
+            .with_mining(mining)
+            .with_miner_address(payout)
+    };
+
+    let mut node = Node::new(build(true));
+    node.run().await.expect("node failed to start");
+    wait_for("the node to mine a few blocks", || async {
+        node.chain_height() >= 3
+    })
+    .await;
+
+    let (height, tip, balance, supply) = {
+        let cs = node.chain_state();
+        let cs = cs.read().await;
+        (
+            cs.tip.height.0,
+            cs.tip.hash,
+            cs.state.get_account(&payout).balance,
+            cs.state.total_supply(),
+        )
+    };
+    assert!(balance > 0, "the miner should have earned something");
+    node.shutdown().await;
+    // sled holds the directory lock until the node is dropped, so the restart
+    // cannot open it while the first node is still alive.
+    drop(node);
+    tokio::task::yield_now().await;
+
+    // Reopen the same directory.
+    let restarted = Node::new(build(false));
+    let cs = restarted.chain_state();
+    let cs = cs.read().await;
+    assert_eq!(cs.tip.height.0, height, "height must survive a restart");
+    assert_eq!(cs.tip.hash, tip, "the tip must survive a restart");
+    assert_eq!(
+        cs.state.get_account(&payout).balance,
+        balance,
+        "balances must survive a restart"
+    );
+    assert_eq!(cs.state.total_supply(), supply);
+    assert_eq!(
+        cs.state.compute_state_root(),
+        cs.tip.header.state_root,
+        "the restored state must match what the tip committed to"
+    );
+    drop(cs);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

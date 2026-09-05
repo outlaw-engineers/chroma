@@ -301,36 +301,25 @@ impl Node {
 
         match storage.get_tip() {
             Ok(Some(persisted_tip)) => {
-                // Replay the stored chain to rebuild state, headers and the
-                // block index together. The previous restore only credited a
-                // dummy address with one subsidy, so a restarted node came
-                // back with account balances that were simply wrong.
-                let mut chain = ChainState::with_params(params);
-                let source = StorageBlocks(storage);
-                let mut restored = 0u32;
-
-                for height in 1..=persisted_tip.height {
-                    match storage.get_block_by_height(height) {
-                        Ok(Some(block)) => match chain.apply_block_with(&block, &source) {
-                            Ok(_) => restored = height,
-                            Err(e) => {
-                                eprintln!(
-                                    "Stopping restore at height {}: {}",
-                                    height, e
-                                );
-                                break;
-                            }
-                        },
-                        _ => break,
+                // Prefer the persisted state: revalidating every block on
+                // startup costs the whole chain's validation time, which grows
+                // without bound. The stored accounts are trusted only after
+                // their root matches the tip header, so a truncated or
+                // corrupted state falls back to a full replay.
+                match Self::restore_from_state(storage, params, &persisted_tip) {
+                    Some(chain) => {
+                        println!(
+                            "Loaded chain from storage: height={}, supply={} units",
+                            chain.tip.height.0,
+                            chain.state.total_supply()
+                        );
+                        chain
+                    }
+                    None => {
+                        println!("Stored state did not verify; replaying the chain");
+                        Self::replay_from_storage(storage, params, persisted_tip.height)
                     }
                 }
-
-                println!(
-                    "Loaded chain from storage: height={}, supply={} units",
-                    restored,
-                    chain.state.total_supply()
-                );
-                chain
             }
             _ => {
                 let chain = ChainState::with_params(params);
@@ -365,6 +354,86 @@ impl Node {
                 chain
             }
         }
+    }
+
+    /// Rebuild chain state from the persisted accounts, verifying it against
+    /// the tip header's state root.
+    ///
+    /// Returns `None` when anything does not line up, leaving the caller to
+    /// replay instead.
+    fn restore_from_state(
+        storage: &chroma_storage::Storage,
+        params: chroma_consensus::ChainParams,
+        persisted_tip: &chroma_storage::PersistedTip,
+    ) -> Option<chroma_consensus::ChainState> {
+        use chroma_consensus::{BlockIndexEntry, ChainState, ChainTip};
+        use chroma_core::types::BlockHeight;
+        use chroma_core::u256::U256;
+
+        let tip_header = storage.get_header(persisted_tip.height).ok()??;
+        if tip_header.hash() != persisted_tip.hash {
+            return None;
+        }
+
+        let state = storage.load_state().ok()?;
+        if state.compute_state_root() != tip_header.state_root {
+            return None;
+        }
+
+        // Headers are cheap to re-read, and the work per block follows from
+        // the target each header declares — no state needed.
+        let mut chain = ChainState::with_params(params);
+        let mut cumulative = chain.tip.cumulative_work;
+        for height in 1..=persisted_tip.height {
+            let header = storage.get_header(height).ok()??;
+            let work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+                &header.bits.to_full_target(),
+            ));
+            cumulative = cumulative.checked_add(&work)?;
+            chain.index.insert(
+                header.hash(),
+                BlockIndexEntry {
+                    header: header.clone(),
+                    cumulative_work: cumulative,
+                },
+            );
+            chain.headers.insert(height, header);
+        }
+
+        chain.state = state;
+        chain.tip = ChainTip {
+            height: BlockHeight(persisted_tip.height),
+            hash: persisted_tip.hash,
+            header: tip_header,
+            cumulative_work: cumulative,
+            supply: chain.state.total_supply(),
+        };
+        chain.tips.insert(chain.tip.hash, chain.tip.clone());
+        Some(chain)
+    }
+
+    /// Rebuild chain state by revalidating every stored block.
+    fn replay_from_storage(
+        storage: &chroma_storage::Storage,
+        params: chroma_consensus::ChainParams,
+        height: u32,
+    ) -> chroma_consensus::ChainState {
+        use chroma_consensus::ChainState;
+
+        let mut chain = ChainState::with_params(params);
+        let source = StorageBlocks(storage);
+        for h in 1..=height {
+            match storage.get_block_by_height(h) {
+                Ok(Some(block)) => {
+                    if let Err(e) = chain.apply_block_with(&block, &source) {
+                        eprintln!("Stopping replay at height {}: {}", h, e);
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        chain
     }
 
     pub fn storage(&self) -> &chroma_storage::Storage {
@@ -497,6 +566,10 @@ impl Node {
     ///
     /// Safe to call more than once, and safe to call on a node that was never
     /// started.
+    ///
+    /// The database lock is held until the `Node` itself is dropped: sled
+    /// takes it exclusively, so another `Node` cannot open the same data
+    /// directory until this one is gone.
     pub async fn shutdown(&mut self) {
         // A send error just means no task is listening; shutdown proceeds.
         let _ = self.shutdown_tx.send(());

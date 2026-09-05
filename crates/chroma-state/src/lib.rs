@@ -42,8 +42,12 @@ impl Account {
         buf
     }
 
+    /// Decode an account from its 16-byte stored form.
+    pub fn decode_stored(data: &[u8]) -> Result<Self> {
+        Self::decode_value(data)
+    }
+
     /// Decode account from 16 bytes
-    #[allow(dead_code)]
     fn decode_value(data: &[u8]) -> Result<Self> {
         if data.len() != 16 {
             return Err(CoreError::Serialization(format!(
@@ -109,6 +113,20 @@ impl State {
     /// Number of accounts with state.
     pub fn account_count(&self) -> usize {
         self.accounts.len()
+    }
+
+    /// Install an account when rebuilding state from storage.
+    ///
+    /// Bypasses the transition rules on purpose: the caller is restoring a
+    /// state that was already validated, and must verify the resulting state
+    /// root before trusting it.
+    pub fn restore_account(&mut self, address: &Address, account: Account) {
+        self.set_account(address, account);
+    }
+
+    /// Set the total supply when rebuilding state from storage.
+    pub fn restore_supply(&mut self, supply: u64) {
+        self.total_supply = supply;
     }
 
     /// Set account (used by state transitions and genesis).
