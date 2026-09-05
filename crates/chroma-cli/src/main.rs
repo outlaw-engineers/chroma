@@ -43,6 +43,34 @@ enum Commands {
         #[arg(short, long, default_value = "default")]
         name: String,
     },
+    /// Build, sign and submit a transaction.
+    Tx {
+        #[command(subcommand)]
+        command: TxCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TxCommands {
+    Send {
+        /// Sender's secret key, hex encoded.
+        #[arg(long)]
+        secret: String,
+        /// Recipient address (bech32m chr1... or 0x hex).
+        #[arg(long)]
+        to: String,
+        /// Amount in units (1 CHR = 1,000,000 units).
+        #[arg(long)]
+        amount: u64,
+        /// Node to submit to.
+        #[arg(long, default_value = "127.0.0.1:8333")]
+        node: SocketAddr,
+        /// Sender's next nonce. Read from --data-dir when omitted.
+        #[arg(long)]
+        nonce: Option<u64>,
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -96,6 +124,131 @@ fn bech32_to_address(s: &str) -> Option<chroma_core::types::Address> {
             chroma_core::hash::Hash160(h),
         ))
     }
+}
+
+/// Open a node's database for reading.
+///
+/// sled takes an exclusive lock, so this fails while a node is running on the
+/// same directory. Querying a live node needs the RPC layer the spec leaves
+/// open (§13); until then, stop the node or pass the value explicitly.
+fn open_storage(data_dir: &std::path::Path) -> anyhow::Result<chroma_storage::Storage> {
+    chroma_storage::Storage::open(data_dir).map_err(|e| {
+        let hint = if e.to_string().contains("lock") {
+            " (a node is running on this data directory; stop it first)"
+        } else {
+            ""
+        };
+        anyhow::anyhow!("cannot open {}: {}{}", data_dir.display(), e, hint)
+    })
+}
+
+/// Submit a signed transaction to a node over the P2P protocol.
+///
+/// There is no RPC yet (spec §13 leaves it open), so the CLI speaks the same
+/// wire protocol a peer would: handshake, send the transaction, and wait long
+/// enough for the node to have processed it.
+async fn submit_transaction(
+    node: SocketAddr,
+    tx: &chroma_tx::Transaction,
+) -> anyhow::Result<()> {
+    use chroma_core::serialize::CanonicalEncode;
+    use chroma_p2p::wire::{decode_frame, FrameDecode, Message, MessageType, VersionMessage};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(node).await?;
+
+    let version = VersionMessage {
+        version: chroma_p2p::PROTOCOL_VERSION,
+        services: 0,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        height: 0,
+        // Our own listen port is meaningless here: we are a client, not a
+        // peer to dial back.
+        nonce: rand_nonce(),
+        listen_port: 0,
+    };
+    stream
+        .write_all(&Message::new(MessageType::Version, version.encode()).encode())
+        .await?;
+
+    // Wait for the node's verack before sending, so the transaction is not
+    // dropped by a peer that has not finished the handshake.
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut ready = false;
+    while !ready {
+        loop {
+            match decode_frame(&buf) {
+                Ok(FrameDecode::Complete { message, consumed }) => {
+                    buf.drain(..consumed);
+                    if message.msg_type == MessageType::VerAck {
+                        ready = true;
+                    }
+                    if message.msg_type == MessageType::Version {
+                        stream
+                            .write_all(&Message::new(MessageType::VerAck, vec![]).encode())
+                            .await?;
+                    }
+                }
+                Ok(FrameDecode::Incomplete { .. }) => break,
+                Err(e) => anyhow::bail!("node sent a malformed frame: {}", e),
+            }
+        }
+        if ready {
+            break;
+        }
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out waiting for the node's handshake"))??;
+        if n == 0 {
+            anyhow::bail!("node closed the connection during the handshake");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    stream
+        .write_all(&Message::new(MessageType::Tx, tx.encode()).encode())
+        .await?;
+    stream.flush().await?;
+
+    // Give the node a moment to read and validate before we hang up; a reject
+    // arrives on this connection if it did not like it.
+    let listen = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        stream.read(&mut chunk),
+    )
+    .await;
+    if let Ok(Ok(n)) = listen {
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(FrameDecode::Complete { message, consumed }) = decode_frame(&buf) {
+            buf.drain(..consumed);
+            if message.msg_type == MessageType::Reject {
+                if let Ok(reject) = chroma_p2p::wire::RejectMessage::decode(&message.payload) {
+                    anyhow::bail!("node rejected the transaction: {}", reject.reason);
+                }
+                anyhow::bail!("node rejected the transaction");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn rand_nonce() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    );
+    h.finish()
 }
 
 #[tokio::main]
@@ -214,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 };
-                match chroma_storage::Storage::open(&data_dir) {
+                match open_storage(&data_dir) {
                     Ok(storage) => {
                         match storage.get_account(&addr) {
                             Ok(Some(account)) => {
@@ -232,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to open database at {}: {}", data_dir.display(), e);
+                        eprintln!("{}", e);
                         std::process::exit(1);
                     }
                 }
@@ -240,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Block { command } => match command {
             BlockCommands::Height { data_dir } => {
-                match chroma_storage::Storage::open(&data_dir) {
+                match open_storage(&data_dir) {
                     Ok(storage) => {
                         match storage.get_tip() {
                             Ok(Some(tip)) => {
@@ -259,7 +412,88 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("Failed to open database at {}: {}", data_dir.display(), e);
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+        Commands::Tx { command } => match command {
+            TxCommands::Send {
+                secret,
+                to,
+                amount,
+                node,
+                nonce,
+                data_dir,
+            } => {
+                let secret_bytes = match hex::decode(secret.trim_start_matches("0x")) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        arr
+                    }
+                    _ => {
+                        eprintln!("Invalid --secret: expected 32 bytes of hex");
+                        std::process::exit(1);
+                    }
+                };
+                let secret_key = match chroma_crypto::schnorr::SecretKey32::from_bytes(secret_bytes)
+                {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("Invalid secret key: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let wallet = chroma_wallet::Wallet::from_secret_key("cli", secret_key)?;
+                let sender = wallet.address();
+
+                let recipient = match bech32_to_address(&to) {
+                    Some(a) => a,
+                    None => {
+                        eprintln!("Invalid --to: expected bech32m (chr1...) or 0x hex");
+                        std::process::exit(1);
+                    }
+                };
+
+                // The nonce must match the account's, so read it from the
+                // chain unless the caller supplied one.
+                let next_nonce = match nonce {
+                    Some(n) => n,
+                    None => match open_storage(&data_dir) {
+                        Ok(storage) => storage
+                            .get_account(&sender)
+                            .ok()
+                            .flatten()
+                            .map(|a| a.nonce)
+                            .unwrap_or(0),
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            eprintln!("Pass --nonce to submit without reading the chain.");
+                            std::process::exit(1);
+                        }
+                    },
+                };
+
+                let tx = wallet.create_transaction(
+                    recipient,
+                    chroma_core::types::Amount(amount),
+                    chroma_core::types::Nonce(next_nonce),
+                )?;
+                let tx_hash = chroma_core::hash::Hash::blake3(
+                    &chroma_core::serialize::CanonicalEncode::encode(&tx),
+                );
+
+                println!("From:   {}", address_to_bech32(&sender));
+                println!("To:     {}", address_to_bech32(&recipient));
+                println!("Amount: {} units", amount);
+                println!("Nonce:  {}", next_nonce);
+
+                match submit_transaction(node, &tx).await {
+                    Ok(()) => println!("Submitted to {}: {}", node, tx_hash.to_hex()),
+                    Err(e) => {
+                        eprintln!("Submission failed: {}", e);
                         std::process::exit(1);
                     }
                 }

@@ -434,7 +434,31 @@ impl Storage {
     }
 
     /// Store all accounts from a State.
+    /// Persist every account, replacing whatever was stored before.
+    ///
+    /// This used to write only the supply despite its name, so balances were
+    /// never persisted at all and every `wallet balance` reported "account not
+    /// found" no matter how much had been mined.
+    ///
+    /// Stored accounts are cleared first: a reorg can remove an account
+    /// entirely, and leaving the old row behind would report a balance that
+    /// the active chain does not agree with. That makes this O(accounts) per
+    /// call; writing only what changed is the optimisation.
     pub fn put_state(&self, state: &State) -> Result<()> {
+        let stale: Vec<Vec<u8>> = self
+            .db
+            .scan_prefix(b"accounts:")
+            .filter_map(|entry| entry.ok().map(|(key, _)| key.to_vec()))
+            .collect();
+        for key in stale {
+            self.db
+                .remove(&key)
+                .map_err(|e| CoreError::Storage(format!("put_state clear: {}", e)))?;
+        }
+
+        for (address, account) in state.accounts() {
+            self.put_account(&address, &account)?;
+        }
         self.put_supply(state.total_supply())?;
         Ok(())
     }
@@ -496,6 +520,46 @@ mod tests {
     fn test_open_and_close() {
         let storage = Storage::open_temporary().unwrap();
         let _ = storage;
+    }
+
+    #[test]
+    fn test_put_state_persists_accounts() {
+        // put_state used to write only the supply, so balances never reached
+        // disk and every balance query reported "account not found".
+        let storage = Storage::open_temporary().unwrap();
+        let mut state = State::new();
+        state.apply_subsidy(&test_address(1), 1).unwrap();
+        state.apply_subsidy(&test_address(2), 2).unwrap();
+
+        storage.put_state(&state).unwrap();
+
+        let a = storage.get_account(&test_address(1)).unwrap().unwrap();
+        assert_eq!(a.balance, 1_000_000);
+        let b = storage.get_account(&test_address(2)).unwrap().unwrap();
+        assert_eq!(b.balance, 1_000_000);
+        assert_eq!(storage.get_supply().unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_put_state_drops_accounts_the_chain_no_longer_has() {
+        // A reorg can remove an account entirely; the stored row must go with
+        // it, or the balance query answers from an abandoned branch.
+        let storage = Storage::open_temporary().unwrap();
+
+        let mut before = State::new();
+        before.apply_subsidy(&test_address(1), 1).unwrap();
+        storage.put_state(&before).unwrap();
+        assert!(storage.get_account(&test_address(1)).unwrap().is_some());
+
+        let mut after = State::new();
+        after.apply_subsidy(&test_address(2), 1).unwrap();
+        storage.put_state(&after).unwrap();
+
+        assert!(
+            storage.get_account(&test_address(1)).unwrap().is_none(),
+            "the abandoned branch's account must not survive"
+        );
+        assert!(storage.get_account(&test_address(2)).unwrap().is_some());
     }
 
     #[test]

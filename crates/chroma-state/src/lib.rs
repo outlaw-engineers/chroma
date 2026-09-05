@@ -96,6 +96,21 @@ impl State {
         self.total_supply
     }
 
+    /// Every account, in key order.
+    pub fn accounts(&self) -> impl Iterator<Item = (Address, Account)> + '_ {
+        self.accounts.iter().map(|(key, account)| {
+            (
+                Address::from_hash160(chroma_core::hash::Hash160(*key)),
+                *account,
+            )
+        })
+    }
+
+    /// Number of accounts with state.
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
     /// Set account (used by state transitions and genesis).
     fn set_account(&mut self, address: &Address, account: Account) {
         *self

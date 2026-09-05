@@ -384,6 +384,10 @@ impl Node {
         self.peer_manager.clone()
     }
 
+    pub fn chain_state(&self) -> Arc<RwLock<chroma_consensus::ChainState>> {
+        self.chain_state.clone()
+    }
+
     pub fn chain_height(&self) -> u32 {
         self.config.chain_height.load(Ordering::Relaxed)
     }
@@ -471,14 +475,15 @@ impl Node {
             let event_tx = self.event_tx.clone();
             let height = self.config.chain_height.clone();
             let miner_address = self.config.miner_address;
+            let miner_pool = self.mempool.clone();
             let shutdown = self.shutdown_tx.subscribe();
             let peer_mgr = self.peer_manager.clone();
             let miner_tx = outbound_tx.clone();
             let miner_syncer = self.syncer.clone();
             self.tasks.push(tokio::spawn(async move {
                 Self::run_miner(
-                    storage, chain_state, event_tx, height, miner_address, peer_mgr, miner_tx,
-                    miner_syncer, shutdown,
+                    storage, chain_state, event_tx, height, miner_address, miner_pool, peer_mgr,
+                    miner_tx, miner_syncer, shutdown,
                 )
                 .await;
             }));
@@ -1008,6 +1013,9 @@ impl Node {
                         }
                         drop(pm);
                         let _ = ctx.event_tx.send(NodeEvent::TxReceived(hash));
+                        // Pass it on, or a transaction only ever reaches the
+                        // one node it was submitted to.
+                        Self::announce(ctx, InvType::Tx, hash, Some(*peer_key)).await;
                     }
                     // Already held: not an error, and not worth re-announcing.
                     Ok(false) => {}
@@ -1304,6 +1312,19 @@ impl Node {
                 let mut syncer = ctx.syncer.write().await;
                 syncer.insert_header(candidate.header.clone());
             }
+            {
+                let mined: Vec<Hash> = candidate
+                    .transactions
+                    .iter()
+                    .skip(1)
+                    .map(|tx| Hash::blake3(&chroma_core::serialize::CanonicalEncode::encode(tx)))
+                    .collect();
+                if !mined.is_empty() {
+                    let mut pool = ctx.mempool.write().await;
+                    pool.remove_transactions(&mined);
+                }
+            }
+
             let height = {
                 let cs = ctx.chain_state.read().await;
                 cs.tip.height.0
@@ -1313,7 +1334,7 @@ impl Node {
                 .event_tx
                 .send(NodeEvent::BlockReceived(candidate_hash, height));
 
-            Self::announce_block(ctx, candidate_hash, from).await;
+            Self::announce(ctx, InvType::Block, candidate_hash, from).await;
 
             let unblocked = {
                 let mut orphans = ctx.orphans.write().await;
@@ -1325,17 +1346,19 @@ impl Node {
         Ok(())
     }
 
-    /// Announce a block to every ready peer except `except`.
+    /// Announce an item to every ready peer except `except`.
     ///
     /// Only the hash goes out: peers that already have it say nothing, and
     /// only those missing it spend bandwidth asking. Pushing whole blocks to
     /// everyone would send the same megabyte to peers that already had it.
-    async fn announce_block(ctx: &ConnectionContext, hash: Hash, except: Option<SocketAddr>) {
+    async fn announce(
+        ctx: &ConnectionContext,
+        inv_type: InvType,
+        hash: Hash,
+        except: Option<SocketAddr>,
+    ) {
         let inv = InvMessage {
-            inventory: vec![InvEntry {
-                inv_type: InvType::Block,
-                hash,
-            }],
+            inventory: vec![InvEntry { inv_type, hash }],
         };
         let msg = Message::new(MessageType::Inv, inv.encode());
 
@@ -1416,6 +1439,7 @@ impl Node {
         event_tx: mpsc::UnboundedSender<NodeEvent>,
         chain_height: Arc<AtomicU32>,
         miner_address: chroma_core::types::Address,
+        mempool: Arc<RwLock<Mempool>>,
         peer_manager: Arc<RwLock<PeerManager>>,
         outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
         syncer: Arc<RwLock<ChainSyncer>>,
@@ -1456,7 +1480,14 @@ impl Node {
                 coinbase_recipient: miner_address,
             };
 
-            match assemble_block(&ctx, &[], &parent_state) {
+            // Take whatever the mempool holds. assemble_block drops anything
+            // that will not apply, so a stale entry costs a skip, not a block.
+            let candidates: Vec<chroma_tx::Transaction> = {
+                let pool = mempool.read().await;
+                pool.transactions().into_iter().cloned().collect()
+            };
+
+            match assemble_block(&ctx, &candidates, &parent_state) {
                 Ok(mut block) => {
                     match mine_block_with_limit(&mut block, 10_000_000) {
                         Ok(()) => {
@@ -1490,6 +1521,24 @@ impl Node {
                                     {
                                         let mut sync = syncer.write().await;
                                         sync.insert_header(block.header.clone());
+                                    }
+                                    // Anything that made it into the block is
+                                    // no longer pending.
+                                    {
+                                        let mined: Vec<Hash> = block
+                                            .transactions
+                                            .iter()
+                                            .skip(1)
+                                            .map(|tx| {
+                                                Hash::blake3(
+                                                    &chroma_core::serialize::CanonicalEncode::encode(tx),
+                                                )
+                                            })
+                                            .collect();
+                                        if !mined.is_empty() {
+                                            let mut pool = mempool.write().await;
+                                            pool.remove_transactions(&mined);
+                                        }
                                     }
                                     let _ = event_tx.send(NodeEvent::BlockMined(block_hash, height));
                                     println!("Mined block #{}: {}", height, block_hash.to_hex());

@@ -723,3 +723,107 @@ async fn getdata_serves_blocks_and_reports_misses() {
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Transaction network
+// ---------------------------------------------------------------------------
+
+/// A transaction submitted to one node must reach another, and then be mined
+/// into a block that both nodes accept.
+///
+/// This is the end-to-end path phase 3 is about: relay, inclusion, and the
+/// balance actually moving.
+#[tokio::test]
+async fn transaction_reaches_a_peer_and_gets_mined() {
+    use chroma_core::types::Amount;
+
+    // The miner funds itself first, so it has something to spend.
+    let secret = SecretKey32::generate();
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let sender = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+    let recipient = Address::from_hash160(Hash160([0x5A; 20]));
+
+    let dir_a = temp_dir("txnet_miner");
+    let params = chroma_consensus::ChainParams::regtest();
+    let config_a = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir_a.clone())
+        .with_mining(true)
+        .with_miner_address(sender);
+    let mut miner = Node::new(config_a);
+    miner.run().await.expect("miner failed to start");
+    let miner_addr = miner.local_addr().unwrap();
+
+    let (relay, _relay_addr, dir_b) =
+        start_regtest_node("txnet_relay", false, vec![miner_addr]).await;
+
+    wait_for("the relay to connect", || async {
+        let pm = relay.peer_manager();
+        let pm = pm.read().await;
+        pm.get_peer(&miner_addr).map(|p| p.state == PeerState::Ready) == Some(true)
+    })
+    .await;
+
+    // Let the miner accumulate a balance to spend.
+    wait_for("the miner to earn a reward", || async {
+        miner.chain_height() >= 2
+    })
+    .await;
+
+    // Submit to the relay, which does not mine: the transaction only gets
+    // into a block if it is passed on.
+    let tx = chroma_tx::create_transaction(
+        &secret,
+        sender,
+        recipient,
+        Amount(300_000),
+        Nonce(0),
+    )
+    .unwrap();
+    let tx_hash = chroma_core::hash::Hash::blake3(&tx.encode());
+    {
+        let pool = relay.mempool();
+        let mut pool = pool.write().await;
+        pool.add_transaction(tx).unwrap();
+    }
+    // Announce it the way a peer would.
+    relay.broadcast_transaction(tx_hash);
+
+    wait_for("the miner to receive the relayed transaction", || async {
+        let pool = miner.mempool();
+        let pool = pool.read().await;
+        pool.has_transaction(&tx_hash)
+    })
+    .await;
+
+    // ...and then to mine it, moving the balance.
+    wait_for("the transfer to be mined", || async {
+        let cs = miner.chain_state();
+        let cs = cs.read().await;
+        cs.state.get_account(&recipient).balance == 300_000
+    })
+    .await;
+
+    {
+        let cs = miner.chain_state();
+        let cs = cs.read().await;
+        assert_eq!(cs.state.get_account(&recipient).balance, 300_000);
+        assert_eq!(cs.state.get_account(&sender).nonce, 1, "the sender's nonce advanced");
+    }
+
+    // Once mined it is no longer pending.
+    let pool = miner.mempool();
+    let pool = pool.read().await;
+    assert!(
+        !pool.has_transaction(&tx_hash),
+        "a mined transaction must leave the mempool"
+    );
+    drop(pool);
+
+    let mut miner = miner;
+    let mut relay = relay;
+    miner.shutdown().await;
+    relay.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
