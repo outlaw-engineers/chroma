@@ -18,6 +18,11 @@ enum Commands {
         connect: Vec<SocketAddr>,
         #[arg(long, default_value = "chroma_data")]
         data_dir: PathBuf,
+        /// Network to run on: devnet, testnet, mainnet, or regtest.
+        /// regtest uses a trivial proof of work with no retargeting, so a
+        /// single node can produce blocks immediately.
+        #[arg(long, default_value = "devnet")]
+        network: String,
     },
     Wallet {
         #[command(subcommand)]
@@ -91,15 +96,27 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Node { listen, connect, data_dir } => {
+        Commands::Node { listen, connect, data_dir, network } => {
             println!("Starting Chroma node on {}", listen);
             println!("Data directory: {}", data_dir.display());
             if !connect.is_empty() {
                 println!("Connecting to: {:?}", connect);
             }
-            let genesis = chroma_consensus::build_genesis_block();
+            let params = match chroma_consensus::ChainParams::parse(&network) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "Unknown network '{}'. Expected devnet, testnet, mainnet or regtest.",
+                        network
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let genesis = chroma_consensus::build_genesis_block_with(&params);
             let genesis_hash = genesis.hash();
+            println!("Network: {}", params.network.as_str());
             let config = chroma_p2p::NodeConfig::new(listen, genesis_hash)
+                .with_params(params)
                 .with_data_dir(data_dir)
                 .with_connect_addrs(connect);
             let mut node = chroma_p2p::Node::new(config);

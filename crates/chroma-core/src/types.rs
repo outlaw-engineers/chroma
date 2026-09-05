@@ -182,6 +182,9 @@ pub enum NetworkId {
     Devnet,
     Testnet,
     Mainnet,
+    /// Local regression-test network: trivial proof of work and no difficulty
+    /// retargeting, so a single node can produce blocks on demand.
+    Regtest,
     Unknown,
 }
 
@@ -191,6 +194,7 @@ impl NetworkId {
             NetworkId::Devnet => "chroma-devnet",
             NetworkId::Testnet => "chroma-testnet",
             NetworkId::Mainnet => "chroma-mainnet",
+            NetworkId::Regtest => "chroma-regtest",
             NetworkId::Unknown => "unknown",
         }
     }
@@ -208,6 +212,7 @@ impl CanonicalEncode for NetworkId {
             NetworkId::Devnet => vec![0u8],
             NetworkId::Testnet => vec![1u8],
             NetworkId::Mainnet => vec![2u8],
+            NetworkId::Regtest => vec![3u8],
             NetworkId::Unknown => vec![255u8],
         }
     }
@@ -222,6 +227,7 @@ impl CanonicalDecode for NetworkId {
             0 => Ok(NetworkId::Devnet),
             1 => Ok(NetworkId::Testnet),
             2 => Ok(NetworkId::Mainnet),
+            3 => Ok(NetworkId::Regtest),
             255 => Ok(NetworkId::Unknown),
             _ => Err(CoreError::InvalidNetworkId(format!("unknown network ID: {}", data[0]))),
         }

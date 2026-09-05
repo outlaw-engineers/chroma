@@ -202,7 +202,10 @@ mod tests {
         let decoded = NetworkId::decode(&[2u8]).unwrap();
         assert_eq!(decoded, NetworkId::Mainnet);
 
-        assert!(NetworkId::decode(&[3u8]).is_err());
+        let regtest = NetworkId::decode(&[3u8]).unwrap();
+        assert_eq!(regtest, NetworkId::Regtest);
+
+        assert!(NetworkId::decode(&[4u8]).is_err());
     }
 
     #[test]
@@ -462,6 +465,7 @@ mod tests {
             (NetworkId::Devnet, 0u8),
             (NetworkId::Testnet, 1),
             (NetworkId::Mainnet, 2),
+            (NetworkId::Regtest, 3),
         ] {
             assert_eq!(id.encode(), vec![expected_byte]);
             assert_eq!(NetworkId::decode(&[expected_byte]).unwrap(), id);
@@ -470,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_network_id_invalid() {
-        assert!(NetworkId::decode(&[3u8]).is_err());
+        assert!(NetworkId::decode(&[4u8]).is_err());
         assert!(NetworkId::decode(&[100u8]).is_err());
     }
 

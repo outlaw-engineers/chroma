@@ -197,3 +197,81 @@ fn a_second_coinbase_cannot_mint() {
     assert_eq!(state.get_account(&thief).balance, 0);
     assert_eq!(state.total_supply(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Regtest
+// ---------------------------------------------------------------------------
+
+/// On regtest a single node must be able to extend the chain through the full
+/// `ChainState::apply_block` path — the thing devnet's difficulty-1 target
+/// makes impossible in practice.
+#[test]
+fn regtest_chain_advances() {
+    use chroma_consensus::{ChainParams, ChainState};
+
+    let params = ChainParams::regtest();
+    let mut chain = ChainState::with_params(params);
+    assert_eq!(chain.tip.height.0, 0);
+
+    for height in 1..=5u32 {
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(height),
+            previous_hash: chain.tip.hash,
+            previous_timestamp: chain.tip.header.timestamp,
+            bits: chain.tip.header.bits,
+            coinbase_recipient: miner_address(),
+        };
+        let mut block = assemble_block(&ctx, &[], &chain.state).unwrap();
+        mine_block_with_limit(&mut block, 1_000)
+            .unwrap_or_else(|e| panic!("regtest mining should be trivial: {}", e));
+
+        chain
+            .apply_block(&block)
+            .unwrap_or_else(|e| panic!("regtest block {} rejected: {}", height, e));
+        assert_eq!(chain.tip.height.0, height);
+    }
+
+    assert_eq!(chain.tip.supply, 5_000_000, "five block rewards");
+    assert_eq!(chain.state.get_account(&miner_address()).balance, 5_000_000);
+}
+
+/// Regtest holds the target fixed, including across a retarget boundary.
+#[test]
+fn regtest_never_retargets() {
+    use chroma_consensus::{ChainParams, ChainState};
+
+    let params = ChainParams::regtest();
+    let mut chain = ChainState::with_params(params);
+    let genesis_bits = chain.tip.header.bits;
+
+    // Past height 10, where a real network would adjust.
+    for height in 1..=12u32 {
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(height),
+            previous_hash: chain.tip.hash,
+            previous_timestamp: chain.tip.header.timestamp,
+            bits: chain.tip.header.bits,
+            coinbase_recipient: miner_address(),
+        };
+        let mut block = assemble_block(&ctx, &[], &chain.state).unwrap();
+        mine_block_with_limit(&mut block, 1_000).unwrap();
+        chain.apply_block(&block).unwrap();
+        assert_eq!(
+            chain.tip.header.bits, genesis_bits,
+            "regtest difficulty must not move at height {}",
+            height
+        );
+    }
+}
+
+/// Regtest and devnet must be separate chains, so a regtest block can never
+/// be mistaken for a real one.
+#[test]
+fn regtest_genesis_differs_from_devnet() {
+    use chroma_consensus::{build_genesis_block_with, ChainParams};
+
+    let regtest = build_genesis_block_with(&ChainParams::regtest());
+    let devnet = build_genesis_block_with(&ChainParams::devnet());
+    assert_ne!(regtest.hash(), devnet.hash());
+    assert_eq!(devnet.hash(), build_genesis_block().hash());
+}

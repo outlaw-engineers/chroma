@@ -40,6 +40,8 @@ pub struct ChainSyncer {
     /// The header chain, ahead of the validated block chain during
     /// headers-first sync. Keyed by height.
     headers: BTreeMap<u32, BlockHeader>,
+    /// Consensus parameters, needed to know what target each height demands.
+    params: chroma_consensus::ChainParams,
 }
 
 impl ChainSyncer {
@@ -50,7 +52,16 @@ impl ChainSyncer {
             best_hash: genesis_hash,
             sync_peer: None,
             headers: BTreeMap::new(),
+            params: chroma_consensus::ChainParams::devnet(),
         }
+    }
+
+    /// Create a syncer for a network, seeded with that network's genesis.
+    pub fn with_params(params: chroma_consensus::ChainParams) -> Self {
+        let genesis = chroma_consensus::build_genesis_block_with(&params).header;
+        let mut syncer = Self::with_genesis(genesis);
+        syncer.params = params;
+        syncer
     }
 
     /// Create a syncer seeded with the genesis header.
@@ -67,6 +78,7 @@ impl ChainSyncer {
             best_hash: hash,
             sync_peer: None,
             headers,
+            params: chroma_consensus::ChainParams::devnet(),
         }
     }
 
@@ -174,7 +186,11 @@ impl ChainSyncer {
                 };
             }
 
-            match chroma_consensus::calculate_target_for_height(height, &self.headers) {
+            match chroma_consensus::calculate_target_for_height_with(
+                height,
+                &self.headers,
+                &self.params,
+            ) {
                 Ok(expected) if expected == header.bits => {}
                 Ok(expected) => {
                     return HeaderBatch {

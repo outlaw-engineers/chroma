@@ -81,6 +81,8 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// Run the mining loop. Off in tests that only exercise networking.
     pub mining_enabled: bool,
+    /// Consensus parameters for the network this node is on.
+    pub params: chroma_consensus::ChainParams,
 }
 
 impl NodeConfig {
@@ -92,7 +94,16 @@ impl NodeConfig {
             chain_height: Arc::new(AtomicU32::new(0)),
             data_dir: PathBuf::from("chroma_data"),
             mining_enabled: true,
+            params: chroma_consensus::ChainParams::devnet(),
         }
+    }
+
+    /// Select the network. Also fixes up the expected genesis hash, since
+    /// each network has its own genesis.
+    pub fn with_params(mut self, params: chroma_consensus::ChainParams) -> Self {
+        self.genesis_hash = chroma_consensus::build_genesis_block_with(&params).hash();
+        self.params = params;
+        self
     }
 
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
@@ -203,14 +214,14 @@ impl Node {
         let storage = chroma_storage::Storage::open(&db_path)
             .expect("failed to open storage database");
 
-        let chain_state = Self::init_chain_state(&storage, config.genesis_hash);
+        let chain_state = Self::init_chain_state(&storage, config.genesis_hash, config.params);
 
         let height = chain_state.tip.height.0;
         config.chain_height.store(height, Ordering::Relaxed);
 
         // Seed the header chain from what is already on disk, so a restarted
         // node resumes sync from its own tip instead of from genesis.
-        let mut syncer = ChainSyncer::with_genesis(chroma_consensus::build_genesis_block().header);
+        let mut syncer = ChainSyncer::with_params(config.params);
         for (_, header) in chain_state.headers.iter() {
             syncer.insert_header(header.clone());
         }
@@ -237,6 +248,7 @@ impl Node {
     fn init_chain_state(
         storage: &chroma_storage::Storage,
         expected_genesis_hash: Hash,
+        params: chroma_consensus::ChainParams,
     ) -> chroma_consensus::ChainState {
         use chroma_consensus::{build_genesis_block, ChainTip, ChainState};
         use chroma_core::types::BlockHeight;
@@ -283,6 +295,7 @@ impl Node {
                     persisted_tip.height, persisted_tip.supply);
 
                 ChainState {
+                    params,
                     headers,
                     tip,
                     state,
@@ -290,8 +303,8 @@ impl Node {
                 }
             }
             _ => {
-                let chain = ChainState::with_genesis();
-                let genesis = build_genesis_block();
+                let chain = ChainState::with_params(params);
+                let genesis = chroma_consensus::build_genesis_block_with(&params);
                 let genesis_hash = genesis.hash();
 
                 if expected_genesis_hash != genesis_hash {

@@ -918,6 +918,7 @@ fn test_chain_state_loads_from_storage() {
     tips.insert(loaded_tip.hash, chain_tip.clone());
 
     let chain = ChainState {
+        params: chroma_consensus::ChainParams::devnet(),
         headers,
         tip: chain_tip,
         state: chroma_state::State::new(),

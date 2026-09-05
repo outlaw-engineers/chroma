@@ -21,12 +21,15 @@
 //! At non-retarget heights, the target carries forward unchanged.
 
 pub mod miner;
+pub mod params;
+
+pub use params::ChainParams;
 
 use std::collections::BTreeMap;
 
 use chroma_core::constants::{
-    DIFFICULTY_ADJUSTMENT_WINDOW, GENESIS_RANDOMX_SEED, GENESIS_TARGET_BITS,
-    GENESIS_TIMESTAMP, MAX_DIFFICULTY_DECREASE_FACTOR, MTP_WINDOW, TARGET_BLOCK_TIME_SECS,
+    DIFFICULTY_ADJUSTMENT_WINDOW, GENESIS_RANDOMX_SEED, MAX_DIFFICULTY_DECREASE_FACTOR,
+    MTP_WINDOW, TARGET_BLOCK_TIME_SECS,
 };
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
@@ -50,13 +53,22 @@ use chroma_state::State;
 /// - state_root = Hash::ZERO (empty state)
 /// - tx_merkle_root = Hash::ZERO (no transactions)
 pub fn build_genesis_block() -> Block {
+    build_genesis_block_with(&ChainParams::devnet())
+}
+
+/// Build the genesis block for a specific network.
+///
+/// Networks differ in their genesis target, so each has a different genesis
+/// hash — which is what keeps a regtest chain from ever being mistaken for a
+/// real one.
+pub fn build_genesis_block_with(params: &ChainParams) -> Block {
     let header = BlockHeader {
         version: 1,
         previous_hash: Hash::ZERO,
         state_root: Hash::ZERO,
         tx_merkle_root: Hash::ZERO,
-        timestamp: GENESIS_TIMESTAMP,
-        bits: CompactTarget(GENESIS_TARGET_BITS),
+        timestamp: params.genesis_timestamp,
+        bits: params.genesis_bits,
         height: BlockHeight::GENESIS,
         nonce: 0,
     };
@@ -81,38 +93,27 @@ pub fn genesis_randomx_seed() -> Hash {
 // Difficulty Retarget
 // ============================================================================
 
-/// Minimum target (highest difficulty).
-/// 0x00000000000000000000FFFF00000000000000000000000000000000000000000
-const MINIMUM_TARGET: [u8; 32] = {
-    let mut t = [0u8; 32];
-    t[10] = 0xFF;
-    t[11] = 0xFF;
-    t
-};
-
-/// Maximum target (lowest difficulty).
-/// ~4× genesis to allow one full difficulty decrease adjustment.
-/// CompactTarget for this is ~0x1E003FFF which is the genesis target × 4.
-const MAXIMUM_TARGET: [u8; 32] = {
-    let mut t = [0u8; 32];
-    t[3] = 0x03;
-    t[4] = 0xFF;
-    t[5] = 0xFF;
-    t[6] = 0xC0;
-    t
-};
-
 /// Determine the target bits for a given block height.
 pub fn calculate_target_for_height(
     height: u32,
     headers: &BTreeMap<u32, BlockHeader>,
 ) -> Result<CompactTarget> {
+    calculate_target_for_height_with(height, headers, &ChainParams::devnet())
+}
+
+/// Determine the target bits for a height under a specific network's rules.
+pub fn calculate_target_for_height_with(
+    height: u32,
+    headers: &BTreeMap<u32, BlockHeader>,
+    params: &ChainParams,
+) -> Result<CompactTarget> {
     if height == 0 {
-        return Ok(CompactTarget(GENESIS_TARGET_BITS));
+        return Ok(params.genesis_bits);
     }
 
-    // Only retarget at multiples of DIFFICULTY_ADJUSTMENT_WINDOW
-    if height % DIFFICULTY_ADJUSTMENT_WINDOW != 0 {
+    // Regtest holds the target still, so block production stays instant no
+    // matter how quickly blocks arrive.
+    if params.no_retargeting || height % DIFFICULTY_ADJUSTMENT_WINDOW != 0 {
         let prev = headers
             .get(&(height - 1))
             .ok_or_else(|| CoreError::InvalidDifficulty(format!("missing header for height {}", height - 1)))?;
@@ -159,8 +160,8 @@ pub fn calculate_target_for_height(
     // Enforce absolute bounds (safety net beyond per-epoch clamping)
     // MINIMUM_TARGET = highest difficulty (smallest target)
     // MAXIMUM_TARGET = lowest difficulty (largest target, ~4× genesis)
-    let min_abs = U256::from_be_bytes(&MINIMUM_TARGET);
-    let max_abs = U256::from_be_bytes(&MAXIMUM_TARGET);
+    let min_abs = U256::from_be_bytes(&params.min_target);
+    let max_abs = U256::from_be_bytes(&params.max_target);
     let final_target = if clamped < min_abs {
         min_abs
     } else if clamped > max_abs {
@@ -252,6 +253,8 @@ impl ChainTip {
 
 /// Full chain state for consensus validation.
 pub struct ChainState {
+    /// Consensus parameters for the network this chain belongs to.
+    pub params: ChainParams,
     /// All block headers indexed by height.
     pub headers: BTreeMap<u32, BlockHeader>,
     /// Best chain tip.
@@ -265,7 +268,12 @@ pub struct ChainState {
 impl ChainState {
     /// Create chain state with the genesis block.
     pub fn with_genesis() -> Self {
-        let genesis = build_genesis_block();
+        Self::with_params(ChainParams::devnet())
+    }
+
+    /// Create chain state with the genesis block of a specific network.
+    pub fn with_params(params: ChainParams) -> Self {
+        let genesis = build_genesis_block_with(&params);
         let genesis_hash = genesis.hash();
         let tip = ChainTip::new(&genesis);
 
@@ -276,6 +284,7 @@ impl ChainState {
         tips.insert(genesis_hash, tip.clone());
 
         ChainState {
+            params,
             headers,
             tip: tip.clone(),
             state: State::new(),
@@ -299,7 +308,8 @@ impl ChainState {
         // Compute Median Time Past from the last MTP_WINDOW (7) block timestamps
         let mtp = self.compute_median_time_past(height);
 
-        let expected_bits = calculate_target_for_height(height, &self.headers)?;
+        let expected_bits =
+            calculate_target_for_height_with(height, &self.headers, &self.params)?;
 
         let ctx = BlockValidationContext {
             previous_hash,
@@ -395,6 +405,8 @@ pub fn median_time_past(headers: &BTreeMap<u32, BlockHeader>, height: u32) -> u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_core::constants::{GENESIS_TARGET_BITS, GENESIS_TIMESTAMP};
+    use crate::params::{DEFAULT_MAX_TARGET as MAXIMUM_TARGET, DEFAULT_MIN_TARGET as MINIMUM_TARGET};
     use chroma_core::constants::MAX_DIFFICULTY_INCREASE_FACTOR;
 
     #[test]
