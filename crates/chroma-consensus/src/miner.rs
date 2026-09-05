@@ -4,7 +4,7 @@
 //! and performs Proof-of-Work (BLAKE3 placeholder for devnet).
 
 use chroma_core::constants::{
-    BLOCK_REWARD_UNITS, TARGET_BLOCK_TIME_SECS,
+    BLOCK_REWARD_UNITS, MAX_FUTURE_TIMESTAMP_OFFSET,
 };
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
@@ -15,11 +15,35 @@ use chroma_tx::Transaction;
 /// Maximum number of transactions to include in a block.
 const MAX_BLOCK_TXS: usize = 10_000;
 
+/// Choose a timestamp for the next block.
+///
+/// Validation demands `median_time_past < timestamp <= now + 20`. Pacing the
+/// chain by stamping `parent + target_block_time` breaks the upper bound as
+/// soon as blocks are found faster than the target — on regtest that is
+/// immediately, and the miner then spends its time producing blocks its own
+/// validation rejects. Wall-clock time is the right value; the median only
+/// sets a floor.
+pub fn next_block_timestamp(now: u64, median_time_past: u64) -> u64 {
+    std::cmp::max(now, median_time_past.saturating_add(1))
+}
+
+/// Whether `timestamp` is still acceptable to validation at time `now`.
+pub fn timestamp_is_valid(timestamp: u64, now: u64, median_time_past: u64) -> bool {
+    timestamp > median_time_past
+        && timestamp <= now.saturating_add(MAX_FUTURE_TIMESTAMP_OFFSET as u64)
+}
+
 /// Block assembly context needed for mining.
 pub struct BlockAssemblyContext {
     pub height: BlockHeight,
     pub previous_hash: Hash,
-    pub previous_timestamp: u64,
+    /// Timestamp to stamp on the block.
+    ///
+    /// The caller must pick one that validation will accept: strictly after
+    /// the median time past, and no more than
+    /// `MAX_FUTURE_TIMESTAMP_OFFSET` ahead of wall-clock time. See
+    /// [`next_block_timestamp`].
+    pub timestamp: u64,
     pub bits: CompactTarget,
     pub coinbase_recipient: chroma_core::types::Address,
 }
@@ -74,7 +98,7 @@ pub fn assemble_block(
         previous_hash: ctx.previous_hash,
         state_root: working.compute_state_root(),
         tx_merkle_root,
-        timestamp: ctx.previous_timestamp + TARGET_BLOCK_TIME_SECS,
+        timestamp: ctx.timestamp,
         bits: ctx.bits,
         height: ctx.height,
         nonce: 0,
@@ -152,6 +176,38 @@ mod tests {
     }
 
     #[test]
+    fn test_next_block_timestamp_stays_within_the_future_bound() {
+        use chroma_core::constants::MAX_FUTURE_TIMESTAMP_OFFSET;
+
+        // Blocks arriving faster than the target must not push the stamp past
+        // what validation accepts. Pacing by parent + target_block_time did
+        // exactly that, and the miner rejected its own blocks.
+        let now = 1_800_000_000u64;
+        for mtp in [0u64, now - 100, now - 1, now, now + 5] {
+            let ts = next_block_timestamp(now, mtp);
+            assert!(ts > mtp, "timestamp {} must be past MTP {}", ts, mtp);
+            assert!(
+                ts <= now + MAX_FUTURE_TIMESTAMP_OFFSET as u64,
+                "timestamp {} is too far ahead of now {}",
+                ts,
+                now
+            );
+            assert!(timestamp_is_valid(ts, now, mtp));
+        }
+    }
+
+    #[test]
+    fn test_timestamp_validity_matches_the_consensus_bounds() {
+        let now = 1_800_000_000u64;
+        let mtp = now - 50;
+        assert!(timestamp_is_valid(now, now, mtp));
+        assert!(timestamp_is_valid(mtp + 1, now, mtp));
+        assert!(!timestamp_is_valid(mtp, now, mtp), "must be strictly after MTP");
+        assert!(timestamp_is_valid(now + 20, now, mtp), "20s ahead is allowed");
+        assert!(!timestamp_is_valid(now + 21, now, mtp), "21s ahead is not");
+    }
+
+    #[test]
     fn test_assemble_block_empty_mempool() {
         let genesis = build_genesis_block();
         let genesis_hash = genesis.hash();
@@ -159,7 +215,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis_hash,
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: CompactTarget(0x1d00ffff),
             coinbase_recipient: test_address(),
         };
@@ -179,7 +235,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: CompactTarget(0x1d00ffff),
             coinbase_recipient: test_address(),
         };
@@ -216,7 +272,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: CompactTarget(0x1d00ffff),
             coinbase_recipient: test_address(),
         };
@@ -246,7 +302,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
@@ -274,7 +330,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
@@ -296,7 +352,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
@@ -327,7 +383,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
@@ -344,7 +400,7 @@ mod tests {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
-            previous_timestamp: genesis.header.timestamp,
+            timestamp: genesis.header.timestamp + 10,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };

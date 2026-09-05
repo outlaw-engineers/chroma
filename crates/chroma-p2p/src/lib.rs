@@ -3,6 +3,7 @@ pub mod peer;
 pub mod mempool;
 pub mod discovery;
 pub mod sync;
+pub mod orphan;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -20,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::discovery::Discovery;
 use crate::mempool::Mempool;
 use crate::sync::ChainSyncer;
+use crate::orphan::OrphanPool;
 use crate::peer::{
     ConnectionSlot, PeerManager, PeerState, PEER_TIMEOUT_SECS, PING_INTERVAL_SECS,
     VERSION_TIMEOUT_SECS,
@@ -42,6 +44,10 @@ const READ_CHUNK: usize = 16 * 1024;
 /// How long shutdown waits for a task to notice the signal before abandoning
 /// it.
 const SHUTDOWN_GRACE_SECS: u64 = 5;
+
+/// Largest inventory we will act on in one message, in either direction.
+/// Bounds the work a single peer can ask of us.
+const MAX_INVENTORY: usize = 500;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SERVICES: u64 = 0;
@@ -130,6 +136,7 @@ pub struct Node {
     storage: Arc<chroma_storage::Storage>,
     chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     syncer: Arc<RwLock<ChainSyncer>>,
+    orphans: Arc<RwLock<OrphanPool>>,
     event_tx: mpsc::UnboundedSender<NodeEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<NodeEvent>>,
     outbound_tx: Option<mpsc::UnboundedSender<OutboundCommand>>,
@@ -175,7 +182,10 @@ struct ConnectionContext {
     storage: Arc<chroma_storage::Storage>,
     chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     syncer: Arc<RwLock<ChainSyncer>>,
+    orphans: Arc<RwLock<OrphanPool>>,
     event_tx: mpsc::UnboundedSender<NodeEvent>,
+    /// Used to relay an accepted block on to our other peers.
+    outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
     chain_height: Arc<AtomicU32>,
     listen_port: u16,
     identity_nonce: u64,
@@ -234,6 +244,7 @@ impl Node {
             storage: Arc::new(storage),
             chain_state: Arc::new(RwLock::new(chain_state)),
             syncer: Arc::new(RwLock::new(syncer)),
+            orphans: Arc::new(RwLock::new(OrphanPool::new())),
             event_tx,
             event_rx: Some(event_rx),
             outbound_tx: Some(outbound_tx),
@@ -374,21 +385,23 @@ impl Node {
             .discover_peers(self.peer_manager.clone(), &self.config.connect_addrs)
             .await;
 
+        let outbound_rx = self.outbound_rx.take().expect("run() called twice");
+        let outbound_tx = self.outbound_tx.as_ref().unwrap().clone();
+
         let ctx = ConnectionContext {
             peer_manager: self.peer_manager.clone(),
             mempool: self.mempool.clone(),
             storage: self.storage.clone(),
             chain_state: self.chain_state.clone(),
             syncer: self.syncer.clone(),
+            orphans: self.orphans.clone(),
             event_tx: self.event_tx.clone(),
+            outbound_tx: outbound_tx.clone(),
             chain_height: self.config.chain_height.clone(),
             listen_port,
             identity_nonce: self.identity_nonce,
             shutdown_tx: self.shutdown_tx.clone(),
         };
-
-        let outbound_rx = self.outbound_rx.take().expect("run() called twice");
-        let outbound_tx = self.outbound_tx.as_ref().unwrap().clone();
 
         {
             let ctx = ctx.clone();
@@ -436,8 +449,15 @@ impl Node {
             let event_tx = self.event_tx.clone();
             let height = self.config.chain_height.clone();
             let shutdown = self.shutdown_tx.subscribe();
+            let peer_mgr = self.peer_manager.clone();
+            let miner_tx = outbound_tx.clone();
+            let miner_syncer = self.syncer.clone();
             self.tasks.push(tokio::spawn(async move {
-                Self::run_miner(storage, chain_state, event_tx, height, shutdown).await;
+                Self::run_miner(
+                    storage, chain_state, event_tx, height, peer_mgr, miner_tx, miner_syncer,
+                    shutdown,
+                )
+                .await;
             }));
         }
 
@@ -1050,65 +1070,248 @@ impl Node {
 
             MessageType::Inv => {
                 let inv = InvMessage::decode(&msg.payload)?;
-                if !inv.inventory.is_empty() {
-                    let getdata = GetDataMessage {
-                        inventory: inv.inventory,
+
+                // Ask only for what we are missing. Requesting everything
+                // announced means re-downloading blocks we already have, and
+                // on a busy network that is most of them.
+                let mut wanted = Vec::new();
+                for entry in inv.inventory.into_iter().take(MAX_INVENTORY) {
+                    let missing = match entry.inv_type {
+                        InvType::Block => !Self::have_block(ctx, &entry.hash).await,
+                        InvType::Tx => {
+                            let pool = ctx.mempool.read().await;
+                            !pool.has_transaction(&entry.hash)
+                        }
                     };
+                    if missing {
+                        wanted.push(entry);
+                    }
+                }
+
+                if !wanted.is_empty() {
+                    let getdata = GetDataMessage { inventory: wanted };
                     Self::send(out_tx, Message::new(MessageType::GetData, getdata.encode())).await?;
                 }
                 Ok(true)
             }
 
-            MessageType::Block => {
-                match chroma_block::Block::decode_block(&msg.payload) {
-                    Ok(block) => {
-                        let block_hash = block.hash();
-                        let block_height = block.header.height.0;
+            MessageType::GetData => {
+                let req = GetDataMessage::decode(&msg.payload)?;
+                let mut not_found = Vec::new();
 
-                        let mut cs = ctx.chain_state.write().await;
-                        match cs.apply_block(&block) {
-                            Ok(()) => {
-                                let _ = ctx.storage.apply_block(&block);
-                                let tip = &cs.tip;
-                                let persisted = chroma_storage::PersistedTip {
-                                    height: tip.height.0,
-                                    hash: tip.hash,
-                                    cumulative_work: tip.cumulative_work.to_be_bytes(),
-                                    supply: tip.supply,
-                                };
-                                let _ = ctx.storage.put_tip(&persisted);
-                                let _ = ctx.storage.put_state(&cs.state);
-                                let _ = ctx.storage.flush();
-
-                                ctx.chain_height.store(block_height, Ordering::Relaxed);
-                                let _ = ctx
-                                    .event_tx
-                                    .send(NodeEvent::BlockReceived(block_hash, block_height));
+                for entry in req.inventory.into_iter().take(MAX_INVENTORY) {
+                    match entry.inv_type {
+                        InvType::Block => {
+                            match ctx.storage.get_block_by_hash(&entry.hash) {
+                                Ok(Some(block)) => {
+                                    Self::send(
+                                        out_tx,
+                                        Message::new(MessageType::Block, block.encode_block()),
+                                    )
+                                    .await?;
+                                }
+                                _ => not_found.push(entry),
                             }
-                            Err(e) => {
-                                let _ = ctx.event_tx.send(NodeEvent::Error(format!(
-                                    "block validation failed: {}",
-                                    e
-                                )));
+                        }
+                        InvType::Tx => {
+                            let payload = {
+                                let pool = ctx.mempool.read().await;
+                                pool.get_transaction(&entry.hash)
+                                    .map(chroma_core::serialize::CanonicalEncode::encode)
+                            };
+                            match payload {
+                                Some(bytes) => {
+                                    Self::send(out_tx, Message::new(MessageType::Tx, bytes)).await?;
+                                }
+                                None => not_found.push(entry),
                             }
                         }
                     }
+                }
+
+                if !not_found.is_empty() {
+                    let msg = InvMessage {
+                        inventory: not_found,
+                    };
+                    Self::send(out_tx, Message::new(MessageType::NotFound, msg.encode())).await?;
+                }
+                Ok(true)
+            }
+
+            MessageType::Block => {
+                let block = match chroma_block::Block::decode_block(&msg.payload) {
+                    Ok(block) => block,
                     Err(e) => {
                         Self::penalize(ctx, peer_key, 10).await;
                         let _ = ctx.event_tx.send(NodeEvent::Error(format!(
                             "block decode failed from {}: {}",
                             peer_key, e
                         )));
+                        return Ok(true);
                     }
-                }
+                };
+
+                Self::accept_block(ctx, out_tx, block, Some(*peer_key)).await?;
                 Ok(true)
             }
 
-            MessageType::GetData
-            | MessageType::Addr
+            MessageType::Addr
             | MessageType::GetAddr
             | MessageType::Reject
             | MessageType::NotFound => Ok(true),
+        }
+    }
+
+
+    /// True if this block is already on disk.
+    ///
+    /// Uses the hash→height index rather than loading the block, so an
+    /// inventory of hundreds costs hundreds of key lookups, not hundreds of
+    /// block deserializations.
+    async fn have_block(ctx: &ConnectionContext, hash: &Hash) -> bool {
+        matches!(ctx.storage.get_height_for_hash(hash), Ok(Some(_)))
+    }
+
+    /// Validate and connect a block, then whatever was waiting on it.
+    ///
+    /// `from` is the peer that sent it, which is excluded from the relay so we
+    /// do not immediately announce the block back to its source.
+    async fn accept_block(
+        ctx: &ConnectionContext,
+        out_tx: &mpsc::Sender<Vec<u8>>,
+        block: chroma_block::Block,
+        from: Option<SocketAddr>,
+    ) -> Result<(), P2pError> {
+        let hash = block.hash();
+
+        // Already have it: a duplicate announcement, or two peers relaying the
+        // same block. Not an error, and not worth re-validating.
+        if Self::have_block(ctx, &hash).await {
+            return Ok(());
+        }
+        {
+            let orphans = ctx.orphans.read().await;
+            if orphans.contains(&hash) {
+                return Ok(());
+            }
+        }
+
+        // Do we have the parent? Genesis is the one block with no parent.
+        let parent_known = block.header.height.0 == 0
+            || Self::have_block(ctx, &block.header.previous_hash).await
+            || {
+                let cs = ctx.chain_state.read().await;
+                cs.tip.hash == block.header.previous_hash
+            };
+
+        if !parent_known {
+            // Park it and go get the parent, rather than dropping a block we
+            // may well be able to use in a moment.
+            let parent = {
+                let mut orphans = ctx.orphans.write().await;
+                orphans.insert(block)
+            };
+            if let Some(parent) = parent {
+                let req = GetDataMessage {
+                    inventory: vec![InvEntry {
+                        inv_type: InvType::Block,
+                        hash: parent,
+                    }],
+                };
+                Self::send(out_tx, Message::new(MessageType::GetData, req.encode())).await?;
+            }
+            return Ok(());
+        }
+
+        // Connect this block, then anything that was waiting on it, and so on
+        // down the parked chain.
+        let mut queue = vec![block];
+        while let Some(candidate) = queue.pop() {
+            let candidate_hash = candidate.hash();
+            let height = candidate.header.height.0;
+
+            let applied = {
+                let mut cs = ctx.chain_state.write().await;
+                match cs.apply_block(&candidate) {
+                    Ok(()) => {
+                        let tip = &cs.tip;
+                        let persisted = chroma_storage::PersistedTip {
+                            height: tip.height.0,
+                            hash: tip.hash,
+                            cumulative_work: tip.cumulative_work.to_be_bytes(),
+                            supply: tip.supply,
+                        };
+                        let _ = ctx.storage.apply_block(&candidate);
+                        let _ = ctx.storage.put_tip(&persisted);
+                        let _ = ctx.storage.put_state(&cs.state);
+                        let _ = ctx.storage.flush();
+                        true
+                    }
+                    Err(e) => {
+                        let _ = ctx
+                            .event_tx
+                            .send(NodeEvent::Error(format!("block validation failed: {}", e)));
+                        false
+                    }
+                }
+            };
+
+            if !applied {
+                // Its children can never connect either.
+                let mut orphans = ctx.orphans.write().await;
+                orphans.remove(&candidate_hash);
+                for child in orphans.take_children_of(&candidate_hash) {
+                    orphans.remove(&child.hash());
+                }
+                continue;
+            }
+
+            {
+                let mut syncer = ctx.syncer.write().await;
+                syncer.insert_header(candidate.header.clone());
+            }
+            ctx.chain_height.store(height, Ordering::Relaxed);
+            let _ = ctx
+                .event_tx
+                .send(NodeEvent::BlockReceived(candidate_hash, height));
+
+            Self::announce_block(ctx, candidate_hash, from).await;
+
+            let unblocked = {
+                let mut orphans = ctx.orphans.write().await;
+                orphans.take_children_of(&candidate_hash)
+            };
+            queue.extend(unblocked);
+        }
+
+        Ok(())
+    }
+
+    /// Announce a block to every ready peer except `except`.
+    ///
+    /// Only the hash goes out: peers that already have it say nothing, and
+    /// only those missing it spend bandwidth asking. Pushing whole blocks to
+    /// everyone would send the same megabyte to peers that already had it.
+    async fn announce_block(ctx: &ConnectionContext, hash: Hash, except: Option<SocketAddr>) {
+        let inv = InvMessage {
+            inventory: vec![InvEntry {
+                inv_type: InvType::Block,
+                hash,
+            }],
+        };
+        let msg = Message::new(MessageType::Inv, inv.encode());
+
+        let peers: Vec<SocketAddr> = {
+            let pm = ctx.peer_manager.read().await;
+            pm.peers_for_announcement()
+        };
+        for addr in peers {
+            if Some(addr) == except {
+                continue;
+            }
+            let _ = ctx
+                .outbound_tx
+                .send(OutboundCommand::Send(addr, msg.clone()));
         }
     }
 
@@ -1174,10 +1377,15 @@ impl Node {
         chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
         chain_height: Arc<AtomicU32>,
+        peer_manager: Arc<RwLock<PeerManager>>,
+        outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
+        syncer: Arc<RwLock<ChainSyncer>>,
         mut shutdown: broadcast::Receiver<()>,
     ) {
-        use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext};
-        use chroma_core::constants::TARGET_BLOCK_TIME_SECS;
+        use chroma_consensus::miner::{
+            assemble_block, mine_block_with_limit, next_block_timestamp, timestamp_is_valid,
+            BlockAssemblyContext,
+        };
         use chroma_core::types::BlockHeight;
         use chroma_core::hash::Hash160;
 
@@ -1195,40 +1403,43 @@ impl Node {
             if shutdown.try_recv().is_ok() {
                 break;
             }
-            let (height, previous_hash, previous_timestamp, bits, parent_state) = {
+            let (height, previous_hash, mtp, bits, parent_state) = {
                 let cs = chain_state.read().await;
                 let tip = &cs.tip;
+                let next_height = tip.height.0 + 1;
                 (
-                    tip.height.0 + 1,
+                    next_height,
                     tip.hash,
-                    tip.header.timestamp,
+                    cs.compute_median_time_past(next_height),
                     tip.header.bits,
                     cs.state.clone(),
                 )
             };
 
-            let network_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let timestamp = std::cmp::max(
-                previous_timestamp + TARGET_BLOCK_TIME_SECS,
-                network_time,
-            );
+            let timestamp = next_block_timestamp(chroma_consensus::now_secs(), mtp);
 
             let ctx = BlockAssemblyContext {
                 height: BlockHeight(height),
                 previous_hash,
-                previous_timestamp: timestamp.saturating_sub(TARGET_BLOCK_TIME_SECS),
+                timestamp,
                 bits,
-                coinbase_recipient: miner_address.clone(),
+                coinbase_recipient: miner_address,
             };
 
             match assemble_block(&ctx, &[], &parent_state) {
                 Ok(mut block) => {
-                    block.header.timestamp = timestamp;
                     match mine_block_with_limit(&mut block, 10_000_000) {
                         Ok(()) => {
+                            // Mining can take a while; if the stamp has gone
+                            // stale meanwhile, rebuild rather than submit a
+                            // block our own validation would reject.
+                            if !timestamp_is_valid(
+                                block.header.timestamp,
+                                chroma_consensus::now_secs(),
+                                mtp,
+                            ) {
+                                continue;
+                            }
                             let mut cs = chain_state.write().await;
                             match cs.apply_block(&block) {
                                 Ok(()) => {
@@ -1245,9 +1456,34 @@ impl Node {
                                     let _ = storage.put_state(&cs.state);
                                     let _ = storage.flush();
 
-                                                            chain_height.store(height, Ordering::Relaxed);
+                                    chain_height.store(height, Ordering::Relaxed);
+                                    {
+                                        let mut sync = syncer.write().await;
+                                        sync.insert_header(block.header.clone());
+                                    }
                                     let _ = event_tx.send(NodeEvent::BlockMined(block_hash, height));
                                     println!("Mined block #{}: {}", height, block_hash.to_hex());
+
+                                    // Announce it, or the block never leaves
+                                    // this node and the network forks.
+                                    let inv = InvMessage {
+                                        inventory: vec![InvEntry {
+                                            inv_type: InvType::Block,
+                                            hash: block_hash,
+                                        }],
+                                    };
+                                    let announcement =
+                                        Message::new(MessageType::Inv, inv.encode());
+                                    let peers: Vec<SocketAddr> = {
+                                        let pm = peer_manager.read().await;
+                                        pm.peers_for_announcement()
+                                    };
+                                    for addr in peers {
+                                        let _ = outbound_tx.send(OutboundCommand::Send(
+                                            addr,
+                                            announcement.clone(),
+                                        ));
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("Mined block rejected: {}", e);

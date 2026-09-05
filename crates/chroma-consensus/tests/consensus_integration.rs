@@ -171,7 +171,7 @@ fn test_block_assembly_and_mining() {
     let ctx = BlockAssemblyContext {
         height: BlockHeight(1),
         previous_hash: genesis.hash(),
-        previous_timestamp: genesis.header.timestamp,
+        timestamp: genesis.header.timestamp + 10,
         bits: easy_bits(),
         coinbase_recipient: alice_addr(),
     };
@@ -703,7 +703,7 @@ fn test_end_to_end_devnet() {
     let ctx = BlockAssemblyContext {
         height: BlockHeight(1),
         previous_hash: genesis.hash,
-        previous_timestamp: genesis.header.timestamp,
+        timestamp: genesis.header.timestamp + 10,
         bits: easy_bits(),
         coinbase_recipient: recipient,
     };
@@ -977,7 +977,7 @@ fn test_devnet_multi_block_mining_and_storage() {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(expected_height),
             previous_hash: prev_hash,
-            previous_timestamp: prev_ts,
+            timestamp: prev_ts + 10,
             bits: easy_bits,
             coinbase_recipient: miner_addr.clone(),
         };

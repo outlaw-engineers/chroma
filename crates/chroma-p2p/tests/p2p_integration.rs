@@ -54,6 +54,26 @@ async fn start_node(tag: &str) -> (Node, SocketAddr, std::path::PathBuf) {
     (node, addr, dir)
 }
 
+/// Start a regtest node. Regtest mining is effectively free, so a node can
+/// actually produce blocks for propagation tests.
+async fn start_regtest_node(
+    tag: &str,
+    mining: bool,
+    connect: Vec<SocketAddr>,
+) -> (Node, SocketAddr, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let params = chroma_consensus::ChainParams::regtest();
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir.clone())
+        .with_mining(mining)
+        .with_connect_addrs(connect);
+    let mut node = Node::new(config);
+    node.run().await.expect("node failed to start");
+    let addr = node.local_addr().expect("listener not bound");
+    (node, addr, dir)
+}
+
 /// A minimal peer implementation driven by the test, so we can control exactly
 /// what goes on the wire and observe exactly what comes back.
 struct RawPeer {
@@ -548,5 +568,158 @@ async fn shutdown_is_graceful_and_releases_the_port() {
     // Shutting down twice must not panic.
     node.shutdown().await;
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Block propagation
+// ---------------------------------------------------------------------------
+
+/// The whole point of phase 4: a block mined on one node reaches another over
+/// the wire and is validated there.
+///
+/// Nothing about this worked before — the miner never announced what it found,
+/// GetData was ignored so nobody ever served a block, and Inv was answered by
+/// asking for everything regardless of what we already had.
+#[tokio::test]
+async fn mined_block_propagates_to_a_peer() {
+    // The listener mines; the dialer only follows.
+    let (miner, miner_addr, dir_a) = start_regtest_node("prop_miner", true, vec![]).await;
+    let (follower, _addr_b, dir_b) =
+        start_regtest_node("prop_follower", false, vec![miner_addr]).await;
+
+    let storage_height = follower.peer_manager();
+    wait_for("the follower to connect", || {
+        let pm = storage_height.clone();
+        async move {
+            let pm = pm.read().await;
+            pm.get_peer(&miner_addr).map(|p| p.state == PeerState::Ready) == Some(true)
+        }
+    })
+    .await;
+
+    // The miner produces blocks and announces them; the follower should end up
+    // holding the same chain without ever mining itself.
+    wait_for("the follower to receive mined blocks", || async {
+        follower.chain_height() >= 2
+    })
+    .await;
+
+    let follower_height = follower.chain_height();
+    let miner_height = miner.chain_height();
+    assert!(
+        follower_height >= 2,
+        "follower should have followed the miner, got height {}",
+        follower_height
+    );
+    assert!(
+        miner_height >= follower_height,
+        "the miner cannot be behind the node following it"
+    );
+
+    // The follower validated and stored them, not just counted them.
+    let tip = follower
+        .storage()
+        .get_block_by_height(follower_height)
+        .expect("storage read")
+        .expect("follower should have stored the block at its tip");
+    assert_eq!(tip.header.height.0, follower_height);
+    assert!(tip.transactions[0].is_coinbase());
+
+    let mut miner = miner;
+    let mut follower = follower;
+    miner.shutdown().await;
+    follower.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// An announcement for a block we already have must not trigger a download.
+#[tokio::test]
+async fn duplicate_announcement_is_not_re_requested() {
+    let (mut node, addr, dir) = start_regtest_node("dup_block", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(addr, 40_010).await;
+    peer.handshake().await;
+
+    // Genesis is the one block the node is guaranteed to hold.
+    let genesis = chroma_consensus::build_genesis_block_with(
+        &chroma_consensus::ChainParams::regtest(),
+    );
+    let inv = chroma_p2p::wire::InvMessage {
+        inventory: vec![chroma_p2p::wire::InvEntry {
+            inv_type: chroma_p2p::wire::InvType::Block,
+            hash: genesis.hash(),
+        }],
+    };
+    peer.send(Message::new(MessageType::Inv, inv.encode())).await;
+
+    // Follow it with a ping. Replies go out in order on the one connection, so
+    // once our pong comes back, any GetData the announcement provoked would
+    // already have arrived. The node also sends pings of its own, so drain
+    // until the pong rather than assuming what lands first.
+    peer.send(Message::new(
+        MessageType::Ping,
+        PingMessage { nonce: 0x5150 }.encode(),
+    ))
+    .await;
+
+    loop {
+        let reply = peer.recv().await.expect("connection closed before the pong");
+        assert_ne!(
+            reply.msg_type,
+            MessageType::GetData,
+            "the node asked for a block it already had"
+        );
+        if reply.msg_type == MessageType::Pong
+            && PingMessage::decode(&reply.payload).unwrap().nonce == 0x5150
+        {
+            break;
+        }
+    }
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// GetData for a block we hold must be answered with the block; for one we do
+/// not, with NotFound.
+#[tokio::test]
+async fn getdata_serves_blocks_and_reports_misses() {
+    let (mut node, addr, dir) = start_regtest_node("serve", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(addr, 40_011).await;
+    peer.handshake().await;
+
+    let genesis = chroma_consensus::build_genesis_block_with(
+        &chroma_consensus::ChainParams::regtest(),
+    );
+    let req = chroma_p2p::wire::GetDataMessage {
+        inventory: vec![chroma_p2p::wire::InvEntry {
+            inv_type: chroma_p2p::wire::InvType::Block,
+            hash: genesis.hash(),
+        }],
+    };
+    peer.send(Message::new(MessageType::GetData, req.encode()))
+        .await;
+
+    let served = peer.recv_expect(MessageType::Block).await;
+    let block = chroma_block::Block::decode_block(&served.payload).expect("served block decodes");
+    assert_eq!(block.hash(), genesis.hash());
+
+    // Now ask for something that does not exist.
+    let req = chroma_p2p::wire::GetDataMessage {
+        inventory: vec![chroma_p2p::wire::InvEntry {
+            inv_type: chroma_p2p::wire::InvType::Block,
+            hash: chroma_core::hash::Hash::blake3(b"no such block"),
+        }],
+    };
+    peer.send(Message::new(MessageType::GetData, req.encode()))
+        .await;
+    let miss = peer.recv_expect(MessageType::NotFound).await;
+    let miss = chroma_p2p::wire::InvMessage::decode(&miss.payload).unwrap();
+    assert_eq!(miss.inventory.len(), 1);
+
+    node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

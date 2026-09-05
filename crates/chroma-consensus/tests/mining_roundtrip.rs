@@ -27,7 +27,7 @@ fn assembly_ctx(height: u32, parent: &chroma_block::BlockHeader) -> BlockAssembl
     BlockAssemblyContext {
         height: BlockHeight(height),
         previous_hash: parent.hash(),
-        previous_timestamp: parent.timestamp,
+        timestamp: parent.timestamp + 10,
         bits: easy_bits(),
         coinbase_recipient: miner_address(),
     }
@@ -217,7 +217,7 @@ fn regtest_chain_advances() {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(height),
             previous_hash: chain.tip.hash,
-            previous_timestamp: chain.tip.header.timestamp,
+            timestamp: chain.tip.header.timestamp + 10,
             bits: chain.tip.header.bits,
             coinbase_recipient: miner_address(),
         };
@@ -249,7 +249,7 @@ fn regtest_never_retargets() {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(height),
             previous_hash: chain.tip.hash,
-            previous_timestamp: chain.tip.header.timestamp,
+            timestamp: chain.tip.header.timestamp + 10,
             bits: chain.tip.header.bits,
             coinbase_recipient: miner_address(),
         };

@@ -23,6 +23,9 @@ enum Commands {
         /// single node can produce blocks immediately.
         #[arg(long, default_value = "devnet")]
         network: String,
+        /// Follow the chain without mining.
+        #[arg(long)]
+        no_mining: bool,
     },
     Wallet {
         #[command(subcommand)]
@@ -96,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Node { listen, connect, data_dir, network } => {
+        Commands::Node { listen, connect, data_dir, network, no_mining } => {
             println!("Starting Chroma node on {}", listen);
             println!("Data directory: {}", data_dir.display());
             if !connect.is_empty() {
@@ -118,7 +121,8 @@ async fn main() -> anyhow::Result<()> {
             let config = chroma_p2p::NodeConfig::new(listen, genesis_hash)
                 .with_params(params)
                 .with_data_dir(data_dir)
-                .with_connect_addrs(connect);
+                .with_connect_addrs(connect)
+                .with_mining(!no_mining);
             let mut node = chroma_p2p::Node::new(config);
             let mut event_rx = node.event_rx().expect("event_rx already taken");
             tokio::spawn(async move {
