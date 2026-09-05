@@ -122,6 +122,9 @@ async fn main() -> anyhow::Result<()> {
                         chroma_p2p::NodeEvent::TxReceived(hash) => {
                             println!("[TX] Received: {}", &hash.to_hex()[..16]);
                         }
+                        chroma_p2p::NodeEvent::HeadersAccepted(count) => {
+                            println!("[SYNC] Accepted {} header(s)", count);
+                        }
                         chroma_p2p::NodeEvent::SyncComplete => {
                             println!("[SYNC] Complete");
                         }

@@ -350,20 +350,30 @@ impl ChainState {
     /// Compute Median Time Past from the last MTP_WINDOW (7) block timestamps.
     /// For height < MTP_WINDOW, uses timestamps from genesis to height-1.
     pub fn compute_median_time_past(&self, height: u32) -> u64 {
-        let mut timestamps: Vec<u64> = Vec::new();
-        let count = std::cmp::min(height as usize, MTP_WINDOW);
-        for i in 0..count {
-            let h = height - 1 - i as u32;
-            if let Some(header) = self.headers.get(&h) {
-                timestamps.push(header.timestamp);
-            }
-        }
-        if timestamps.is_empty() {
-            return 0;
-        }
-        timestamps.sort_unstable();
-        timestamps[timestamps.len() / 2]
+        median_time_past(&self.headers, height)
     }
+}
+
+/// Median Time Past: the median timestamp of the `MTP_WINDOW` headers
+/// preceding `height`.
+///
+/// A block's timestamp must be strictly greater than this (spec §9). Shared
+/// by block validation and by headers-first sync, which validates timestamps
+/// against a header chain that has no blocks behind it yet.
+pub fn median_time_past(headers: &BTreeMap<u32, BlockHeader>, height: u32) -> u64 {
+    let mut timestamps: Vec<u64> = Vec::new();
+    let count = std::cmp::min(height as usize, MTP_WINDOW);
+    for i in 0..count {
+        let h = height - 1 - i as u32;
+        if let Some(header) = headers.get(&h) {
+            timestamps.push(header.timestamp);
+        }
+    }
+    if timestamps.is_empty() {
+        return 0;
+    }
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
 }
 
 // ============================================================================

@@ -19,13 +19,15 @@ use tokio::task::JoinHandle;
 
 use crate::discovery::Discovery;
 use crate::mempool::Mempool;
+use crate::sync::ChainSyncer;
 use crate::peer::{
     ConnectionSlot, PeerManager, PeerState, PEER_TIMEOUT_SECS, PING_INTERVAL_SECS,
     VERSION_TIMEOUT_SECS,
 };
 use crate::wire::{
-    decode_frame, FrameDecode, GetDataMessage, GetHeadersMessage, InvEntry, InvMessage, InvType,
-    Message, MessageType, PingMessage, RejectMessage, VersionMessage, MAX_MESSAGE_SIZE,
+    decode_frame, FrameDecode, GetDataMessage, GetHeadersMessage, HeadersMessage, InvEntry,
+    InvMessage, InvType, Message, MessageType, PingMessage, RejectMessage, VersionMessage,
+    MAX_MESSAGE_SIZE,
 };
 
 /// Capacity of the per-connection outbound queue. Bounded so that a peer that
@@ -116,6 +118,7 @@ pub struct Node {
     discovery: Discovery,
     storage: Arc<chroma_storage::Storage>,
     chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
+    syncer: Arc<RwLock<ChainSyncer>>,
     event_tx: mpsc::UnboundedSender<NodeEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<NodeEvent>>,
     outbound_tx: Option<mpsc::UnboundedSender<OutboundCommand>>,
@@ -137,6 +140,8 @@ pub enum NodeEvent {
     BlockReceived(Hash, u32),
     BlockMined(Hash, u32),
     TxReceived(Hash),
+    /// Number of headers accepted from a peer in one batch.
+    HeadersAccepted(usize),
     SyncComplete,
     Error(String),
 }
@@ -158,6 +163,7 @@ struct ConnectionContext {
     mempool: Arc<RwLock<Mempool>>,
     storage: Arc<chroma_storage::Storage>,
     chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
+    syncer: Arc<RwLock<ChainSyncer>>,
     event_tx: mpsc::UnboundedSender<NodeEvent>,
     chain_height: Arc<AtomicU32>,
     listen_port: u16,
@@ -202,6 +208,13 @@ impl Node {
         let height = chain_state.tip.height.0;
         config.chain_height.store(height, Ordering::Relaxed);
 
+        // Seed the header chain from what is already on disk, so a restarted
+        // node resumes sync from its own tip instead of from genesis.
+        let mut syncer = ChainSyncer::with_genesis(chroma_consensus::build_genesis_block().header);
+        for (_, header) in chain_state.headers.iter() {
+            syncer.insert_header(header.clone());
+        }
+
         Node {
             config,
             peer_manager: Arc::new(RwLock::new(PeerManager::new())),
@@ -209,6 +222,7 @@ impl Node {
             discovery: Discovery::new(),
             storage: Arc::new(storage),
             chain_state: Arc::new(RwLock::new(chain_state)),
+            syncer: Arc::new(RwLock::new(syncer)),
             event_tx,
             event_rx: Some(event_rx),
             outbound_tx: Some(outbound_tx),
@@ -352,6 +366,7 @@ impl Node {
             mempool: self.mempool.clone(),
             storage: self.storage.clone(),
             chain_state: self.chain_state.clone(),
+            syncer: self.syncer.clone(),
             event_tx: self.event_tx.clone(),
             chain_height: self.config.chain_height.clone(),
             listen_port,
@@ -845,6 +860,30 @@ impl Node {
                 };
                 if announce {
                     let _ = ctx.event_tx.send(NodeEvent::PeerConnected(*peer_key));
+
+                    // Ask a peer that claims a longer chain for the headers we
+                    // are missing. Without this the handshake completes and
+                    // both sides simply sit there.
+                    let peer_height = {
+                        let pm = ctx.peer_manager.read().await;
+                        pm.get_peer(peer_key).map(|p| p.height).unwrap_or(0)
+                    };
+                    let request = {
+                        let mut syncer = ctx.syncer.write().await;
+                        let from = syncer.best_hash;
+                        if peer_height > syncer.best_height && !syncer.is_syncing() {
+                            Some(syncer.start_header_sync(*peer_key, from))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(req) = request {
+                        Self::send(
+                            out_tx,
+                            Message::new(MessageType::GetHeaders, req.encode()),
+                        )
+                        .await?;
+                    }
                 }
                 Ok(true)
             }
@@ -926,9 +965,73 @@ impl Node {
             }
 
             MessageType::GetHeaders => {
-                let _ = GetHeadersMessage::decode(&msg.payload)?;
-                // Header serving lands with chain sync (phase 2).
-                Self::send(out_tx, Message::new(MessageType::Headers, vec![0u8; 4])).await?;
+                let req = GetHeadersMessage::decode(&msg.payload)?;
+                let headers = {
+                    let syncer = ctx.syncer.read().await;
+                    syncer.headers_after(&req.start_hash, &req.stop_hash)
+                };
+                Self::send(
+                    out_tx,
+                    Message::new(MessageType::Headers, HeadersMessage { headers }.encode()),
+                )
+                .await?;
+                Ok(true)
+            }
+
+            MessageType::Headers => {
+                let resp = HeadersMessage::decode(&msg.payload)?;
+
+                // An empty response means the peer has nothing beyond what we
+                // already hold, so this branch of the sync is done.
+                if resp.headers.is_empty() {
+                    let mut syncer = ctx.syncer.write().await;
+                    if syncer.sync_peer() == Some(*peer_key) {
+                        syncer.sync_complete();
+                        drop(syncer);
+                        let _ = ctx.event_tx.send(NodeEvent::SyncComplete);
+                    }
+                    return Ok(true);
+                }
+
+                let offered = resp.headers.len();
+                let (batch, best_hash) = {
+                    let mut syncer = ctx.syncer.write().await;
+                    let batch = syncer.absorb_headers(&resp.headers);
+                    (batch, syncer.best_hash)
+                };
+
+                // Persist what was accepted so the chain survives a restart.
+                for header in resp.headers.iter().take(batch.accepted) {
+                    if let Err(e) = ctx.storage.put_header(header.height.0, header) {
+                        let _ = ctx
+                            .event_tx
+                            .send(NodeEvent::Error(format!("storing header: {}", e)));
+                    }
+                }
+                let _ = ctx.storage.flush();
+
+                if let Some(reason) = batch.rejected {
+                    // Headers that do not link up, carry the wrong target, or
+                    // fail their own proof of work are a protocol violation.
+                    Self::penalize(ctx, peer_key, 20).await;
+                    let _ = ctx.event_tx.send(NodeEvent::Error(format!(
+                        "bad headers from {}: {}",
+                        peer_key, reason
+                    )));
+                    return Ok(true);
+                }
+
+                let _ = ctx.event_tx.send(NodeEvent::HeadersAccepted(batch.accepted));
+
+                // A full batch means the peer probably has more.
+                if batch.accepted == offered {
+                    let more = GetHeadersMessage {
+                        start_hash: best_hash,
+                        stop_hash: Hash::ZERO,
+                    };
+                    Self::send(out_tx, Message::new(MessageType::GetHeaders, more.encode()))
+                        .await?;
+                }
                 Ok(true)
             }
 
@@ -992,8 +1095,7 @@ impl Node {
             | MessageType::Addr
             | MessageType::GetAddr
             | MessageType::Reject
-            | MessageType::NotFound
-            | MessageType::Headers => Ok(true),
+            | MessageType::NotFound => Ok(true),
         }
     }
 

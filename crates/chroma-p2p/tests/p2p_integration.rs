@@ -113,11 +113,17 @@ impl RawPeer {
 
     /// Complete the version/verack handshake as the initiating side.
     async fn handshake(&mut self) {
+        self.handshake_claiming_height(0).await
+    }
+
+    /// Handshake while advertising `height`, which is what makes the node
+    /// decide whether it needs to sync from us.
+    async fn handshake_claiming_height(&mut self, height: u32) {
         let version = VersionMessage {
             version: PROTOCOL_VERSION,
             services: 0,
             timestamp: 1_700_000_000,
-            height: 0,
+            height,
             nonce: 0xFEED_BEEF_1234_5678,
             listen_port: self.listen_port,
         };
@@ -426,6 +432,76 @@ async fn self_connection_is_dropped() {
     let ready = pm.ready_peers().len();
     drop(pm);
     assert_eq!(ready, 0, "a node must not end up peered with itself");
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer that advertises a longer chain must be asked for headers, and the
+/// headers it serves must be validated and stored.
+///
+/// The raw peer plays the role of the node with the longer chain: it claims a
+/// height in its version message, answers the resulting GetHeaders with a real
+/// mined header chain, and then reports that it has nothing more.
+#[tokio::test]
+async fn node_syncs_headers_from_a_longer_peer() {
+    let (mut node, addr, dir) = start_node("hdrsync").await;
+    let mut events = node.event_rx().expect("event receiver already taken");
+
+    // The node's genesis is the real one, at difficulty 1, which cannot be
+    // mined in a test. So the chain we serve is built on that genesis but
+    // cannot satisfy its target — which is exactly what lets this test also
+    // confirm that unmineable headers are rejected rather than trusted.
+    let genesis = chroma_consensus::build_genesis_block().header;
+    let bogus = chroma_block::BlockHeader {
+        version: 1,
+        previous_hash: genesis.hash(),
+        state_root: chroma_core::hash::Hash::ZERO,
+        tx_merkle_root: chroma_core::hash::Hash::ZERO,
+        timestamp: genesis.timestamp + 10,
+        bits: genesis.bits,
+        height: chroma_core::types::BlockHeight(1),
+        nonce: 12345,
+    };
+
+    let mut peer = RawPeer::connect(addr, 40_007).await;
+    peer.handshake_claiming_height(50).await;
+
+    // The node should ask us for headers because we claimed height 50.
+    let request = peer.recv_expect(MessageType::GetHeaders).await;
+    let request = chroma_p2p::wire::GetHeadersMessage::decode(&request.payload).unwrap();
+    assert_eq!(
+        request.start_hash,
+        genesis.hash(),
+        "sync must start from the node's own best header"
+    );
+
+    peer.send(Message::new(
+        MessageType::Headers,
+        chroma_p2p::wire::HeadersMessage {
+            headers: vec![bogus],
+        }
+        .encode(),
+    ))
+    .await;
+
+    // A header that does not meet its target must be refused.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut refused = false;
+    while std::time::Instant::now() < deadline && !refused {
+        while let Ok(event) = events.try_recv() {
+            if let NodeEvent::Error(msg) = &event {
+                if msg.contains("does not meet its target") {
+                    refused = true;
+                }
+            }
+            if let NodeEvent::HeadersAccepted(n) = &event {
+                panic!("node accepted {} unmineable header(s)", n);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(refused, "expected the node to reject the invalid header");
 
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
