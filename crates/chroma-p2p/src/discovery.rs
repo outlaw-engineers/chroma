@@ -123,7 +123,18 @@ impl Discovery {
         // tokio's resolver, not `ToSocketAddrs`: the latter blocks the worker
         // thread it runs on, so a slow or unreachable seed would stall
         // unrelated tasks for the whole lookup.
-        match tokio::net::lookup_host(hostport).await {
+        //
+        // Bounded like the TXT lookup is: this runs before the node has any
+        // peers, so a resolver that accepts the query and then never answers
+        // would hold up bootstrapping for as long as it cared to.
+        let lookup = tokio::time::timeout(
+            std::time::Duration::from_secs(DNS_TIMEOUT_SECS),
+            tokio::net::lookup_host(hostport),
+        )
+        .await
+        .ok()?;
+
+        match lookup {
             Ok(addrs) => Some(
                 addrs
                     .map(|socket| PeerAddress::new(node_id, noise_key, socket))

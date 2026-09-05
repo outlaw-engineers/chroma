@@ -205,20 +205,20 @@ impl Storage {
             .insert(&key, encoded)
             .map_err(|e| CoreError::Storage(format!("put_block: {}", e)))?;
 
-        // Also store hash→height mapping
+        // Also store hash→height mapping. This one belongs to the block
+        // itself — a block's height is part of it — so it is safe to write for
+        // any block we hold.
         let height_key = hash_to_height_key(&hash);
         self.db
             .insert(height_key, block.header.height.0.to_le_bytes().to_vec())
             .map_err(|e| CoreError::Storage(format!("put_block height mapping: {}", e)))?;
 
-        // ...and the reverse index, so height lookups do not have to scan.
-        self.db
-            .insert(
-                height_to_hash_key(block.header.height.0),
-                hash.as_bytes().to_vec(),
-            )
-            .map_err(|e| CoreError::Storage(format!("put_block hash index: {}", e)))?;
-
+        // The reverse index is deliberately not written here. It names the
+        // active chain's block at a height, and blocks are stored before
+        // anyone knows whether they will be on the active chain — a losing
+        // branch is stored precisely so a later reorg can replay it. Writing
+        // it here let a side branch repoint the height at itself.
+        // [`Storage::mark_active`] is where that happens.
         Ok(())
     }
 
@@ -425,11 +425,58 @@ impl Storage {
     // Batch Operations
     // ========================================================================
 
-    /// Apply a full block to storage: header, full block, hash mapping.
-    pub fn apply_block(&self, block: &Block) -> Result<()> {
+    /// Record that a block is the active chain's block at its height.
+    ///
+    /// The height-keyed records — the header and the height→hash index —
+    /// describe the active chain, not everything we have stored. Two blocks
+    /// can exist at one height; only one of them is the answer to "what is at
+    /// height H", and the caller is the only one that knows which. A reorg
+    /// rewrites these for every height it moved.
+    pub fn mark_active(&self, block: &Block) -> Result<()> {
         let height = block.header.height.0;
         self.put_header(height, &block.header)?;
+        self.set_hash_for_height(height, &block.hash())?;
+        Ok(())
+    }
+
+    /// Forget the active-chain records above `height`.
+    ///
+    /// A reorg can move the tip to a chain that is shorter than the one it
+    /// replaced, since fork choice is on work and not on length. The heights
+    /// past the new tip would otherwise keep answering with blocks from the
+    /// chain that lost. The blocks themselves are left alone: they are still
+    /// reachable by hash, and a later reorg may need to replay them.
+    ///
+    /// Walks up from `height + 1` and stops at the first height with nothing
+    /// stored, so it costs what it removes rather than a scan of the chain.
+    pub fn clear_heights_above(&self, height: u32) -> Result<()> {
+        let mut h = height.saturating_add(1);
+        loop {
+            let removed = self
+                .db
+                .remove(height_to_hash_key(h))
+                .map_err(|e| CoreError::Storage(format!("clear_heights_above: {}", e)))?;
+            let removed_header = self
+                .db
+                .remove(header_key(h))
+                .map_err(|e| CoreError::Storage(format!("clear_heights_above: {}", e)))?;
+            if removed.is_none() && removed_header.is_none() {
+                return Ok(());
+            }
+            match h.checked_add(1) {
+                Some(next) => h = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Store a block and mark it active, for one that extended the tip.
+    ///
+    /// A block that might be on a losing branch must be stored with
+    /// [`Storage::put_block`] instead, and marked active only if it wins.
+    pub fn apply_block(&self, block: &Block) -> Result<()> {
         self.put_block(block)?;
+        self.mark_active(block)?;
         Ok(())
     }
 
@@ -548,6 +595,81 @@ mod tests {
         }
     }
 
+    /// A block is stored before anyone knows whether it will be on the active
+    /// chain — a losing branch is stored precisely so a later reorg can replay
+    /// it. Storing one must not repoint its height at itself: `put_block` used
+    /// to write the height→hash index, so a side branch arriving at a height
+    /// silently became the answer for that height, and a restart replayed the
+    /// wrong block.
+    #[test]
+    fn test_storing_a_side_branch_does_not_take_over_its_height() {
+        let storage = Storage::open_temporary().unwrap();
+
+        let active = test_block(7);
+        storage.apply_block(&active).unwrap();
+
+        // Same height, different block: a competing branch.
+        let mut rival = test_block(7);
+        rival.header.nonce = 99;
+        assert_ne!(rival.hash(), active.hash());
+        storage.put_block(&rival).unwrap();
+
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(active.hash()),
+            "the active chain's block must still be the answer for its height"
+        );
+        assert_eq!(
+            storage.get_header(7).unwrap().map(|h| h.hash()),
+            Some(active.hash()),
+            "the stored header at a height is the active chain's"
+        );
+
+        // The rival is still readable by hash, which is what a reorg needs.
+        assert_eq!(
+            storage.get_block_by_hash(&rival.hash()).unwrap().map(|b| b.hash()),
+            Some(rival.hash())
+        );
+
+        // ...and it takes over once it is the one that won.
+        storage.mark_active(&rival).unwrap();
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(rival.hash())
+        );
+    }
+
+    /// Fork choice is on work, not length, so a reorg can leave the tip lower
+    /// than it was. The heights above it must stop answering with the chain
+    /// that lost.
+    #[test]
+    fn test_clearing_heights_above_a_lower_tip() {
+        let storage = Storage::open_temporary().unwrap();
+
+        for height in 1..=5 {
+            storage.apply_block(&test_block(height)).unwrap();
+        }
+        assert!(storage.get_block_by_height(5).unwrap().is_some());
+
+        storage.clear_heights_above(3).unwrap();
+
+        assert!(storage.get_block_by_height(3).unwrap().is_some());
+        for height in 4..=5 {
+            assert!(
+                storage.get_block_by_height(height).unwrap().is_none(),
+                "height {} is above the tip and must not answer",
+                height
+            );
+            assert!(storage.get_header(height).unwrap().is_none());
+        }
+
+        // The blocks themselves survive: a later reorg may replay them.
+        assert!(storage
+            .get_block_by_hash(&test_block(5).hash())
+            .unwrap()
+            .is_some());
+    }
+
     fn test_address(n: u8) -> Address {
         let mut h = [0u8; 20];
         h[0] = n;
@@ -638,12 +760,12 @@ mod tests {
     fn test_height_index_round_trip() {
         let storage = Storage::open_temporary().unwrap();
         let block = test_block(7);
-        storage.put_block(&block).unwrap();
+        storage.apply_block(&block).unwrap();
 
         assert_eq!(
             storage.get_hash_for_height(7).unwrap(),
             Some(block.hash()),
-            "put_block must populate the height index"
+            "a block marked active must answer for its height"
         );
         assert_eq!(
             storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
@@ -684,7 +806,7 @@ mod tests {
     fn test_height_index_survives_many_blocks() {
         let storage = Storage::open_temporary().unwrap();
         for h in 0..50u32 {
-            storage.put_block(&test_block(h)).unwrap();
+            storage.apply_block(&test_block(h)).unwrap();
         }
         for h in 0..50u32 {
             assert_eq!(

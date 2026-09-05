@@ -203,6 +203,19 @@ impl VersionMessage {
         buf
     }
 
+    /// Decode a version payload.
+    ///
+    /// Trailing bytes are ignored rather than rejected, which is deliberate
+    /// and the one place in this module that is so. Version is the message
+    /// that negotiates what two nodes speak: a future protocol version adding
+    /// a field here has to remain readable by nodes that predate it, or the
+    /// negotiation below — clamping to `min(theirs, ours)` and rejecting only
+    /// what is older than `MIN_PROTOCOL_VERSION` — could never happen with a
+    /// newer peer. Every other message is fixed by the version already agreed,
+    /// so trailing bytes there mean a peer sending something we did not agree
+    /// to, and those decoders refuse it.
+    ///
+    /// The payload is still bounded: a frame cannot exceed `MAX_MESSAGE_SIZE`.
     pub fn decode(data: &[u8]) -> Result<Self> {
         if data.len() < Self::SERIALIZED_SIZE {
             return Err(CoreError::Serialization("version: too short".to_string()));
@@ -645,6 +658,31 @@ mod tests {
         assert_eq!(dec.height, 100);
         assert_eq!(dec.nonce, 42);
         assert_eq!(dec.listen_port, 8333);
+    }
+
+    /// A newer peer may append fields to its version message. Refusing those
+    /// would mean an older node could never complete a handshake with a newer
+    /// one, and the version negotiation right after this decode would never
+    /// get to run.
+    #[test]
+    fn test_version_accepts_a_longer_payload_from_a_newer_peer() {
+        let version = VersionMessage {
+            version: crate::PROTOCOL_VERSION + 1,
+            services: 1,
+            timestamp: 1_700_000_000,
+            height: 42,
+            nonce: 7,
+            listen_port: 8333,
+        };
+        let mut payload = version.encode();
+        payload.extend_from_slice(b"a field from a later version");
+
+        let decoded = VersionMessage::decode(&payload).expect("must stay readable");
+        assert_eq!(
+            decoded.encode(),
+            version.encode(),
+            "the fields we know must decode unchanged"
+        );
     }
 
     #[test]

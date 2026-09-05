@@ -114,10 +114,21 @@ value: { balance: u64, nonce: u64 } → 16 bytes
 
 Stateは、`(key, value)` ペアをkeyの辞書順でソートしたSorted Merkle Treeによってcommitする。
 
+* `H` = BLAKE3
+* ソート順: keyのバイト列の昇順
 * Leaf: `H(encode(key) || encode(value))`
 * Internal Node: `H(left || right)`
 * Empty Root: 32 bytes of zero
 * Proof: Merkle path（`log₂N` sibling hashes）
+
+**奇数ノードの扱い:** ある段のノード数が奇数の場合、最後のノードを
+**そのまま次の段へ繰り上げる**。複製して自分自身とペアにしてはならない。
+
+これはState Rootの値そのものを変える規則であり、実装間で食い違えば同じStateから
+異なるRootが出てチェーンが分岐する。したがって選択の余地はない。
+
+複製ではなく繰り上げとする理由は、複製した場合、異なる木が同一のRootを持ちうる
+ため（末尾ノードが複製された木と、その複製が実在する木が区別できない)。
 
 ## 8. Difficulty Adjustment
 

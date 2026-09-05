@@ -1695,10 +1695,19 @@ impl Node {
                 let mut cs = ctx.chain_state.write().await;
                 let source = StorageBlocks(ctx.storage.as_ref());
                 // Store first: a reorg replays the branch out of storage, so
-                // the block has to be readable before it can be chosen.
-                let _ = ctx.storage.apply_block(&candidate);
+                // the block has to be readable before it can be chosen. Only
+                // the block itself though — whether it is the active chain's
+                // block at its height is what we are about to find out.
+                let _ = ctx.storage.put_block(&candidate);
                 match cs.apply_block_with(&candidate, &source) {
                     Ok(outcome) => {
+                        // Height-keyed records follow the active chain. A
+                        // block that extended it owns its height; a reorg
+                        // rewrites every height it moved; a side branch is
+                        // stored and otherwise left alone.
+                        if outcome == chroma_consensus::BlockOutcome::Extended {
+                            let _ = ctx.storage.mark_active(&candidate);
+                        }
                         if let chroma_consensus::BlockOutcome::Reorganized { depth } = outcome {
                             let _ = ctx
                                 .event_tx
@@ -1707,6 +1716,10 @@ impl Node {
                                 let _ = ctx.storage.set_hash_for_height(height, &header.hash());
                                 let _ = ctx.storage.put_header(height, &header);
                             }
+                            // Fork choice is on work, not length, so the new
+                            // chain can be shorter. Anything above its tip is
+                            // from the chain that just lost.
+                            let _ = ctx.storage.clear_heights_above(cs.tip.height.0);
                         }
                         let tip = &cs.tip;
                         let persisted = chroma_storage::PersistedTip {

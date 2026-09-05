@@ -245,9 +245,9 @@ impl State {
     /// anything else would leave genesis inconsistent with its own state.
     ///
     /// A level with an odd number of nodes carries the last node up unchanged
-    /// rather than duplicating it. The spec does not pin this down; promotion
-    /// avoids any chance of two different trees sharing a root, which is the
-    /// failure mode duplication is known for.
+    /// rather than duplicating it, as §7.2 requires. Promotion avoids two
+    /// different trees sharing a root, which is the failure mode duplication
+    /// is known for.
     pub fn compute_state_root(&self) -> Hash {
         let mut level = self.leaves();
         if level.is_empty() {
