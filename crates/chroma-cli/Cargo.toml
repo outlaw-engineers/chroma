@@ -25,3 +25,4 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 anyhow = "1"
+rpassword = "7"

@@ -6,6 +6,8 @@ use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
 use chroma_tx::create_transaction;
 use zeroize::Zeroize;
 
+pub mod keystore;
+
 pub struct Wallet {
     secret_key: SecretKey32,
     address: Address,
@@ -59,10 +61,31 @@ impl Wallet {
     }
 }
 
+/// Written by hand rather than derived: a derived `Debug` would print the
+/// secret key, and the first `{:?}` in a log would hand out the wallet.
+impl std::fmt::Debug for Wallet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wallet")
+            .field("name", &self.name)
+            .field("address", &address_to_bech32(&self.address))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for Wallet {
     fn drop(&mut self) {
         self.secret_key.0.zeroize();
     }
+}
+
+/// Render an address in the form users see and paste.
+///
+/// Falls back to the raw form only if the address cannot be encoded, which
+/// would be a bug rather than user input.
+pub fn address_to_bech32(addr: &Address) -> String {
+    chroma_crypto::address::AddressString::from_hash160(&addr.as_hash160(), None)
+        .map(|a| a.0)
+        .unwrap_or_else(|| format!("{}", addr))
 }
 
 /// Number of words a freshly generated phrase has.

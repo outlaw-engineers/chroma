@@ -56,18 +56,22 @@ enum Commands {
 #[derive(Subcommand)]
 enum TxCommands {
     Send {
-        /// Sender's secret key, hex encoded.
+        /// Name of the stored wallet to send from. Its passphrase is prompted
+        /// for: a secret key passed on the command line would be left in the
+        /// shell history and visible to every process on the machine.
         #[arg(long)]
-        secret: String,
+        wallet: String,
         /// Recipient address (bech32m chr1... or 0x hex).
         #[arg(long)]
         to: String,
         /// Amount in units (1 CHR = 1,000,000 units).
         #[arg(long)]
         amount: u64,
-        /// Node to submit to.
-        #[arg(long, default_value = "127.0.0.1:8333")]
-        node: SocketAddr,
+        /// Node to submit to, as `<node-id>.<noise-key>@host:port`. The
+        /// connection is encrypted, so the node's keys are needed to open it
+        /// — take them from the node's startup log.
+        #[arg(long)]
+        node: chroma_p2p::peer::PeerAddress,
         /// Sender's next nonce. Read from --data-dir when omitted.
         #[arg(long)]
         nonce: Option<u64>,
@@ -78,15 +82,37 @@ enum TxCommands {
 
 #[derive(Subcommand)]
 enum WalletCommands {
+    /// Create a wallet, store it encrypted, and print its seed phrase once.
     Create {
         #[arg(short, long)]
         name: String,
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
     },
+    /// Restore a wallet from its seed phrase and store it encrypted.
+    Import {
+        #[arg(short, long)]
+        name: String,
+        /// The 12- or 24-word BIP-39 phrase, quoted.
+        #[arg(long)]
+        seed: String,
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
+    },
+    /// List the wallets stored in the data directory.
+    List {
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
+    },
+    /// Show a wallet's address. Reads the stored wallet unless --seed is given.
     Address {
         #[arg(short, long)]
         name: String,
+        /// Derive from this seed phrase instead of reading the stored wallet.
         #[arg(long)]
-        seed: String,
+        seed: Option<String>,
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
     },
     Balance {
         #[arg(short, long)]
@@ -105,9 +131,36 @@ enum BlockCommands {
 }
 
 fn address_to_bech32(addr: &chroma_core::types::Address) -> String {
-    chroma_crypto::address::AddressString::from_hash160(&addr.as_hash160(), None)
-        .map(|a| a.0)
-        .unwrap_or_else(|| format!("{}", addr))
+    chroma_wallet::address_to_bech32(addr)
+}
+
+/// Environment variable holding a wallet passphrase, for scripts and tests.
+///
+/// Prompting is the normal path. This exists because there is no other way to
+/// drive the CLI unattended, and it is deliberately named so that anyone
+/// reading a script can see the passphrase is sitting in the environment.
+const PASSPHRASE_ENV: &str = "CHROMA_WALLET_PASSPHRASE";
+
+/// Ask for a wallet passphrase.
+///
+/// `confirm` is for a passphrase being set rather than entered: a typo when
+/// creating a wallet locks the key away permanently, so it is asked twice.
+fn ask_passphrase(prompt: &str, confirm: bool) -> anyhow::Result<String> {
+    if let Ok(from_env) = std::env::var(PASSPHRASE_ENV) {
+        return Ok(from_env);
+    }
+
+    let passphrase = rpassword::prompt_password(prompt)?;
+    if passphrase.is_empty() {
+        anyhow::bail!("an empty passphrase would leave the wallet unprotected");
+    }
+    if confirm {
+        let again = rpassword::prompt_password("Confirm passphrase: ")?;
+        if again != passphrase {
+            anyhow::bail!("the passphrases do not match");
+        }
+    }
+    Ok(passphrase)
 }
 
 fn bech32_to_address(s: &str) -> Option<chroma_core::types::Address> {
@@ -145,20 +198,123 @@ fn open_storage(data_dir: &std::path::Path) -> anyhow::Result<chroma_storage::St
     })
 }
 
-/// Submit a signed transaction to a node over the P2P protocol.
+/// A short-lived, encrypted connection to a node, speaking the peer protocol.
 ///
-/// There is no RPC yet (spec §13 leaves it open), so the CLI speaks the same
-/// wire protocol a peer would: handshake, send the transaction, and wait long
-/// enough for the node to have processed it.
+/// There is no RPC yet (spec §13 leaves it open), so the CLI connects the way
+/// a peer would. That means the Noise handshake first: since §10 the link is
+/// encrypted from the first byte, and a plaintext frame would be read as a
+/// handshake message and get the connection dropped.
+struct NodeClient {
+    stream: tokio::net::TcpStream,
+    session: chroma_crypto::noise::Session,
+    /// Ciphertext read but not yet a whole Noise chunk.
+    sealed: Vec<u8>,
+    /// Decrypted bytes not yet a whole protocol frame.
+    plain: Vec<u8>,
+}
+
+impl NodeClient {
+    async fn connect(node: &chroma_p2p::peer::PeerAddress) -> anyhow::Result<Self> {
+        use chroma_crypto::noise::{Handshake, NodeKeypair};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(node.socket).await?;
+
+        // A throwaway identity: this connection exists to hand over one
+        // transaction, and a stable key would only let nodes correlate the
+        // submissions of whoever is running the CLI.
+        let identity = NodeKeypair::generate()?;
+        let mut handshake = Handshake::initiator(&identity, &node.node_id, &node.noise_key)?;
+
+        for step in 0..3 {
+            if step % 2 == 0 {
+                let msg = handshake.write_message()?;
+                stream.write_all(&(msg.len() as u16).to_be_bytes()).await?;
+                stream.write_all(&msg).await?;
+            } else {
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len).await.map_err(|e| {
+                    anyhow::anyhow!("node closed the connection during the handshake: {}", e)
+                })?;
+                let mut msg = vec![0u8; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut msg).await?;
+                handshake.read_message(&msg)?;
+            }
+        }
+
+        Ok(NodeClient {
+            stream,
+            session: handshake.into_session()?,
+            sealed: Vec::new(),
+            plain: Vec::new(),
+        })
+    }
+
+    async fn send(&mut self, msg: chroma_p2p::wire::Message) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let sealed = self.session.encrypt(&msg.encode())?;
+        self.stream.write_all(&sealed).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// Next protocol frame, or `None` if the deadline passes or the node hangs
+    /// up.
+    async fn recv(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<chroma_p2p::wire::Message>> {
+        use chroma_p2p::wire::{decode_frame, FrameDecode};
+        use tokio::io::AsyncReadExt;
+
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            match decode_frame(&self.plain) {
+                Ok(FrameDecode::Complete { message, consumed }) => {
+                    self.plain.drain(..consumed);
+                    return Ok(Some(message));
+                }
+                Ok(FrameDecode::Incomplete { .. }) => {}
+                Err(e) => anyhow::bail!("node sent a malformed frame: {}", e),
+            }
+
+            let n = match tokio::time::timeout_at(deadline, self.stream.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => return Ok(None),
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e.into()),
+            };
+            self.sealed.extend_from_slice(&chunk[..n]);
+
+            // Each Noise chunk is a 4-byte big-endian length and that many
+            // ciphertext bytes; a partial one waits for the rest.
+            while self.sealed.len() >= 4 {
+                let len = u32::from_be_bytes([
+                    self.sealed[0],
+                    self.sealed[1],
+                    self.sealed[2],
+                    self.sealed[3],
+                ]) as usize;
+                if self.sealed.len() < 4 + len {
+                    break;
+                }
+                let ciphertext = self.sealed[..4 + len].to_vec();
+                self.sealed.drain(..4 + len);
+                self.plain
+                    .extend_from_slice(&self.session.decrypt(&ciphertext)?);
+            }
+        }
+    }
+}
+
+/// Submit a signed transaction to a node over the P2P protocol.
 async fn submit_transaction(
-    node: SocketAddr,
+    node: &chroma_p2p::peer::PeerAddress,
     tx: &chroma_tx::Transaction,
 ) -> anyhow::Result<()> {
     use chroma_core::serialize::CanonicalEncode;
-    use chroma_p2p::wire::{decode_frame, FrameDecode, Message, MessageType, VersionMessage};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use chroma_p2p::wire::{Message, MessageType, VersionMessage};
 
-    let mut stream = tokio::net::TcpStream::connect(node).await?;
+    let mut client = NodeClient::connect(node).await?;
 
     let version = VersionMessage {
         version: chroma_p2p::PROTOCOL_VERSION,
@@ -173,68 +329,41 @@ async fn submit_transaction(
         nonce: rand_nonce(),
         listen_port: 0,
     };
-    stream
-        .write_all(&Message::new(MessageType::Version, version.encode()).encode())
+    client
+        .send(Message::new(MessageType::Version, version.encode()))
         .await?;
 
     // Wait for the node's verack before sending, so the transaction is not
     // dropped by a peer that has not finished the handshake.
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; 4096];
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut ready = false;
-    while !ready {
-        loop {
-            match decode_frame(&buf) {
-                Ok(FrameDecode::Complete { message, consumed }) => {
-                    buf.drain(..consumed);
-                    if message.msg_type == MessageType::VerAck {
-                        ready = true;
-                    }
-                    if message.msg_type == MessageType::Version {
-                        stream
-                            .write_all(&Message::new(MessageType::VerAck, vec![]).encode())
-                            .await?;
-                    }
+    loop {
+        match client.recv(deadline).await? {
+            Some(message) => match message.msg_type {
+                MessageType::VerAck => break,
+                MessageType::Version => {
+                    client
+                        .send(Message::new(MessageType::VerAck, vec![]))
+                        .await?
                 }
-                Ok(FrameDecode::Incomplete { .. }) => break,
-                Err(e) => anyhow::bail!("node sent a malformed frame: {}", e),
-            }
+                _ => {}
+            },
+            None => anyhow::bail!("node closed the connection during the handshake"),
         }
-        if ready {
-            break;
-        }
-        let n = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out waiting for the node's handshake"))??;
-        if n == 0 {
-            anyhow::bail!("node closed the connection during the handshake");
-        }
-        buf.extend_from_slice(&chunk[..n]);
     }
 
-    stream
-        .write_all(&Message::new(MessageType::Tx, tx.encode()).encode())
+    client
+        .send(Message::new(MessageType::Tx, tx.encode()))
         .await?;
-    stream.flush().await?;
 
     // Give the node a moment to read and validate before we hang up; a reject
     // arrives on this connection if it did not like it.
-    let listen = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        stream.read(&mut chunk),
-    )
-    .await;
-    if let Ok(Ok(n)) = listen {
-        buf.extend_from_slice(&chunk[..n]);
-        while let Ok(FrameDecode::Complete { message, consumed }) = decode_frame(&buf) {
-            buf.drain(..consumed);
-            if message.msg_type == MessageType::Reject {
-                if let Ok(reject) = chroma_p2p::wire::RejectMessage::decode(&message.payload) {
-                    anyhow::bail!("node rejected the transaction: {}", reject.reason);
-                }
-                anyhow::bail!("node rejected the transaction");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    while let Some(message) = client.recv(deadline).await? {
+        if message.msg_type == MessageType::Reject {
+            if let Ok(reject) = chroma_p2p::wire::RejectMessage::decode(&message.payload) {
+                anyhow::bail!("node rejected the transaction: {}", reject.reason);
             }
+            anyhow::bail!("node rejected the transaction");
         }
     }
 
@@ -389,25 +518,76 @@ async fn main() -> anyhow::Result<()> {
             println!("Stopped cleanly.");
         }
         Commands::Wallet { command } => match command {
-            WalletCommands::Create { name } => {
-                let wallet = chroma_wallet::Wallet::generate(&name);
+            WalletCommands::Create { name, data_dir } => {
+                // The wallet is generated from a phrase rather than a bare
+                // key, so the printed phrase really is a full backup: the
+                // keystore can be lost and the wallet still restored.
+                let phrase = chroma_wallet::generate_seed_phrase();
+                let wallet = chroma_wallet::wallet_from_seed_phrase(&name, &phrase)?;
+                let passphrase = ask_passphrase("New wallet passphrase: ", true)?;
+                let path = chroma_wallet::keystore::save(&data_dir, &wallet, &passphrase)?;
+
                 println!("Wallet created: {}", wallet.name());
                 println!("Address: {}", address_to_bech32(&wallet.address()));
-                println!("Save your secret key:");
-                println!("  {}", hex::encode(wallet.secret_bytes()));
+                println!("Stored:  {}", path.display());
+                println!();
+                println!("Write down the seed phrase. It is shown once and is the only way");
+                println!("to recover this wallet if the file or the passphrase is lost:");
+                println!();
+                println!("  {}", phrase.join(" "));
             }
-            WalletCommands::Address { name, seed } => {
+            WalletCommands::Import { name, seed, data_dir } => {
                 let words: Vec<String> = seed.split_whitespace().map(|s| s.to_string()).collect();
-                match chroma_wallet::wallet_from_seed_phrase(&name, &words) {
-                    Ok(wallet) => {
-                        println!("Wallet '{}':", name);
-                        println!("  Address: {}", address_to_bech32(&wallet.address()));
-                    }
+                let wallet = match chroma_wallet::wallet_from_seed_phrase(&name, &words) {
+                    Ok(wallet) => wallet,
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
+                };
+                let passphrase = ask_passphrase("New wallet passphrase: ", true)?;
+                let path = chroma_wallet::keystore::save(&data_dir, &wallet, &passphrase)?;
+                println!("Wallet imported: {}", wallet.name());
+                println!("Address: {}", address_to_bech32(&wallet.address()));
+                println!("Stored:  {}", path.display());
+            }
+            WalletCommands::List { data_dir } => {
+                let names = chroma_wallet::keystore::list(&data_dir);
+                if names.is_empty() {
+                    println!("No wallets in {}", data_dir.display());
                 }
+                for name in names {
+                    // The address is in the keystore header, so listing does
+                    // not need anyone's passphrase.
+                    match chroma_wallet::keystore::load_address(&data_dir, &name) {
+                        Ok(address) => println!("{}\t{}", name, address),
+                        Err(e) => println!("{}\t<unreadable: {}>", name, e),
+                    }
+                }
+            }
+            WalletCommands::Address { name, seed, data_dir } => {
+                let address = match seed {
+                    Some(seed) => {
+                        let words: Vec<String> =
+                            seed.split_whitespace().map(|s| s.to_string()).collect();
+                        match chroma_wallet::wallet_from_seed_phrase(&name, &words) {
+                            Ok(wallet) => address_to_bech32(&wallet.address()),
+                            Err(e) => {
+                                eprintln!("Error: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    None => match chroma_wallet::keystore::load_address(&data_dir, &name) {
+                        Ok(address) => address,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                };
+                println!("Wallet '{}':", name);
+                println!("  Address: {}", address);
             }
             WalletCommands::Balance { address, data_dir } => {
                 let addr = match bech32_to_address(&address) {
@@ -470,33 +650,22 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::Tx { command } => match command {
             TxCommands::Send {
-                secret,
+                wallet: wallet_name,
                 to,
                 amount,
                 node,
                 nonce,
                 data_dir,
             } => {
-                let secret_bytes = match hex::decode(secret.trim_start_matches("0x")) {
-                    Ok(b) if b.len() == 32 => {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        arr
-                    }
-                    _ => {
-                        eprintln!("Invalid --secret: expected 32 bytes of hex");
-                        std::process::exit(1);
-                    }
-                };
-                let secret_key = match chroma_crypto::schnorr::SecretKey32::from_bytes(secret_bytes)
-                {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("Invalid secret key: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let wallet = chroma_wallet::Wallet::from_secret_key("cli", secret_key)?;
+                let passphrase = ask_passphrase("Wallet passphrase: ", false)?;
+                let wallet =
+                    match chroma_wallet::keystore::load(&data_dir, &wallet_name, &passphrase) {
+                        Ok(wallet) => wallet,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
                 let sender = wallet.address();
 
                 let recipient = match bech32_to_address(&to) {
@@ -540,8 +709,8 @@ async fn main() -> anyhow::Result<()> {
                 println!("Amount: {} units", amount);
                 println!("Nonce:  {}", next_nonce);
 
-                match submit_transaction(node, &tx).await {
-                    Ok(()) => println!("Submitted to {}: {}", node, tx_hash.to_hex()),
+                match submit_transaction(&node, &tx).await {
+                    Ok(()) => println!("Submitted to {}: {}", node.socket, tx_hash.to_hex()),
                     Err(e) => {
                         eprintln!("Submission failed: {}", e);
                         std::process::exit(1);
