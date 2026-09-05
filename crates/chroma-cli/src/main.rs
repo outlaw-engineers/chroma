@@ -26,6 +26,10 @@ enum Commands {
         /// Follow the chain without mining.
         #[arg(long)]
         no_mining: bool,
+        /// Address to pay block rewards to. A fresh one is generated if
+        /// omitted, so two nodes never mine identical blocks by accident.
+        #[arg(long)]
+        miner_address: Option<String>,
     },
     Wallet {
         #[command(subcommand)]
@@ -99,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Node { listen, connect, data_dir, network, no_mining } => {
+        Commands::Node { listen, connect, data_dir, network, no_mining, miner_address } => {
             println!("Starting Chroma node on {}", listen);
             println!("Data directory: {}", data_dir.display());
             if !connect.is_empty() {
@@ -123,6 +127,19 @@ async fn main() -> anyhow::Result<()> {
                 .with_data_dir(data_dir)
                 .with_connect_addrs(connect)
                 .with_mining(!no_mining);
+            let config = match miner_address {
+                Some(text) => match bech32_to_address(&text) {
+                    Some(addr) => config.with_miner_address(addr),
+                    None => {
+                        eprintln!("Invalid --miner-address: expected bech32m (chr1...) or 0x hex");
+                        std::process::exit(1);
+                    }
+                },
+                None => config,
+            };
+            if !no_mining {
+                println!("Mining rewards to: {}", address_to_bech32(&config.miner_address));
+            }
             let mut node = chroma_p2p::Node::new(config);
             let mut event_rx = node.event_rx().expect("event_rx already taken");
             tokio::spawn(async move {
@@ -142,6 +159,13 @@ async fn main() -> anyhow::Result<()> {
                         }
                         chroma_p2p::NodeEvent::TxReceived(hash) => {
                             println!("[TX] Received: {}", &hash.to_hex()[..16]);
+                        }
+                        chroma_p2p::NodeEvent::Reorganized { depth, new_tip } => {
+                            println!(
+                                "[REORG] rolled back {} block(s), new tip {}",
+                                depth,
+                                &new_tip.to_hex()[..16]
+                            );
                         }
                         chroma_p2p::NodeEvent::HeadersAccepted(count) => {
                             println!("[SYNC] Accepted {} header(s)", count);

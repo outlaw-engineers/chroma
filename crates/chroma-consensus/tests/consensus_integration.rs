@@ -190,7 +190,7 @@ fn test_block_assembly_and_mining() {
 
 #[test]
 fn test_block_reward_exact_amount() {
-    let mut state = State::new();
+    let state = State::new();
     let subsidy = state.block_subsidy(0).unwrap();
     assert_eq!(subsidy, BLOCK_REWARD_UNITS);
 }
@@ -685,7 +685,7 @@ fn test_end_to_end_devnet() {
     use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext};
     use chroma_consensus::ChainState;
 
-    let mut chain = ChainState::with_genesis();
+    let chain = ChainState::with_genesis();
 
     let wallet = chroma_wallet::Wallet::generate("devnet-test");
     let recipient = wallet.address();
@@ -920,6 +920,7 @@ fn test_chain_state_loads_from_storage() {
     let chain = ChainState {
         params: chroma_consensus::ChainParams::devnet(),
         headers,
+        index: std::collections::HashMap::new(),
         tip: chain_tip,
         state: chroma_state::State::new(),
         tips,
@@ -934,7 +935,7 @@ fn test_chain_state_loads_from_storage() {
 fn test_devnet_multi_block_mining_and_storage() {
     use chroma_storage::Storage;
     use chroma_consensus::{
-        build_genesis_block, ChainState, calculate_target_for_height,
+        build_genesis_block, ChainState,
         miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext},
     };
     use chroma_core::types::{BlockHeight, Address, CompactTarget};

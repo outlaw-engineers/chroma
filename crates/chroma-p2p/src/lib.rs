@@ -79,6 +79,17 @@ impl From<chroma_core::error::CoreError> for P2pError {
     }
 }
 
+/// A fresh random payout address, so two nodes started the same way do not
+/// mine to the same account.
+pub fn random_address() -> chroma_core::types::Address {
+    let secret = chroma_crypto::schnorr::SecretKey32::generate();
+    let pubkey = chroma_crypto::schnorr::PublicKey32::from_secret(&secret)
+        .expect("a generated secret key always has a public key");
+    chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(
+        chroma_crypto::hash::hash160(&pubkey.0),
+    ))
+}
+
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
     pub connect_addrs: Vec<SocketAddr>,
@@ -89,6 +100,12 @@ pub struct NodeConfig {
     pub mining_enabled: bool,
     /// Consensus parameters for the network this node is on.
     pub params: chroma_consensus::ChainParams,
+    /// Address the block reward is paid to.
+    ///
+    /// Two nodes mining to the same address with the same empty block and the
+    /// same timestamp produce byte-identical blocks, so they never actually
+    /// compete — which silently hides whether fork choice works at all.
+    pub miner_address: chroma_core::types::Address,
 }
 
 impl NodeConfig {
@@ -101,7 +118,13 @@ impl NodeConfig {
             data_dir: PathBuf::from("chroma_data"),
             mining_enabled: true,
             params: chroma_consensus::ChainParams::devnet(),
+            miner_address: random_address(),
         }
+    }
+
+    pub fn with_miner_address(mut self, address: chroma_core::types::Address) -> Self {
+        self.miner_address = address;
+        self
     }
 
     /// Select the network. Also fixes up the expected genesis hash, since
@@ -160,6 +183,8 @@ pub enum NodeEvent {
     TxReceived(Hash),
     /// Number of headers accepted from a peer in one batch.
     HeadersAccepted(usize),
+    /// The active chain was replaced by one with more work.
+    Reorganized { depth: u32, new_tip: Hash },
     SyncComplete,
     Error(String),
 }
@@ -168,6 +193,16 @@ enum OutboundCommand {
     Send(SocketAddr, Message),
     Connect(SocketAddr),
     Disconnect(SocketAddr),
+}
+
+/// Lets consensus read blocks back during a reorg without depending on the
+/// storage crate.
+struct StorageBlocks<'a>(&'a chroma_storage::Storage);
+
+impl chroma_consensus::BlockSource for StorageBlocks<'_> {
+    fn get_block(&self, hash: &Hash) -> Option<chroma_block::Block> {
+        self.0.get_block_by_hash(hash).ok().flatten()
+    }
 }
 
 /// Everything a live connection needs from the node.
@@ -261,57 +296,41 @@ impl Node {
         expected_genesis_hash: Hash,
         params: chroma_consensus::ChainParams,
     ) -> chroma_consensus::ChainState {
-        use chroma_consensus::{build_genesis_block, ChainTip, ChainState};
-        use chroma_core::types::BlockHeight;
+        use chroma_consensus::ChainState;
         use chroma_core::u256::U256;
-        use std::collections::BTreeMap;
 
         match storage.get_tip() {
             Ok(Some(persisted_tip)) => {
-                let mut headers = BTreeMap::new();
-                let mut current_height = 0u32;
-                while let Ok(Some(header)) = storage.get_header(current_height) {
-                    headers.insert(current_height, header);
-                    if current_height == persisted_tip.height {
-                        break;
+                // Replay the stored chain to rebuild state, headers and the
+                // block index together. The previous restore only credited a
+                // dummy address with one subsidy, so a restarted node came
+                // back with account balances that were simply wrong.
+                let mut chain = ChainState::with_params(params);
+                let source = StorageBlocks(storage);
+                let mut restored = 0u32;
+
+                for height in 1..=persisted_tip.height {
+                    match storage.get_block_by_height(height) {
+                        Ok(Some(block)) => match chain.apply_block_with(&block, &source) {
+                            Ok(_) => restored = height,
+                            Err(e) => {
+                                eprintln!(
+                                    "Stopping restore at height {}: {}",
+                                    height, e
+                                );
+                                break;
+                            }
+                        },
+                        _ => break,
                     }
-                    current_height += 1;
                 }
 
-                let mut state = chroma_state::State::new();
-                let total_supply = storage.get_supply().unwrap_or(0);
-                if total_supply > 0 {
-                    state.apply_subsidy(&chroma_core::types::Address::from_hash160(
-                        chroma_core::hash::Hash160([0u8; 20]),
-                    ), persisted_tip.height).ok();
-                }
-
-                let cumulative_work = U256::from_be_bytes(&persisted_tip.cumulative_work);
-                let tip_header = headers.get(&persisted_tip.height).cloned().unwrap_or_else(|| {
-                    build_genesis_block().header
-                });
-
-                let tip = ChainTip {
-                    height: BlockHeight(persisted_tip.height),
-                    hash: persisted_tip.hash,
-                    header: tip_header,
-                    cumulative_work,
-                    supply: persisted_tip.supply,
-                };
-
-                let mut tips = BTreeMap::new();
-                tips.insert(persisted_tip.hash, tip.clone());
-
-                println!("Loaded chain from storage: height={}, supply={} units",
-                    persisted_tip.height, persisted_tip.supply);
-
-                ChainState {
-                    params,
-                    headers,
-                    tip,
-                    state,
-                    tips,
-                }
+                println!(
+                    "Loaded chain from storage: height={}, supply={} units",
+                    restored,
+                    chain.state.total_supply()
+                );
+                chain
             }
             _ => {
                 let chain = ChainState::with_params(params);
@@ -319,8 +338,11 @@ impl Node {
                 let genesis_hash = genesis.hash();
 
                 if expected_genesis_hash != genesis_hash {
-                    eprintln!("Warning: expected genesis hash {} but computed {}",
-                        expected_genesis_hash.to_hex(), genesis_hash.to_hex());
+                    eprintln!(
+                        "Warning: expected genesis hash {} but computed {}",
+                        expected_genesis_hash.to_hex(),
+                        genesis_hash.to_hex()
+                    );
                 }
 
                 storage.apply_block(&genesis).ok();
@@ -448,14 +470,15 @@ impl Node {
             let chain_state = self.chain_state.clone();
             let event_tx = self.event_tx.clone();
             let height = self.config.chain_height.clone();
+            let miner_address = self.config.miner_address;
             let shutdown = self.shutdown_tx.subscribe();
             let peer_mgr = self.peer_manager.clone();
             let miner_tx = outbound_tx.clone();
             let miner_syncer = self.syncer.clone();
             self.tasks.push(tokio::spawn(async move {
                 Self::run_miner(
-                    storage, chain_state, event_tx, height, peer_mgr, miner_tx, miner_syncer,
-                    shutdown,
+                    storage, chain_state, event_tx, height, miner_address, peer_mgr, miner_tx,
+                    miner_syncer, shutdown,
                 )
                 .await;
             }));
@@ -1228,12 +1251,24 @@ impl Node {
         let mut queue = vec![block];
         while let Some(candidate) = queue.pop() {
             let candidate_hash = candidate.hash();
-            let height = candidate.header.height.0;
 
             let applied = {
                 let mut cs = ctx.chain_state.write().await;
-                match cs.apply_block(&candidate) {
-                    Ok(()) => {
+                let source = StorageBlocks(ctx.storage.as_ref());
+                // Store first: a reorg replays the branch out of storage, so
+                // the block has to be readable before it can be chosen.
+                let _ = ctx.storage.apply_block(&candidate);
+                match cs.apply_block_with(&candidate, &source) {
+                    Ok(outcome) => {
+                        if let chroma_consensus::BlockOutcome::Reorganized { depth } = outcome {
+                            let _ = ctx
+                                .event_tx
+                                .send(NodeEvent::Reorganized { depth, new_tip: cs.tip.hash });
+                            for (height, header) in cs.headers.clone() {
+                                let _ = ctx.storage.set_hash_for_height(height, &header.hash());
+                                let _ = ctx.storage.put_header(height, &header);
+                            }
+                        }
                         let tip = &cs.tip;
                         let persisted = chroma_storage::PersistedTip {
                             height: tip.height.0,
@@ -1241,7 +1276,6 @@ impl Node {
                             cumulative_work: tip.cumulative_work.to_be_bytes(),
                             supply: tip.supply,
                         };
-                        let _ = ctx.storage.apply_block(&candidate);
                         let _ = ctx.storage.put_tip(&persisted);
                         let _ = ctx.storage.put_state(&cs.state);
                         let _ = ctx.storage.flush();
@@ -1270,6 +1304,10 @@ impl Node {
                 let mut syncer = ctx.syncer.write().await;
                 syncer.insert_header(candidate.header.clone());
             }
+            let height = {
+                let cs = ctx.chain_state.read().await;
+                cs.tip.height.0
+            };
             ctx.chain_height.store(height, Ordering::Relaxed);
             let _ = ctx
                 .event_tx
@@ -1377,6 +1415,7 @@ impl Node {
         chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
         chain_height: Arc<AtomicU32>,
+        miner_address: chroma_core::types::Address,
         peer_manager: Arc<RwLock<PeerManager>>,
         outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
         syncer: Arc<RwLock<ChainSyncer>>,
@@ -1387,16 +1426,7 @@ impl Node {
             BlockAssemblyContext,
         };
         use chroma_core::types::BlockHeight;
-        use chroma_core::hash::Hash160;
 
-        let miner_address = {
-            let mut addr = [0u8; 20];
-            addr[0] = 0xDE;
-            addr[1] = 0xAD;
-            addr[2] = 0xBE;
-            addr[3] = 0xEF;
-            chroma_core::types::Address::from_hash160(Hash160(addr))
-        };
 
         loop {
             // Checked between rounds; a round in progress finishes first.

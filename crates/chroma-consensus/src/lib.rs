@@ -251,12 +251,52 @@ impl ChainTip {
 // Chain State
 // ============================================================================
 
+/// Somewhere blocks can be fetched from by hash.
+///
+/// A reorg has to replay a branch the chain state never held in memory, so
+/// consensus needs a way to read blocks back without depending on the storage
+/// crate.
+pub trait BlockSource {
+    fn get_block(&self, hash: &Hash) -> Option<Block>;
+}
+
+/// A block source that holds nothing. Fine for a chain that only ever extends.
+pub struct NoBlockSource;
+
+impl BlockSource for NoBlockSource {
+    fn get_block(&self, _hash: &Hash) -> Option<Block> {
+        None
+    }
+}
+
+/// What happened to a block offered to the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// Extended the active chain.
+    Extended,
+    /// Valid, but on a branch with less work than the active chain.
+    SideBranch,
+    /// Replaced the active chain; `depth` blocks were rolled back.
+    Reorganized { depth: u32 },
+    /// Already known.
+    Duplicate,
+}
+
+/// One block in the index of everything we know about.
+#[derive(Clone, Debug)]
+pub struct BlockIndexEntry {
+    pub header: BlockHeader,
+    pub cumulative_work: U256,
+}
+
 /// Full chain state for consensus validation.
 pub struct ChainState {
     /// Consensus parameters for the network this chain belongs to.
     pub params: ChainParams,
-    /// All block headers indexed by height.
+    /// Headers of the *active* chain, indexed by height.
     pub headers: BTreeMap<u32, BlockHeader>,
+    /// Every block we have accepted, on any branch, keyed by hash.
+    pub index: std::collections::HashMap<Hash, BlockIndexEntry>,
     /// Best chain tip.
     pub tip: ChainTip,
     /// Account state at the tip.
@@ -283,9 +323,19 @@ impl ChainState {
         let mut tips = BTreeMap::new();
         tips.insert(genesis_hash, tip.clone());
 
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            genesis_hash,
+            BlockIndexEntry {
+                header: genesis.header.clone(),
+                cumulative_work: tip.cumulative_work,
+            },
+        );
+
         ChainState {
             params,
             headers,
+            index,
             tip: tip.clone(),
             state: State::new(),
             tips,
@@ -293,67 +343,259 @@ impl ChainState {
     }
 
     /// Validate and apply a new block to the best chain.
+    /// Validate a block and, if it now has the most work, make it the tip.
+    ///
+    /// Convenience for a chain that only ever extends; a reorg needs blocks
+    /// that are not in memory, so use [`ChainState::apply_block_with`].
     pub fn apply_block(&mut self, block: &Block) -> Result<()> {
+        self.apply_block_with(block, &NoBlockSource).map(|_| ())
+    }
+
+    /// Validate a block and apply the fork-choice rule.
+    ///
+    /// A block on a branch other than the active one is kept, but only becomes
+    /// the tip when its branch has more accumulated work (spec §2.1). Ties are
+    /// broken by the smaller tip hash.
+    pub fn apply_block_with(
+        &mut self,
+        block: &Block,
+        source: &dyn BlockSource,
+    ) -> Result<BlockOutcome> {
+        let hash = block.hash();
+        if self.index.contains_key(&hash) {
+            return Ok(BlockOutcome::Duplicate);
+        }
+
         let height = block.header.height.0;
+        if height == 0 {
+            return Err(CoreError::InvalidBlock(
+                "genesis is fixed by the network parameters".to_string(),
+            ));
+        }
 
-        let (previous_hash, previous_timestamp, current_supply) = if height == 0 {
-            (Hash::ZERO, 0u64, 0u64)
-        } else {
-            let prev = self.headers.get(&(height - 1)).ok_or_else(|| {
-                CoreError::InvalidBlock(format!("missing parent header at height {}", height - 1))
-            })?;
-            (prev.hash(), prev.timestamp, self.tip.supply)
+        let parent = self
+            .index
+            .get(&block.header.previous_hash)
+            .ok_or_else(|| {
+                CoreError::InvalidBlock(format!(
+                    "missing parent {} for block at height {}",
+                    block.header.previous_hash.to_hex(),
+                    height
+                ))
+            })?
+            .clone();
+
+        if parent.header.height.0 + 1 != height {
+            return Err(CoreError::InvalidBlock(format!(
+                "height {} does not follow parent at {}",
+                height, parent.header.height.0
+            )));
+        }
+
+        let block_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+            &block.header.bits.to_full_target(),
+        ));
+        let cumulative_work = parent
+            .cumulative_work
+            .checked_add(&block_work)
+            .ok_or_else(|| CoreError::Overflow("cumulative work overflow".into()))?;
+
+        let extends_tip = block.header.previous_hash == self.tip.hash;
+        let wins = Self::outranks(&cumulative_work, &hash, &self.tip.cumulative_work, &self.tip.hash);
+
+        if extends_tip {
+            // The common case: validate against the state we already hold.
+            let ctx = self.validation_context(block, &self.headers)?;
+            chroma_block::validate_block(block, &ctx, &mut self.state)?;
+            self.record(block, cumulative_work);
+            self.headers.insert(height, block.header.clone());
+            self.set_tip(block, cumulative_work);
+            return Ok(BlockOutcome::Extended);
+        }
+
+        // A branch block. Validate it against its own branch's headers before
+        // deciding anything, so an invalid block never enters the index.
+        let branch_headers = self.branch_headers(&block.header.previous_hash);
+        let ctx = self.validation_context(block, &branch_headers)?;
+        let mut scratch = self.state_at(&block.header.previous_hash, source)?;
+        chroma_block::validate_block(block, &ctx, &mut scratch)?;
+
+        self.record(block, cumulative_work);
+
+        if !wins {
+            return Ok(BlockOutcome::SideBranch);
+        }
+
+        // This branch now has the most work: switch to it.
+        let depth = self.reorganize(block, cumulative_work, scratch);
+        Ok(BlockOutcome::Reorganized { depth })
+    }
+
+    /// Fork-choice comparison: more work wins; on a tie, the smaller hash.
+    fn outranks(work: &U256, hash: &Hash, other_work: &U256, other_hash: &Hash) -> bool {
+        match work.cmp(other_work) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => hash.0 < other_hash.0,
+        }
+    }
+
+    fn record(&mut self, block: &Block, cumulative_work: U256) {
+        self.index.insert(
+            block.hash(),
+            BlockIndexEntry {
+                header: block.header.clone(),
+                cumulative_work,
+            },
+        );
+    }
+
+    fn set_tip(&mut self, block: &Block, cumulative_work: U256) {
+        let tip = ChainTip {
+            height: block.header.height,
+            hash: block.hash(),
+            header: block.header.clone(),
+            cumulative_work,
+            supply: self.state.total_supply(),
         };
+        self.tip = tip.clone();
+        self.tips.insert(tip.hash, tip);
+    }
 
-        // Compute Median Time Past from the last MTP_WINDOW (7) block timestamps
-        let mtp = self.compute_median_time_past(height);
+    /// Make `block`'s branch the active chain. Returns how many blocks of the
+    /// old chain were rolled back.
+    fn reorganize(&mut self, block: &Block, cumulative_work: U256, new_state: State) -> u32 {
+        let old_height = self.tip.height.0;
 
-        let expected_bits =
-            calculate_target_for_height_with(height, &self.headers, &self.params)?;
+        // Rebuild the active header map by walking the new branch back to
+        // genesis through the index.
+        let mut headers = BTreeMap::new();
+        let mut cursor = block.hash();
+        while let Some(entry) = self.index.get(&cursor) {
+            headers.insert(entry.header.height.0, entry.header.clone());
+            if entry.header.height.0 == 0 {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
 
-        let ctx = BlockValidationContext {
-            previous_hash,
+        let fork_height = self
+            .headers
+            .iter()
+            .filter(|(h, old)| headers.get(h).map(|new| new.hash() == old.hash()) == Some(true))
+            .map(|(h, _)| *h)
+            .max()
+            .unwrap_or(0);
+
+        self.headers = headers;
+        self.state = new_state;
+        self.set_tip(block, cumulative_work);
+
+        old_height.saturating_sub(fork_height)
+    }
+
+    /// Headers along the branch ending at `tip_hash`, deep enough to compute
+    /// the next block's target and median time past.
+    fn branch_headers(&self, tip_hash: &Hash) -> BTreeMap<u32, BlockHeader> {
+        // The retarget reads the header a full window back, and the median
+        // covers MTP_WINDOW; take both plus slack.
+        let depth = DIFFICULTY_ADJUSTMENT_WINDOW as usize + MTP_WINDOW + 2;
+        let mut headers = BTreeMap::new();
+        let mut cursor = *tip_hash;
+        for _ in 0..depth {
+            match self.index.get(&cursor) {
+                Some(entry) => {
+                    headers.insert(entry.header.height.0, entry.header.clone());
+                    if entry.header.height.0 == 0 {
+                        break;
+                    }
+                    cursor = entry.header.previous_hash;
+                }
+                None => break,
+            }
+        }
+        headers
+    }
+
+    /// The account state as of `hash`, rebuilt by replaying its branch.
+    ///
+    /// Replays from genesis. Spec §2.3 calls for a 2000-block journal so a
+    /// shallow reorg does not have to; that is an optimisation over this, not
+    /// a different answer.
+    fn state_at(&self, hash: &Hash, source: &dyn BlockSource) -> Result<State> {
+        if *hash == self.tip.hash {
+            return Ok(self.state.clone());
+        }
+
+        // Collect the branch, genesis first.
+        let mut chain: Vec<Hash> = Vec::new();
+        let mut cursor = *hash;
+        loop {
+            let entry = self.index.get(&cursor).ok_or_else(|| {
+                CoreError::InvalidBlock(format!("branch block {} is unknown", cursor.to_hex()))
+            })?;
+            chain.push(cursor);
+            if entry.header.height.0 == 0 {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
+        chain.reverse();
+
+        let mut state = State::new();
+        let mut headers: BTreeMap<u32, BlockHeader> = BTreeMap::new();
+
+        for block_hash in chain {
+            let entry = self
+                .index
+                .get(&block_hash)
+                .expect("collected from the index");
+            let height = entry.header.height.0;
+            if height == 0 {
+                headers.insert(0, entry.header.clone());
+                continue;
+            }
+
+            let block = source.get_block(&block_hash).ok_or_else(|| {
+                CoreError::InvalidBlock(format!(
+                    "cannot replay branch: block {} is not available",
+                    block_hash.to_hex()
+                ))
+            })?;
+
+            let ctx = self.validation_context(&block, &headers)?;
+            chroma_block::validate_block(&block, &ctx, &mut state)?;
+            headers.insert(height, entry.header.clone());
+        }
+
+        Ok(state)
+    }
+
+    /// Build the validation context for `block` against a given header chain.
+    fn validation_context(
+        &self,
+        block: &Block,
+        headers: &BTreeMap<u32, BlockHeader>,
+    ) -> Result<BlockValidationContext> {
+        let height = block.header.height.0;
+        let parent = headers.get(&(height - 1)).ok_or_else(|| {
+            CoreError::InvalidBlock(format!("missing parent header at height {}", height - 1))
+        })?;
+
+        Ok(BlockValidationContext {
+            previous_hash: parent.hash(),
             expected_height: BlockHeight(height),
-            previous_timestamp,
-            median_time_past: mtp,
-            expected_bits,
-            current_supply,
-            previous_state_root: self.tip.header.state_root,
+            previous_timestamp: parent.timestamp,
+            median_time_past: median_time_past(headers, height),
+            expected_bits: calculate_target_for_height_with(height, headers, &self.params)?,
+            current_supply: self.tip.supply,
+            previous_state_root: parent.state_root,
             // Wall-clock time, not the block's own timestamp. Passing the
             // block's timestamp made the "not too far in the future" check
             // compare the value against itself, so it always passed and
             // spec §9's upper bound was never enforced.
             network_time: now_secs(),
-        };
-
-        chroma_block::validate_block(block, &ctx, &mut self.state)?;
-
-        let new_hash = block.hash();
-        let block_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
-            &block.header.bits.to_full_target(),
-        ));
-        let new_cumulative_work = self
-            .tip
-            .cumulative_work
-            .checked_add(&block_work)
-            .ok_or_else(|| {
-                CoreError::Overflow("cumulative work overflow".into())
-            })?;
-
-        self.headers.insert(height, block.header.clone());
-
-        let new_tip = ChainTip {
-            height: BlockHeight(height),
-            hash: new_hash,
-            header: block.header.clone(),
-            cumulative_work: new_cumulative_work,
-            supply: self.state.total_supply(),
-        };
-
-        self.tip = new_tip.clone();
-        self.tips.insert(new_hash, new_tip);
-
-        Ok(())
+        })
     }
 
     /// Select the best chain tip (greatest cumulative work).
