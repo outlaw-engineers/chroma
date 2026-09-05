@@ -214,6 +214,54 @@ impl VersionMessage {
     }
 }
 
+/// A run of consecutive block headers, in ascending height order.
+///
+/// Encoded as a LEB128 count followed by that many canonical 124-byte headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadersMessage {
+    pub headers: Vec<chroma_block::BlockHeader>,
+}
+
+impl HeadersMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        use chroma_core::serialize::CanonicalEncode;
+        let mut buf = chroma_core::serialize::encode_leb128(self.headers.len() as u64);
+        for header in &self.headers {
+            buf.extend_from_slice(&header.encode());
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        use chroma_core::serialize::CanonicalDecode;
+        let (count, mut pos) = chroma_core::serialize::decode_leb128(data, 0)?;
+        let count = count as usize;
+
+        // Reject an inflated count before allocating for it.
+        let available = data.len().saturating_sub(pos) / chroma_block::BlockHeader::SERIALIZED_SIZE;
+        if count > available {
+            return Err(CoreError::Serialization(format!(
+                "headers: declared {} headers but only {} fit in the payload",
+                count, available
+            )));
+        }
+
+        let mut headers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (header, used) = chroma_block::BlockHeader::decode_partial(&data[pos..])?;
+            headers.push(header);
+            pos += used;
+        }
+        if pos != data.len() {
+            return Err(CoreError::Serialization(format!(
+                "headers: {} trailing bytes",
+                data.len() - pos
+            )));
+        }
+        Ok(HeadersMessage { headers })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PingMessage {
     pub nonce: u64,
@@ -412,6 +460,7 @@ impl RejectMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_core::serialize::CanonicalEncode;
 
     #[test]
     fn test_message_roundtrip() {
@@ -569,6 +618,76 @@ mod tests {
             FrameDecode::Complete { message, consumed } => {
                 assert_eq!(consumed, encoded.len());
                 assert_eq!(message.payload.len(), payload.len());
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    fn sample_header(height: u32) -> chroma_block::BlockHeader {
+        use chroma_core::types::{BlockHeight, CompactTarget};
+        chroma_block::BlockHeader {
+            version: 1,
+            previous_hash: Hash::blake3(&height.to_le_bytes()),
+            state_root: Hash::blake3(b"state"),
+            tx_merkle_root: Hash::blake3(b"txs"),
+            timestamp: 1_700_000_000 + height as u64 * 10,
+            bits: CompactTarget::DIFFICULTY_1,
+            height: BlockHeight(height),
+            nonce: height as u64,
+        }
+    }
+
+    #[test]
+    fn test_headers_roundtrip() {
+        let headers: Vec<_> = (0..5).map(sample_header).collect();
+        let msg = HeadersMessage {
+            headers: headers.clone(),
+        };
+        let dec = HeadersMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(dec.headers, headers);
+    }
+
+    #[test]
+    fn test_headers_empty() {
+        let dec = HeadersMessage::decode(&HeadersMessage { headers: vec![] }.encode()).unwrap();
+        assert!(dec.headers.is_empty());
+    }
+
+    #[test]
+    fn test_headers_rejects_inflated_count() {
+        // A peer claiming more headers than the payload can hold must be
+        // rejected before anything is allocated for the claim.
+        let mut data = chroma_core::serialize::encode_leb128(100_000);
+        data.extend_from_slice(&sample_header(1).encode());
+        assert!(HeadersMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn test_headers_rejects_trailing_bytes() {
+        let mut data = HeadersMessage {
+            headers: vec![sample_header(1)],
+        }
+        .encode();
+        data.push(0xFF);
+        assert!(HeadersMessage::decode(&data).is_err());
+    }
+
+    #[test]
+    fn test_headers_survives_full_frame() {
+        // A maximum-size headers response must fit inside one message.
+        let headers: Vec<_> = (0..crate::sync::MAX_HEADERS_PER_RESPONSE as u32)
+            .map(sample_header)
+            .collect();
+        let payload = HeadersMessage {
+            headers: headers.clone(),
+        }
+        .encode();
+        assert!(payload.len() < MAX_MESSAGE_SIZE);
+
+        let framed = Message::new(MessageType::Headers, payload).encode();
+        match decode_frame(&framed).unwrap() {
+            FrameDecode::Complete { message, .. } => {
+                assert_eq!(HeadersMessage::decode(&message.payload).unwrap().headers, headers);
             }
             other => panic!("expected Complete, got {:?}", other),
         }

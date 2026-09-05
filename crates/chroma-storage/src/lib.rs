@@ -43,6 +43,13 @@ fn hash_to_height_key(hash: &Hash) -> Vec<u8> {
     key
 }
 
+/// Big-endian height so the index iterates in chain order.
+fn height_to_hash_key(height: u32) -> Vec<u8> {
+    let mut key = b"height_to_hash:".to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
 fn account_key(address: &Address) -> Vec<u8> {
     let mut key = b"accounts:".to_vec();
     key.extend_from_slice(address.as_hash160().as_bytes());
@@ -204,6 +211,41 @@ impl Storage {
             .insert(height_key, block.header.height.0.to_le_bytes().to_vec())
             .map_err(|e| CoreError::Storage(format!("put_block height mapping: {}", e)))?;
 
+        // ...and the reverse index, so height lookups do not have to scan.
+        self.db
+            .insert(
+                height_to_hash_key(block.header.height.0),
+                hash.as_bytes().to_vec(),
+            )
+            .map_err(|e| CoreError::Storage(format!("put_block hash index: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Retrieve the block hash stored at a height on the active chain.
+    pub fn get_hash_for_height(&self, height: u32) -> Result<Option<Hash>> {
+        match self
+            .db
+            .get(height_to_hash_key(height))
+            .map_err(|e| CoreError::Storage(format!("get_hash_for_height: {}", e)))?
+        {
+            Some(data) => {
+                let hash = Hash::from_slice(&data)
+                    .map_err(|e| CoreError::Storage(format!("hash index: {}", e)))?;
+                Ok(Some(hash))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Point the height index at `hash`, replacing whatever was there.
+    ///
+    /// A reorg reuses heights, so the index must be rewritten for the new
+    /// branch rather than only appended to.
+    pub fn set_hash_for_height(&self, height: u32, hash: &Hash) -> Result<()> {
+        self.db
+            .insert(height_to_hash_key(height), hash.as_bytes().to_vec())
+            .map_err(|e| CoreError::Storage(format!("set_hash_for_height: {}", e)))?;
         Ok(())
     }
 
@@ -242,25 +284,16 @@ impl Storage {
         }
     }
 
-    /// Get a block by height (looks up hash from tip chain, then fetches block).
-    /// This requires the block to be at a known height.
+    /// Get the block stored at a height on the active chain.
+    ///
+    /// Uses the height→hash index; previously this scanned every
+    /// `hash_to_height` entry in the database on each lookup, which made
+    /// serving a range of blocks quadratic in chain length.
     pub fn get_block_by_height(&self, height: u32) -> Result<Option<Block>> {
-        // We need to find the block hash at this height.
-        // Scan hash_to_height for matching height.
-        let height_bytes = height.to_le_bytes();
-        for entry in self
-            .db
-            .scan_prefix(b"hash_to_height:")
-        {
-            let (key, val) = entry.map_err(|e| CoreError::Storage(format!("scan: {}", e)))?;
-            if val.len() >= 4 && val[..4] == height_bytes {
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&key[15..]); // skip "hash_to_height:" prefix
-                let hash = Hash::from_bytes(hash_bytes);
-                return self.get_block_by_hash(&hash);
-            }
+        match self.get_hash_for_height(height)? {
+            Some(hash) => self.get_block_by_hash(&hash),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     // ========================================================================
@@ -463,6 +496,66 @@ mod tests {
     fn test_open_and_close() {
         let storage = Storage::open_temporary().unwrap();
         let _ = storage;
+    }
+
+    #[test]
+    fn test_height_index_round_trip() {
+        let storage = Storage::open_temporary().unwrap();
+        let block = test_block(7);
+        storage.put_block(&block).unwrap();
+
+        assert_eq!(
+            storage.get_hash_for_height(7).unwrap(),
+            Some(block.hash()),
+            "put_block must populate the height index"
+        );
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(block.hash())
+        );
+        assert!(storage.get_block_by_height(8).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_height_index_is_rewritable_for_reorg() {
+        // A reorg reuses heights, so the index has to be repointable rather
+        // than append-only.
+        let storage = Storage::open_temporary().unwrap();
+
+        let mut original = test_block(3);
+        original.header.nonce = 1;
+        storage.put_block(&original).unwrap();
+
+        let mut replacement = test_block(3);
+        replacement.header.nonce = 2;
+        storage.put_block(&replacement).unwrap();
+        assert_ne!(original.hash(), replacement.hash());
+
+        storage
+            .set_hash_for_height(3, &replacement.hash())
+            .unwrap();
+        assert_eq!(
+            storage.get_block_by_height(3).unwrap().map(|b| b.hash()),
+            Some(replacement.hash()),
+            "the height index must follow the active branch"
+        );
+
+        // The displaced block is still retrievable by hash.
+        assert!(storage.get_block_by_hash(&original.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_height_index_survives_many_blocks() {
+        let storage = Storage::open_temporary().unwrap();
+        for h in 0..50u32 {
+            storage.put_block(&test_block(h)).unwrap();
+        }
+        for h in 0..50u32 {
+            assert_eq!(
+                storage.get_block_by_height(h).unwrap().map(|b| b.header.height.0),
+                Some(h)
+            );
+        }
     }
 
     #[test]
