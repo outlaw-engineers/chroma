@@ -79,6 +79,11 @@ impl NodeConfig {
         self.data_dir = data_dir;
         self
     }
+
+    pub fn with_connect_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.connect_addrs = addrs;
+        self
+    }
 }
 
 pub struct Node {
@@ -256,9 +261,19 @@ impl Node {
         let peer_mgr_out = peer_mgr.clone();
         let event_tx_out = event_tx.clone();
         let chain_height_out = self.config.chain_height.clone();
+        let storage_out = self.storage.clone();
+        let chain_state_out = self.chain_state.clone();
         tokio::spawn(async move {
-            Self::run_outbound(peer_mgr_out, outbound_rx, event_tx_out, chain_height_out).await;
+            Self::run_outbound(
+                peer_mgr_out, outbound_rx, event_tx_out, chain_height_out,
+                storage_out, chain_state_out,
+            ).await;
         });
+
+        let outbound_tx_ref = self.outbound_tx.as_ref().unwrap();
+        for addr in &self.config.connect_addrs {
+            let _ = outbound_tx_ref.send(OutboundCommand::Connect(*addr));
+        }
 
         let peer_mgr_in = peer_mgr.clone();
         let mempool_in = mempool.clone();
@@ -281,8 +296,9 @@ impl Node {
         });
 
         let peer_mgr_tick = peer_mgr.clone();
+        let outbound_tx_tick = self.outbound_tx.as_ref().unwrap().clone();
         tokio::spawn(async move {
-            Self::run_peer_tick(peer_mgr_tick).await;
+            Self::run_peer_tick(peer_mgr_tick, outbound_tx_tick).await;
         });
 
         let mining_storage = self.storage.clone();
@@ -301,6 +317,8 @@ impl Node {
         mut outbound_rx: mpsc::UnboundedReceiver<OutboundCommand>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
         chain_height: Arc<AtomicU32>,
+        storage: Arc<chroma_storage::Storage>,
+        chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     ) {
         while let Some(cmd) = outbound_rx.recv().await {
             match cmd {
@@ -318,7 +336,16 @@ impl Node {
                     )
                     .await
                     {
-                        Ok(Ok(stream)) => {
+                        Ok(Ok(mut stream)) => {
+                            let pm = peer_manager.write().await;
+                            if let Some(peer) = pm.get_peer(&addr) {
+                                if peer.state == PeerState::Ready || peer.state == PeerState::Connected {
+                                    drop(pm);
+                                    continue;
+                                }
+                            }
+                            drop(pm);
+
                             let mut pm = peer_manager.write().await;
                             pm.add_peer(addr);
                             if let Some(peer) = pm.get_peer_mut(&addr) {
@@ -326,7 +353,6 @@ impl Node {
                                 peer.connected_at = Some(std::time::Instant::now());
                             }
                             drop(pm);
-                            let _ = event_tx.send(NodeEvent::PeerConnected(addr));
 
                             let height = chain_height.load(Ordering::Relaxed);
                             let version = VersionMessage {
@@ -340,8 +366,32 @@ impl Node {
                                 nonce: rand_u64(),
                             };
                             let msg = Message::new(MessageType::Version, version.encode());
-                            let mut stream = stream;
-                            let _ = stream.write_all(&msg.encode()).await;
+                            if stream.write_all(&msg.encode()).await.is_err() {
+                                let mut pm = peer_manager.write().await;
+                                if let Some(peer) = pm.get_peer_mut(&addr) {
+                                    peer.score_bad(5);
+                                }
+                                continue;
+                            }
+
+                            let pm = peer_manager.clone();
+                            let et = event_tx.clone();
+                            let et2 = event_tx.clone();
+                            let ch = chain_height.clone();
+                            let st = storage.clone();
+                            let cs = chain_state.clone();
+                            tokio::spawn(async move {
+                                match Self::handle_connection(
+                                    stream, addr, pm, et, ch, st, cs, true,
+                                ).await {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        let _ = et2.send(NodeEvent::Error(
+                                            format!("{}: {}", addr, e),
+                                        ));
+                                    }
+                                }
+                            });
                         }
                         _ => {
                             let mut pm = peer_manager.write().await;
@@ -400,7 +450,7 @@ impl Node {
             let cs = chain_state.clone();
 
             tokio::spawn(async move {
-                match Self::handle_connection(stream, addr, pm, et, ch, st, cs).await {
+                match Self::handle_connection(stream, addr, pm, et, ch, st, cs, false).await {
                     Ok(()) => {}
                     Err(e) => {
                         let _ = et2.send(NodeEvent::Error(format!("{}: {}", addr, e)));
@@ -418,6 +468,7 @@ impl Node {
         chain_height: Arc<AtomicU32>,
         storage: Arc<chroma_storage::Storage>,
         chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
+        already_sent_version: bool,
     ) -> Result<(), P2pError> {
         {
             let mut pm = peer_manager.write().await;
@@ -428,19 +479,21 @@ impl Node {
             }
         }
 
-        let height = chain_height.load(Ordering::Relaxed);
-        let version = VersionMessage {
-            version: PROTOCOL_VERSION,
-            services: SERVICES,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            height,
-            nonce: rand_u64(),
-        };
-        let msg = Message::new(MessageType::Version, version.encode());
-        stream.write_all(&msg.encode()).await?;
+        if !already_sent_version {
+            let height = chain_height.load(Ordering::Relaxed);
+            let version = VersionMessage {
+                version: PROTOCOL_VERSION,
+                services: SERVICES,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                height,
+                nonce: rand_u64(),
+            };
+            let msg = Message::new(MessageType::Version, version.encode());
+            stream.write_all(&msg.encode()).await?;
+        }
 
         let mut buf = vec![0u8; 8192];
         let mut read_pos = 0;
@@ -582,21 +635,22 @@ impl Node {
         Ok(())
     }
 
-    async fn run_peer_tick(peer_manager: Arc<RwLock<PeerManager>>) {
+    async fn run_peer_tick(
+        peer_manager: Arc<RwLock<PeerManager>>,
+        outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
+    ) {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
         loop {
             interval.tick().await;
             let pm = peer_manager.read().await;
-            let peers: Vec<SocketAddr> = pm.ready_peers().into_iter().map(|p| p.addr).collect();
+            let addrs: Vec<SocketAddr> = pm.peers_for_announcement();
             drop(pm);
 
-            for addr in peers {
+            for addr in addrs {
                 let ping = PingMessage { nonce: rand_u64() };
                 let msg = Message::new(MessageType::Ping, ping.encode());
-                if let Ok(mut stream) = TcpStream::connect(addr).await {
-                    let _ = stream.write_all(&msg.encode()).await;
-                }
+                let _ = outbound_tx.send(OutboundCommand::Send(addr, msg));
             }
         }
     }
@@ -709,7 +763,7 @@ impl Node {
             let peers = self.peer_manager.clone();
             tokio::spawn(async move {
                 let pm = peers.read().await;
-                let addrs: Vec<SocketAddr> = pm.peers_for_announcement();
+            let addrs: Vec<SocketAddr> = pm.connected_peers().into_iter().map(|p| p.addr).collect();
                 drop(pm);
                 for addr in addrs {
                     let _ = tx.send(OutboundCommand::Send(addr, msg.clone()));

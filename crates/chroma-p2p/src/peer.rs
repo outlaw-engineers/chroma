@@ -10,7 +10,7 @@ pub const BAN_SCORE_THRESHOLD: i32 = -200;
 pub const MAX_OUTBOUND_PEERS: usize = 8;
 pub const MAX_INBOUND_PEERS: usize = 16;
 pub const PEER_TIMEOUT_SECS: u64 = 30;
-pub const PING_INTERVAL_SECS: u64 = 60;
+pub const PING_INTERVAL_SECS: u64 = 5;
 pub const VERSION_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +123,13 @@ impl PeerManager {
         self.peers
             .values()
             .filter(|p| p.state == PeerState::Ready && !p.is_banned())
+            .collect()
+    }
+
+    pub fn connected_peers(&self) -> Vec<&PeerInfo> {
+        self.peers
+            .values()
+            .filter(|p| !matches!(p.state, PeerState::Disconnected) && !p.is_banned())
             .collect()
     }
 

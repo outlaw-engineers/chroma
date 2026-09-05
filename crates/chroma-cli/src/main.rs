@@ -100,11 +100,37 @@ async fn main() -> anyhow::Result<()> {
             let genesis = chroma_consensus::build_genesis_block();
             let genesis_hash = genesis.hash();
             let config = chroma_p2p::NodeConfig::new(listen, genesis_hash)
-                .with_data_dir(data_dir);
+                .with_data_dir(data_dir)
+                .with_connect_addrs(connect);
             let mut node = chroma_p2p::Node::new(config);
-            for addr in &connect {
-                node.connect(*addr);
-            }
+            let mut event_rx = node.event_rx().expect("event_rx already taken");
+            tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        chroma_p2p::NodeEvent::PeerConnected(addr) => {
+                            println!("[PEER] Connected: {}", addr);
+                        }
+                        chroma_p2p::NodeEvent::PeerDisconnected(addr) => {
+                            println!("[PEER] Disconnected: {}", addr);
+                        }
+                        chroma_p2p::NodeEvent::BlockReceived(hash, height) => {
+                            println!("[BLOCK] Received: height={} hash={}", height, &hash.to_hex()[..16]);
+                        }
+                        chroma_p2p::NodeEvent::BlockMined(hash, height) => {
+                            println!("[BLOCK] Mined: height={} hash={}", height, &hash.to_hex()[..16]);
+                        }
+                        chroma_p2p::NodeEvent::TxReceived(hash) => {
+                            println!("[TX] Received: {}", &hash.to_hex()[..16]);
+                        }
+                        chroma_p2p::NodeEvent::SyncComplete => {
+                            println!("[SYNC] Complete");
+                        }
+                        chroma_p2p::NodeEvent::Error(e) => {
+                            eprintln!("[ERROR] {}", e);
+                        }
+                    }
+                }
+            });
             node.run().await?;
             tokio::signal::ctrl_c().await?;
             println!("Shutting down...");
