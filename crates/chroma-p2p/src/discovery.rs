@@ -10,7 +10,11 @@ use crate::peer::PeerManager;
 pub const SEED_NODES: &[&str] = &[];
 
 /// DNS seeds. Each name resolves to a set of bootstrap node addresses.
-pub const DNS_SEEDS: &[&str] = &["seed.chroma.network:8333"];
+///
+/// The record does not exist yet, so resolution fails and the failure budget
+/// below stops it being retried. Bootstrapping is via `--connect` until the
+/// record is published.
+pub const DNS_SEEDS: &[&str] = &["seed.chroma.org.uk:8333"];
 
 pub const MAX_SEED_FAILURES: usize = 3;
 
