@@ -434,6 +434,7 @@ impl AddrMessage {
         let mut buf = chroma_core::serialize::encode_leb128(count as u64);
         for peer in self.addrs.iter().take(count) {
             buf.extend_from_slice(&peer.node_id.0);
+            buf.extend_from_slice(&peer.noise_key.0);
             match peer.socket.ip() {
                 IpAddr::V4(v4) => {
                     buf.push(4);
@@ -468,6 +469,17 @@ impl AddrMessage {
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&data[pos..pos + 32]);
+            pos += 32;
+
+            // The static key travels with the identity: without it the entry
+            // cannot be dialed, and a receiver has no way to fill it in.
+            if pos + 32 > data.len() {
+                return Err(CoreError::Serialization(
+                    "addr: truncated noise key".to_string(),
+                ));
+            }
+            let mut noise_key = [0u8; 32];
+            noise_key.copy_from_slice(&data[pos..pos + 32]);
             pos += 32;
 
             if pos >= data.len() {
@@ -511,6 +523,7 @@ impl AddrMessage {
 
             addrs.push(crate::peer::PeerAddress::new(
                 chroma_crypto::noise::NodeId(key),
+                chroma_crypto::noise::NoiseKey(noise_key),
                 SocketAddr::new(ip, port),
             ));
         }
@@ -878,6 +891,15 @@ mod tests {
         assert_eq!(dec.inventory.len(), 1);
     }
 
+    /// A peer address with distinct, arbitrary keys.
+    fn test_peer(socket: std::net::SocketAddr) -> crate::peer::PeerAddress {
+        crate::peer::PeerAddress::new(
+            chroma_crypto::noise::NodeId::generate(),
+            chroma_crypto::noise::NoiseKey::from_bytes(chroma_crypto::noise::NodeId::generate().0),
+            socket,
+        )
+    }
+
     #[test]
     fn test_addr_roundtrip() {
         use std::net::SocketAddr;
@@ -887,7 +909,7 @@ mod tests {
             "[2001:db8::1]:8333".parse::<SocketAddr>().unwrap(),
         ]
         .into_iter()
-        .map(|s| crate::peer::PeerAddress::new(chroma_crypto::noise::NodeId::generate(), s))
+        .map(test_peer)
         .collect();
         let msg = AddrMessage {
             addrs: addrs.clone(),
@@ -907,7 +929,7 @@ mod tests {
         // A declared count beyond the cap must be refused before anything is
         // allocated for it.
         let mut payload = chroma_core::serialize::encode_leb128((MAX_ADDRS_PER_MESSAGE + 1) as u64);
-        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&[0u8; 64]);
         payload.push(4);
         payload.extend_from_slice(&[127, 0, 0, 1]);
         payload.extend_from_slice(&8333u16.to_le_bytes());
@@ -917,10 +939,7 @@ mod tests {
     #[test]
     fn test_addr_rejects_truncated_and_trailing() {
         let msg = AddrMessage {
-            addrs: vec![crate::peer::PeerAddress::new(
-                chroma_crypto::noise::NodeId::generate(),
-                "127.0.0.1:8333".parse().unwrap(),
-            )],
+            addrs: vec![test_peer("127.0.0.1:8333".parse().unwrap())],
         };
         let encoded = msg.encode();
         assert!(AddrMessage::decode(&encoded[..encoded.len() - 1]).is_err());
@@ -933,7 +952,7 @@ mod tests {
     #[test]
     fn test_addr_rejects_unknown_family() {
         let mut payload = chroma_core::serialize::encode_leb128(1);
-        payload.extend_from_slice(&[0u8; 32]);
+        payload.extend_from_slice(&[0u8; 64]);
         payload.push(9); // neither 4 nor 6
         payload.extend_from_slice(&[0; 4]);
         payload.extend_from_slice(&8333u16.to_le_bytes());
@@ -945,10 +964,10 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let addrs: Vec<crate::peer::PeerAddress> = (0..(MAX_ADDRS_PER_MESSAGE + 50))
             .map(|i| {
-                crate::peer::PeerAddress::new(
-                    chroma_crypto::noise::NodeId::generate(),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 8333),
-                )
+                test_peer(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)),
+                    8333,
+                ))
             })
             .collect();
         let decoded = AddrMessage::decode(&AddrMessage { addrs }.encode()).unwrap();

@@ -14,7 +14,7 @@ use chroma_core::serialize::CanonicalEncode;
 use chroma_core::types::{Address, Amount, Nonce};
 use chroma_crypto::hash::hash160;
 use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
-use chroma_crypto::noise::{Handshake, NodeId, NodeKeypair, Session};
+use chroma_crypto::noise::{Handshake, NodeId, NodeKeypair, NoiseKey, Session};
 use chroma_p2p::peer::{PeerAddress, PeerState};
 use chroma_p2p::wire::{
     decode_frame, FrameDecode, Message, MessageType, PingMessage, VersionMessage,
@@ -58,7 +58,7 @@ async fn start_node(tag: &str) -> (Node, SocketAddr, std::path::PathBuf) {
 /// The dialable identity of a running node: everything a peer needs to reach
 /// it, including the Noise key the handshake authenticates it against.
 fn peer_of(node: &Node) -> PeerAddress {
-    PeerAddress::new(node.node_id(), node.local_addr().expect("listener not bound"))
+    node.peer_address().expect("listener not bound")
 }
 
 /// Start a regtest node. Regtest mining is effectively free, so a node can
@@ -103,7 +103,7 @@ impl RawPeer {
 
     async fn connect_to(peer: PeerAddress, listen_port: u16) -> Self {
         let mut stream = TcpStream::connect(peer.socket).await.expect("dial failed");
-        let session = Self::noise_handshake(&mut stream, peer.node_id).await;
+        let session = Self::noise_handshake(&mut stream, peer.node_id, peer.noise_key).await;
         RawPeer {
             stream,
             sealed: Vec::new(),
@@ -115,13 +115,18 @@ impl RawPeer {
 
     /// The initiator half of `Noise_XK`, framed the way the node frames it:
     /// three messages, each behind a 2-byte big-endian length.
-    async fn noise_handshake(stream: &mut TcpStream, remote: NodeId) -> Session {
+    async fn noise_handshake(
+        stream: &mut TcpStream,
+        remote: NodeId,
+        remote_key: NoiseKey,
+    ) -> Session {
         let identity = NodeKeypair::generate().expect("keygen failed");
-        let mut handshake = Handshake::initiator(&identity, &remote).expect("handshake setup");
+        let mut handshake =
+            Handshake::initiator(&identity, &remote, &remote_key).expect("handshake setup");
 
         for step in 0..3 {
             if step % 2 == 0 {
-                let msg = handshake.write_message(&[]).expect("handshake write");
+                let msg = handshake.write_message().expect("handshake write");
                 stream
                     .write_all(&(msg.len() as u16).to_be_bytes())
                     .await
@@ -1237,20 +1242,21 @@ async fn plaintext_dialer_is_refused() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// XK authenticates the responder against the key the dialer already holds.
-/// Dialing the right address with the wrong identity must fail rather than
-/// silently connect: otherwise the pinned key would be decoration.
+/// XK does the Diffie-Hellman against the static key the dialer already
+/// holds, so a connection opened with somebody else's key cannot even be read
+/// by the node it reached.
 #[tokio::test]
-async fn handshake_fails_against_the_wrong_identity() {
-    let (mut node, addr, dir) = start_node("wrongid").await;
+async fn handshake_fails_against_the_wrong_static_key() {
+    let (mut node, addr, dir) = start_node("wrongkey").await;
 
-    let impostor = NodeKeypair::generate().unwrap().node_id();
-    assert_ne!(impostor, node.node_id());
+    let impostor = NodeKeypair::generate().unwrap();
+    assert_ne!(impostor.noise_key(), node.noise_key());
 
     let mut stream = TcpStream::connect(addr).await.expect("dial failed");
     let identity = NodeKeypair::generate().unwrap();
-    let mut handshake = Handshake::initiator(&identity, &impostor).unwrap();
-    let msg = handshake.write_message(&[]).unwrap();
+    let mut handshake =
+        Handshake::initiator(&identity, &impostor.node_id(), &impostor.noise_key()).unwrap();
+    let msg = handshake.write_message().unwrap();
     stream
         .write_all(&(msg.len() as u16).to_be_bytes())
         .await
@@ -1263,7 +1269,57 @@ async fn handshake_fails_against_the_wrong_identity() {
     let reply = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len)).await;
     assert!(
         matches!(reply, Ok(Err(_))) || reply.is_err(),
-        "a handshake to the wrong identity must not complete"
+        "a handshake to the wrong static key must not complete"
+    );
+
+    let pm = node.peer_manager();
+    let ready = pm.read().await.ready_peers().len();
+    assert_eq!(ready, 0);
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The identity is the half of an address that has to be right. Reaching a
+/// node whose static key works but whose ed25519 identity is not the one we
+/// asked for must fail: that is the case where someone handed us an address
+/// with their own transport key spliced in.
+#[tokio::test]
+async fn handshake_fails_when_the_identity_is_not_the_expected_one() {
+    let (mut node, addr, dir) = start_node("wrongid").await;
+
+    let wanted = NodeKeypair::generate().unwrap().node_id();
+    assert_ne!(wanted, node.node_id());
+
+    let mut stream = TcpStream::connect(addr).await.expect("dial failed");
+    let identity = NodeKeypair::generate().unwrap();
+    // The node's real static key, but an identity it cannot prove.
+    let mut handshake = Handshake::initiator(&identity, &wanted, &node.noise_key()).unwrap();
+
+    let msg = handshake.write_message().unwrap();
+    stream
+        .write_all(&(msg.len() as u16).to_be_bytes())
+        .await
+        .expect("write failed");
+    stream.write_all(&msg).await.expect("write failed");
+
+    // The node answers — its key is genuine — but the proof it sends names a
+    // different node, and the dialer refuses it.
+    let mut len = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len))
+        .await
+        .expect("timed out")
+        .expect("the node should answer, its static key is real");
+    let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
+    stream.read_exact(&mut reply).await.expect("read failed");
+
+    let err = handshake
+        .read_message(&reply)
+        .expect_err("a proof from another identity must be refused");
+    assert!(
+        format!("{}", err).contains("expected node"),
+        "unexpected error: {}",
+        err
     );
 
     let pm = node.peer_manager();

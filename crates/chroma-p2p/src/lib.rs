@@ -233,6 +233,9 @@ struct ConnectionOrigin {
     /// Proved by the Noise handshake, so it is the one thing here that a peer
     /// cannot lie about.
     remote_id: chroma_crypto::noise::NodeId,
+    /// The static key that identity signed. Recorded alongside because it is
+    /// what another node would need to dial this peer.
+    remote_key: chroma_crypto::noise::NoiseKey,
 }
 
 /// Everything a live connection needs from the node.
@@ -500,10 +503,21 @@ impl Node {
         self.chain_state.clone()
     }
 
-    /// This node's Noise identity. Peers need it to dial us, since XK
-    /// authenticates the responder by a key known in advance.
+    /// This node's identity: the ed25519 key peers pin it by.
     pub fn node_id(&self) -> chroma_crypto::noise::NodeId {
         self.identity.node_id()
+    }
+
+    /// This node's X25519 static key, which a dialer needs in advance for the
+    /// XK handshake.
+    pub fn noise_key(&self) -> chroma_crypto::noise::NoiseKey {
+        self.identity.noise_key()
+    }
+
+    /// The address a peer would use to dial this node, once it is listening.
+    pub fn peer_address(&self) -> Option<crate::peer::PeerAddress> {
+        self.local_addr
+            .map(|socket| crate::peer::PeerAddress::new(self.node_id(), self.noise_key(), socket))
     }
 
     pub fn chain_height(&self) -> u32 {
@@ -709,7 +723,13 @@ impl Node {
                     tokio::spawn(async move {
                         let event_tx = ctx.event_tx.clone();
                         if let Err(e) =
-                            Self::handle_connection(stream, addr, ctx, Some(peer.node_id)).await
+                            Self::handle_connection(
+                                stream,
+                                addr,
+                                ctx,
+                                Some((peer.node_id, peer.noise_key)),
+                            )
+                            .await
                         {
                             let _ = event_tx.send(NodeEvent::Error(format!("{}: {}", addr, e)));
                         }
@@ -798,7 +818,7 @@ impl Node {
         stream: TcpStream,
         src: SocketAddr,
         ctx: ConnectionContext,
-        expected: Option<chroma_crypto::noise::NodeId>,
+        expected: Option<(chroma_crypto::noise::NodeId, chroma_crypto::noise::NoiseKey)>,
     ) -> Result<(), P2pError> {
         let inbound = expected.is_none();
         stream.set_nodelay(true).ok();
@@ -809,11 +829,13 @@ impl Node {
         // listener learns who dialled it.
         let session = Self::noise_handshake(&mut reader, &mut writer, &ctx, expected).await?;
         let remote_id = session.remote_node_id();
+        let remote_key = session.remote_noise_key();
         let session = Arc::new(tokio::sync::Mutex::new(session));
         let origin = ConnectionOrigin {
             src,
             inbound,
             remote_id,
+            remote_key,
         };
 
         // `src` is the socket's remote address. For an inbound connection that
@@ -848,6 +870,7 @@ impl Node {
             // says about itself later.
             if let Some(info) = pm.get_peer_mut(&peer_key) {
                 info.node_id = Some(remote_id);
+                info.noise_key = Some(remote_key);
             }
         }
 
@@ -1008,12 +1031,12 @@ impl Node {
         reader: &mut tokio::net::tcp::OwnedReadHalf,
         writer: &mut tokio::net::tcp::OwnedWriteHalf,
         ctx: &ConnectionContext,
-        expected: Option<chroma_crypto::noise::NodeId>,
+        expected: Option<(chroma_crypto::noise::NodeId, chroma_crypto::noise::NoiseKey)>,
     ) -> Result<chroma_crypto::noise::Session, P2pError> {
         use chroma_crypto::noise::Handshake;
 
         let mut handshake = match expected {
-            Some(remote) => Handshake::initiator(&ctx.identity, &remote)
+            Some((remote, remote_key)) => Handshake::initiator(&ctx.identity, &remote, &remote_key)
                 .map_err(|e| P2pError::Protocol(format!("noise setup: {}", e)))?,
             None => Handshake::responder(&ctx.identity)
                 .map_err(|e| P2pError::Protocol(format!("noise setup: {}", e)))?,
@@ -1025,7 +1048,7 @@ impl Node {
             let ours = (step % 2 == 0) == initiator;
             if ours {
                 let msg = handshake
-                    .write_message(&[])
+                    .write_message()
                     .map_err(|e| P2pError::Protocol(format!("noise write: {}", e)))?;
                 writer.write_all(&(msg.len() as u16).to_be_bytes()).await?;
                 writer.write_all(&msg).await?;
@@ -1176,6 +1199,7 @@ impl Node {
                         // peer claims: an inbound peer only gets its final
                         // key here, so this is where its identity lands.
                         peer.node_id = Some(origin.remote_id);
+                        peer.noise_key = Some(origin.remote_key);
                         // The version we actually speak is the lower of the two.
                         peer.version = std::cmp::min(ver.version, PROTOCOL_VERSION);
                         peer.height = ver.height;

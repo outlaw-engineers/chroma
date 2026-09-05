@@ -14,9 +14,9 @@ enum Commands {
     Node {
         #[arg(short, long, default_value = "127.0.0.1:8333")]
         listen: SocketAddr,
-        /// Peer to dial, as `<node-id-hex>@host:port`. The identity is
-        /// required: Noise XK authenticates the far end against a key known
-        /// in advance, so there is nothing to verify without it.
+        /// Peer to dial, as `<node-id>.<noise-key>@host:port`. Both keys are
+        /// required: the handshake needs the static key to connect at all,
+        /// and the identity to know it reached the node it meant to.
         #[arg(short, long)]
         connect: Vec<chroma_p2p::peer::PeerAddress>,
         #[arg(long, default_value = "chroma_data")]
@@ -254,11 +254,13 @@ fn rand_nonce() -> u64 {
     h.finish()
 }
 
-/// Read this node's Noise secret from the data directory, creating one on
+/// Read this node's identity seed from the data directory, creating one on
 /// first run.
 ///
 /// Stored as hex in `node_key`, owner-readable only where the platform
-/// supports it: anyone holding it can impersonate the node to its peers.
+/// supports it: anyone holding it can impersonate the node to its peers. Both
+/// the ed25519 identity and the X25519 static key come from this one seed, so
+/// this file is the whole backup.
 fn load_or_create_node_key(data_dir: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     let path = data_dir.join("node_key");
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -334,7 +336,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("Mining rewards to: {}", address_to_bech32(&config.miner_address));
             }
             let mut node = chroma_p2p::Node::new(config);
-            println!("Node identity: {}@{}", node.node_id().to_hex(), listen);
+            // Printed in the form a peer would pass to --connect, since that
+            // is what an operator needs to hand out.
+            println!(
+                "Node identity: {}.{}@{}",
+                node.node_id().to_hex(),
+                node.noise_key().to_hex(),
+                listen
+            );
             let mut event_rx = node.event_rx().expect("event_rx already taken");
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {

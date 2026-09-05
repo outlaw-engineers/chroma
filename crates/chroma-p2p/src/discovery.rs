@@ -69,8 +69,9 @@ impl Discovery {
             }
         }
 
-        // Seeds publish `<node-id>@host:port` entries, since Noise XK needs
-        // the identity as well as the address.
+        // Seeds publish `<node-id>.<noise-key>@host:port` entries: XK needs
+        // the static key to connect, and the identity to know it reached the
+        // node it meant to.
         for seed in SEED_NODES.iter().chain(DNS_SEEDS.iter()) {
             if self.seed_failures >= MAX_SEED_FAILURES {
                 break;
@@ -95,9 +96,9 @@ impl Discovery {
 
     /// Resolve one seed entry into peers.
     ///
-    /// A literal entry is `<node-id>@host:port`. Anything else is a DNS name,
-    /// looked up for TXT records whose strings are
-    /// `chroma-seed=<node-id>@host:port`.
+    /// A literal entry is `<node-id>.<noise-key>@host:port`. Anything else is
+    /// a DNS name, looked up for TXT records whose strings are
+    /// `chroma-seed=<node-id>.<noise-key>@host:port`.
     ///
     /// Either way the identity is mandatory. DNS is not authenticated and we
     /// do not require DNSSEC, so a seed answer is only a hint about where to
@@ -111,10 +112,13 @@ impl Discovery {
         Self::resolve_txt(seed).await
     }
 
-    /// Resolve a `<node-id>@host:port` entry, whose host may still be a name.
+    /// Resolve a `<node-id>.<noise-key>@host:port` entry, whose host may
+    /// still be a name.
     async fn resolve_literal(entry: &str) -> Option<Vec<PeerAddress>> {
-        let (key, hostport) = entry.split_once('@')?;
-        let node_id = chroma_crypto::noise::NodeId::from_hex(key).ok()?;
+        let (keys, hostport) = entry.split_once('@')?;
+        let (id, key) = keys.split_once('.')?;
+        let node_id = chroma_crypto::noise::NodeId::from_hex(id).ok()?;
+        let noise_key = chroma_crypto::noise::NoiseKey::from_hex(key).ok()?;
 
         // tokio's resolver, not `ToSocketAddrs`: the latter blocks the worker
         // thread it runs on, so a slow or unreachable seed would stall
@@ -122,7 +126,7 @@ impl Discovery {
         match tokio::net::lookup_host(hostport).await {
             Ok(addrs) => Some(
                 addrs
-                    .map(|socket| PeerAddress::new(node_id, socket))
+                    .map(|socket| PeerAddress::new(node_id, noise_key, socket))
                     .take(MAX_PEERS_PER_SEED)
                     .collect(),
             ),
@@ -198,15 +202,17 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chroma_crypto::noise::NodeId;
+    use chroma_crypto::noise::{NodeId, NoiseKey};
     use std::net::SocketAddr;
 
     fn peer(port: u16) -> PeerAddress {
         let mut raw = [0u8; 32];
         raw[0] = port as u8;
         raw[1] = (port >> 8) as u8;
+        let mut key = [0xEEu8; 32];
+        key[0] = port as u8;
         let socket: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-        PeerAddress::new(NodeId::from_bytes(raw), socket)
+        PeerAddress::new(NodeId::from_bytes(raw), NoiseKey::from_bytes(key), socket)
     }
 
     #[test]
@@ -274,13 +280,18 @@ mod tests {
     /// whatever an SPF string happened to parse as.
     #[test]
     fn test_txt_entry_requires_the_prefix() {
-        let id = NodeId::from_bytes([3u8; 32]).to_hex();
-        let good = format!("{}{}@127.0.0.1:8333", SEED_TXT_PREFIX, id);
+        let keys = format!(
+            "{}.{}",
+            NodeId::from_bytes([3u8; 32]).to_hex(),
+            NoiseKey::from_bytes([4u8; 32]).to_hex()
+        );
+        let good = format!("{}{}@127.0.0.1:8333", SEED_TXT_PREFIX, keys);
         let parsed = Discovery::parse_txt_entry(&good).expect("prefixed entry must parse");
         assert_eq!(parsed.socket, "127.0.0.1:8333".parse::<SocketAddr>().unwrap());
-        assert_eq!(parsed.node_id.to_hex(), id);
+        assert_eq!(parsed.node_id, NodeId::from_bytes([3u8; 32]));
+        assert_eq!(parsed.noise_key, NoiseKey::from_bytes([4u8; 32]));
 
-        assert!(Discovery::parse_txt_entry(&format!("{}@127.0.0.1:8333", id)).is_none());
+        assert!(Discovery::parse_txt_entry(&format!("{}@127.0.0.1:8333", keys)).is_none());
         assert!(Discovery::parse_txt_entry("v=spf1 -all").is_none());
         assert!(Discovery::parse_txt_entry("").is_none());
     }
@@ -289,7 +300,11 @@ mod tests {
     /// should not cost an entry.
     #[test]
     fn test_txt_entry_tolerates_whitespace() {
-        let id = NodeId::from_bytes([9u8; 32]).to_hex();
+        let id = format!(
+            "{}.{}",
+            NodeId::from_bytes([9u8; 32]).to_hex(),
+            NoiseKey::from_bytes([10u8; 32]).to_hex()
+        );
         for entry in [
             format!("  {}{}@127.0.0.1:8333  ", SEED_TXT_PREFIX, id),
             format!("{} {}@127.0.0.1:8333", SEED_TXT_PREFIX, id),
@@ -303,18 +318,27 @@ mod tests {
         }
     }
 
-    /// An entry without an identity must be refused wherever it appears. Noise
-    /// XK has nothing to authenticate the far end against without one, so the
-    /// address alone is worse than useless.
+    /// An entry missing either key must be refused wherever it appears: with
+    /// no static key there is nothing to hand XK, and with no identity there
+    /// is nothing to check that key against.
     #[test]
-    fn test_txt_entry_without_identity_is_refused() {
-        assert!(
-            Discovery::parse_txt_entry(&format!("{}127.0.0.1:8333", SEED_TXT_PREFIX)).is_none()
-        );
-        assert!(
-            Discovery::parse_txt_entry(&format!("{}not-a-node@127.0.0.1:8333", SEED_TXT_PREFIX))
-                .is_none()
-        );
+    fn test_txt_entry_without_both_keys_is_refused() {
+        let id = NodeId::from_bytes([1u8; 32]).to_hex();
+        let key = NoiseKey::from_bytes([2u8; 32]).to_hex();
+        for entry in [
+            "127.0.0.1:8333".to_string(),
+            format!("{}@127.0.0.1:8333", id),
+            format!("{}@127.0.0.1:8333", key),
+            format!("{}.@127.0.0.1:8333", id),
+            format!("not-a-node.{}@127.0.0.1:8333", key),
+            format!("{}.not-a-key@127.0.0.1:8333", id),
+        ] {
+            assert!(
+                Discovery::parse_txt_entry(&format!("{}{}", SEED_TXT_PREFIX, entry)).is_none(),
+                "must be refused: {:?}",
+                entry
+            );
+        }
     }
 
     /// Live check against the published record, for whoever is editing the

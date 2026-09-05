@@ -6,27 +6,47 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
-/// A peer's address together with the identity it must present.
+/// Everything needed to dial a peer: where it is, who it is, and the static
+/// key its handshake will use.
 ///
-/// Noise XK authenticates the responder, which means the dialer has to know
-/// which node it expects before it connects — an address alone would let
-/// anyone who can answer that address impersonate the peer. Written as
-/// `<64 hex chars>@host:port`.
+/// Both keys are here because they do different jobs. Noise XK does its
+/// Diffie-Hellman against the X25519 static key, so the dialer must hold that
+/// key before it connects. The node id is the ed25519 identity that signed
+/// that static key, and it is the part that has to be right: a substituted
+/// static key fails the handshake, because whoever substituted it cannot sign
+/// it as this identity.
+///
+/// Written as `<node-id>.<noise-key>@host:port`, both keys in hex.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PeerAddress {
     pub node_id: chroma_crypto::noise::NodeId,
+    pub noise_key: chroma_crypto::noise::NoiseKey,
     pub socket: SocketAddr,
 }
 
 impl PeerAddress {
-    pub fn new(node_id: chroma_crypto::noise::NodeId, socket: SocketAddr) -> Self {
-        PeerAddress { node_id, socket }
+    pub fn new(
+        node_id: chroma_crypto::noise::NodeId,
+        noise_key: chroma_crypto::noise::NoiseKey,
+        socket: SocketAddr,
+    ) -> Self {
+        PeerAddress {
+            node_id,
+            noise_key,
+            socket,
+        }
     }
 }
 
 impl fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.node_id.to_hex(), self.socket)
+        write!(
+            f,
+            "{}.{}@{}",
+            self.node_id.to_hex(),
+            self.noise_key.to_hex(),
+            self.socket
+        )
     }
 }
 
@@ -34,15 +54,30 @@ impl FromStr for PeerAddress {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let (key, socket) = s
-            .split_once('@')
-            .ok_or_else(|| format!("expected <node-id>@<host:port>, got {:?}", s))?;
-        let node_id = chroma_crypto::noise::NodeId::from_hex(key)
+        let (keys, socket) = s.split_once('@').ok_or_else(|| {
+            format!(
+                "expected <node-id>.<noise-key>@<host:port>, got {:?}",
+                s
+            )
+        })?;
+        let (id, key) = keys.split_once('.').ok_or_else(|| {
+            format!(
+                "expected <node-id>.<noise-key>@<host:port>, got {:?}",
+                s
+            )
+        })?;
+        let node_id = chroma_crypto::noise::NodeId::from_hex(id)
             .map_err(|e| format!("bad node id: {}", e))?;
+        let noise_key = chroma_crypto::noise::NoiseKey::from_hex(key)
+            .map_err(|e| format!("bad noise key: {}", e))?;
         let socket: SocketAddr = socket
             .parse()
             .map_err(|e| format!("bad socket address: {}", e))?;
-        Ok(PeerAddress { node_id, socket })
+        Ok(PeerAddress {
+            node_id,
+            noise_key,
+            socket,
+        })
     }
 }
 
@@ -126,6 +161,9 @@ pub struct PeerInfo {
     pub inbound: bool,
     /// The node identity this peer presented, once known.
     pub node_id: Option<chroma_crypto::noise::NodeId>,
+    /// The static key that identity authorised. Needed to dial the peer, so
+    /// an entry without it can be talked to but not called back.
+    pub noise_key: Option<chroma_crypto::noise::NoiseKey>,
     /// True once a handshake completed on this address at least once.
     ///
     /// Only these are worth passing to other nodes: an address we merely heard
@@ -151,8 +189,23 @@ impl PeerInfo {
             ban_until: None,
             inbound: false,
             node_id: None,
+            noise_key: None,
             handshaked: false,
             rate: RateWindow::new(),
+        }
+    }
+
+    /// The address another node could dial this peer on.
+    ///
+    /// Both keys or nothing: XK needs the static key to connect at all, and
+    /// the identity to know whether it reached the right node, so half an
+    /// identity is not something to hand out or act on.
+    pub fn peer_address(&self) -> Option<PeerAddress> {
+        match (self.node_id, self.noise_key) {
+            (Some(node_id), Some(noise_key)) => {
+                Some(PeerAddress::new(node_id, noise_key, self.addr))
+            }
+            _ => None,
         }
     }
 
@@ -253,6 +306,7 @@ impl PeerManager {
             .entry(peer.socket)
             .or_insert_with(|| PeerInfo::new(peer.socket));
         entry.node_id = Some(peer.node_id);
+        entry.noise_key = Some(peer.noise_key);
     }
 
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
@@ -330,7 +384,7 @@ impl PeerManager {
             .values()
             .filter(|p| p.handshaked && !p.is_banned())
             .filter(|p| Some(p.addr) != except)
-            .filter_map(|p| p.node_id.map(|id| PeerAddress::new(id, p.addr)))
+            .filter_map(|p| p.peer_address())
             .take(limit)
             .collect()
     }
@@ -344,7 +398,7 @@ impl PeerManager {
         self.peers
             .values()
             .filter(|p| !p.is_active() && !p.is_banned())
-            .filter_map(|p| p.node_id.map(|id| PeerAddress::new(id, p.addr)))
+            .filter_map(|p| p.peer_address())
             .take(limit)
             .collect()
     }
