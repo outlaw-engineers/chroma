@@ -309,7 +309,11 @@ impl ChainState {
             expected_bits,
             current_supply,
             previous_state_root: self.tip.header.state_root,
-            network_time: block.header.timestamp,
+            // Wall-clock time, not the block's own timestamp. Passing the
+            // block's timestamp made the "not too far in the future" check
+            // compare the value against itself, so it always passed and
+            // spec §9's upper bound was never enforced.
+            network_time: now_secs(),
         };
 
         chroma_block::validate_block(block, &ctx, &mut self.state)?;
@@ -352,6 +356,14 @@ impl ChainState {
     pub fn compute_median_time_past(&self, height: u32) -> u64 {
         median_time_past(&self.headers, height)
     }
+}
+
+/// Current wall-clock time in Unix seconds.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Median Time Past: the median timestamp of the `MTP_WINDOW` headers

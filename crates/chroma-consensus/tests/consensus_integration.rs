@@ -172,12 +172,11 @@ fn test_block_assembly_and_mining() {
         height: BlockHeight(1),
         previous_hash: genesis.hash(),
         previous_timestamp: genesis.header.timestamp,
-        state_root: Hash::ZERO,
         bits: easy_bits(),
         coinbase_recipient: alice_addr(),
     };
 
-    let mut block = assemble_block(&ctx, &[]).unwrap();
+    let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
     assert_eq!(block.transactions.len(), 1);
     assert_eq!(block.transactions[0].amount.0, BLOCK_REWARD_UNITS);
 
@@ -699,19 +698,17 @@ fn test_end_to_end_devnet() {
     let sender = Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)));
     state.apply_subsidy(&sender, 0).unwrap();
 
-    let state_root = state.compute_state_root();
 
     let genesis = chain.best_tip().clone();
     let ctx = BlockAssemblyContext {
         height: BlockHeight(1),
         previous_hash: genesis.hash,
         previous_timestamp: genesis.header.timestamp,
-        state_root,
         bits: easy_bits(),
         coinbase_recipient: recipient,
     };
 
-    let mut block = assemble_block(&ctx, &[]).unwrap();
+    let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
     mine_block_with_limit(&mut block, 10_000_000).unwrap();
 
     let target = block.header.bits.to_full_target();
@@ -971,7 +968,7 @@ fn test_devnet_multi_block_mining_and_storage() {
     let blocks_to_mine = 3u32;
 
     for expected_height in 1..=blocks_to_mine {
-        let (prev_hash, prev_ts, state_root) = {
+        let (prev_hash, prev_ts, _state_root) = {
             let tip = chain.best_tip();
             (tip.hash, tip.header.timestamp, tip.header.state_root)
         };
@@ -980,12 +977,11 @@ fn test_devnet_multi_block_mining_and_storage() {
             height: BlockHeight(expected_height),
             previous_hash: prev_hash,
             previous_timestamp: prev_ts,
-            state_root,
             bits: easy_bits,
             coinbase_recipient: miner_addr.clone(),
         };
 
-        let mut block = assemble_block(&ctx, &[]).unwrap();
+        let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
         block.header.timestamp = prev_ts + 10;
         mine_block_with_limit(&mut block, 10_000_000).unwrap();
 

@@ -1182,10 +1182,16 @@ impl Node {
             if shutdown.try_recv().is_ok() {
                 break;
             }
-            let (height, previous_hash, previous_timestamp, state_root, bits) = {
+            let (height, previous_hash, previous_timestamp, bits, parent_state) = {
                 let cs = chain_state.read().await;
                 let tip = &cs.tip;
-                (tip.height.0 + 1, tip.hash, tip.header.timestamp, tip.header.state_root, tip.header.bits)
+                (
+                    tip.height.0 + 1,
+                    tip.hash,
+                    tip.header.timestamp,
+                    tip.header.bits,
+                    cs.state.clone(),
+                )
             };
 
             let network_time = std::time::SystemTime::now()
@@ -1201,12 +1207,11 @@ impl Node {
                 height: BlockHeight(height),
                 previous_hash,
                 previous_timestamp: timestamp.saturating_sub(TARGET_BLOCK_TIME_SECS),
-                state_root,
                 bits,
                 coinbase_recipient: miner_address.clone(),
             };
 
-            match assemble_block(&ctx, &[]) {
+            match assemble_block(&ctx, &[], &parent_state) {
                 Ok(mut block) => {
                     block.header.timestamp = timestamp;
                     match mine_block_with_limit(&mut block, 10_000_000) {

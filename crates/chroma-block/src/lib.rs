@@ -314,15 +314,20 @@ pub fn validate_block(
     // We accept any signature for coinbase — it's a protocol-level mint
 
     // --- Apply state transitions ---
-    // Reset state to previous state root (caller should provide clean state)
+    // Everything below runs on a scratch copy, which replaces the caller's
+    // state only once the block has fully validated. Applying in place would
+    // leave a rejected block's partial effects behind, corrupting the state
+    // for every block after it.
+    let mut working = state.clone();
+
     // Apply coinbase subsidy
-    let _subsidy = state.apply_subsidy(&coinbase.recipient, header.height.0)?;
+    let _subsidy = working.apply_subsidy(&coinbase.recipient, header.height.0)?;
 
     // Check supply cap
-    if state.total_supply() > MAX_SUPPLY_UNITS as u64 {
+    if working.total_supply() > MAX_SUPPLY_UNITS as u64 {
         return Err(CoreError::SupplyInvariant(format!(
             "total supply {} exceeds max {}",
-            state.total_supply(),
+            working.total_supply(),
             MAX_SUPPLY_UNITS
         )));
     }
@@ -337,7 +342,8 @@ pub fn validate_block(
             ));
         }
 
-        // Verify signature
+        // Verify signature. A coinbase-marked transaction never verifies, so
+        // this is also what stops a second mint hiding among the transfers.
         if !tx.verify_signature() {
             return Err(CoreError::InvalidSignature(
                 "transaction signature verification failed".to_string(),
@@ -345,7 +351,7 @@ pub fn validate_block(
         }
 
         // Apply to state
-        state.apply_transaction(
+        working.apply_transaction(
             &tx.sender_address(),
             &tx.recipient,
             tx.amount.0,
@@ -354,7 +360,7 @@ pub fn validate_block(
     }
 
     // --- State root check ---
-    let new_state_root = state.compute_state_root();
+    let new_state_root = working.compute_state_root();
     if new_state_root != header.state_root {
         return Err(CoreError::InvalidStateRoot(format!(
             "expected {}, got {}",
@@ -373,6 +379,8 @@ pub fn validate_block(
         )));
     }
 
+    // The block is fully valid: commit the scratch state.
+    *state = working;
     Ok(new_state_root)
 }
 

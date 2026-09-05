@@ -8,7 +8,7 @@ use chroma_core::constants::{
 };
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
-use chroma_core::types::{Amount, BlockHeight, CompactTarget, Nonce};
+use chroma_core::types::{Amount, BlockHeight, CompactTarget};
 use chroma_block::{Block, BlockHeader};
 use chroma_tx::Transaction;
 
@@ -20,39 +20,59 @@ pub struct BlockAssemblyContext {
     pub height: BlockHeight,
     pub previous_hash: Hash,
     pub previous_timestamp: u64,
-    pub state_root: Hash,
     pub bits: CompactTarget,
     pub coinbase_recipient: chroma_core::types::Address,
 }
 
 /// Assemble a new block from mempool transactions.
 ///
-/// Creates the coinbase transaction and constructs a candidate block.
-/// Does NOT perform mining (nonce search) — caller must do that.
+/// Creates the coinbase, selects transactions that actually apply on top of
+/// `parent_state`, and records the resulting state root in the header. Does
+/// NOT perform mining (nonce search) — the caller must do that.
+///
+/// The header must carry the state root *after* the block is applied, because
+/// that is what validation recomputes and compares against. Filling it with
+/// the parent's root — which is what the assembly context used to supply —
+/// makes every block fail validation at its own state-root check, since the
+/// coinbase subsidy alone always changes the state.
 pub fn assemble_block(
     ctx: &BlockAssemblyContext,
     mempool_txs: &[Transaction],
+    parent_state: &chroma_state::State,
 ) -> Result<Block> {
-    let coinbase = Transaction {
-        sender_pubkey: chroma_crypto::schnorr::PublicKey32([0u8; 32]),
-        recipient: ctx.coinbase_recipient.clone(),
-        amount: Amount(BLOCK_REWARD_UNITS),
-        nonce: Nonce(0),
-        signature: chroma_crypto::schnorr::Signature64([0u8; 64]),
-    };
+    let coinbase = Transaction::coinbase(ctx.coinbase_recipient, Amount(BLOCK_REWARD_UNITS));
+
+    // Apply to a scratch copy in the same order validation will, so the root
+    // we publish is the one a validator arrives at.
+    let mut working = parent_state.clone();
+    working.apply_subsidy(&ctx.coinbase_recipient, ctx.height.0)?;
 
     let mut transactions = Vec::with_capacity(1 + mempool_txs.len());
     transactions.push(coinbase);
 
-    let max_txs = std::cmp::min(mempool_txs.len(), MAX_BLOCK_TXS - 1);
-    transactions.extend_from_slice(&mempool_txs[..max_txs]);
+    let budget = MAX_BLOCK_TXS.saturating_sub(1);
+    for tx in mempool_txs.iter().take(budget) {
+        if tx.is_coinbase() || !tx.verify_signature() {
+            continue;
+        }
+        // A transaction that does not apply here (stale nonce, spent balance)
+        // would make the whole block invalid, so it is left out rather than
+        // included and hoped for.
+        if working
+            .apply_transaction(&tx.sender_address(), &tx.recipient, tx.amount.0, tx.nonce.0)
+            .is_err()
+        {
+            continue;
+        }
+        transactions.push(tx.clone());
+    }
 
     let tx_merkle_root = Block::compute_tx_merkle_root(&transactions);
 
     let header = BlockHeader {
         version: 1,
         previous_hash: ctx.previous_hash,
-        state_root: ctx.state_root,
+        state_root: working.compute_state_root(),
         tx_merkle_root,
         timestamp: ctx.previous_timestamp + TARGET_BLOCK_TIME_SECS,
         bits: ctx.bits,
@@ -117,8 +137,9 @@ pub fn mine_block_with_limit(block: &mut Block, max_nonces: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::build_genesis_block;
+    use chroma_state::State;
     use chroma_core::hash::Hash160;
-    use chroma_core::types::Address;
+    use chroma_core::types::{Address, Nonce};
 
     fn test_address() -> Address {
         let mut h = [0u8; 20];
@@ -139,12 +160,11 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis_hash,
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: CompactTarget(0x1d00ffff),
             coinbase_recipient: test_address(),
         };
 
-        let block = assemble_block(&ctx, &[]).unwrap();
+        let block = assemble_block(&ctx, &[], &State::new()).unwrap();
         assert_eq!(block.header.height, BlockHeight(1));
         assert_eq!(block.header.previous_hash, genesis_hash);
         assert_eq!(block.transactions.len(), 1);
@@ -160,7 +180,6 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: CompactTarget(0x1d00ffff),
             coinbase_recipient: test_address(),
         };
@@ -178,9 +197,75 @@ mod tests {
         )
         .unwrap();
 
-        let block = assemble_block(&ctx, &[tx]).unwrap();
+        // The sender needs a balance, or the transaction cannot apply and is
+        // correctly left out of the block.
+        let mut funded = State::new();
+        funded.apply_subsidy(&sender_addr, 0).unwrap();
+
+        let block = assemble_block(&ctx, &[tx.clone()], &funded).unwrap();
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(block.transactions[0].amount.0, BLOCK_REWARD_UNITS);
+        assert_eq!(block.transactions[1], tx);
+    }
+
+    #[test]
+    fn test_assemble_block_skips_inapplicable_transactions() {
+        // A transaction from an account with no balance would make the whole
+        // block invalid, so assembly must drop it rather than include it.
+        let genesis = build_genesis_block();
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(1),
+            previous_hash: genesis.hash(),
+            previous_timestamp: genesis.header.timestamp,
+            bits: CompactTarget(0x1d00ffff),
+            coinbase_recipient: test_address(),
+        };
+
+        let secret = chroma_crypto::schnorr::SecretKey32::from_bytes([0xCC; 32]).unwrap();
+        let pubkey = chroma_crypto::schnorr::PublicKey32::from_secret(&secret).unwrap();
+        let broke = Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)));
+        let tx = chroma_tx::create_transaction(
+            &secret,
+            broke,
+            test_address(),
+            Amount(100_000),
+            Nonce(0),
+        )
+        .unwrap();
+
+        let block = assemble_block(&ctx, &[tx], &State::new()).unwrap();
+        assert_eq!(block.transactions.len(), 1, "only the coinbase should remain");
+    }
+
+    #[test]
+    fn test_assembled_block_state_root_matches_validation() {
+        // The header must carry the state root *after* the block applies.
+        // Previously it carried the parent's root, so every mined block was
+        // rejected at its own state-root check.
+        let genesis = build_genesis_block();
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(1),
+            previous_hash: genesis.hash(),
+            previous_timestamp: genesis.header.timestamp,
+            bits: easy_bits(),
+            coinbase_recipient: test_address(),
+        };
+
+        let parent = State::new();
+        let block = assemble_block(&ctx, &[], &parent).unwrap();
+
+        let mut applied = parent.clone();
+        applied.apply_subsidy(&test_address(), 1).unwrap();
+        assert_eq!(
+            block.header.state_root,
+            applied.compute_state_root(),
+            "header must commit to the post-block state"
+        );
+        assert_ne!(
+            block.header.state_root,
+            parent.compute_state_root(),
+            "the subsidy always changes the state, so the roots must differ"
+        );
     }
 
     #[test]
@@ -190,12 +275,11 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
 
-        let mut block = assemble_block(&ctx, &[]).unwrap();
+        let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
         mine_block_with_limit(&mut block, 10_000_000).unwrap();
 
         let target = block.header.bits.to_full_target();
@@ -213,12 +297,11 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
 
-        let mut block = assemble_block(&ctx, &[]).unwrap();
+        let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
 
         let target = block.header.bits.to_full_target();
 
@@ -245,12 +328,11 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
 
-        let block = assemble_block(&ctx, &[]).unwrap();
+        let block = assemble_block(&ctx, &[], &State::new()).unwrap();
         let coinbase = &block.transactions[0];
         assert_eq!(coinbase.sender_pubkey.0, [0u8; 32]);
         assert_eq!(coinbase.signature.0, [0u8; 64]);
@@ -263,12 +345,11 @@ mod tests {
             height: BlockHeight(1),
             previous_hash: genesis.hash(),
             previous_timestamp: genesis.header.timestamp,
-            state_root: Hash::ZERO,
             bits: easy_bits(),
             coinbase_recipient: test_address(),
         };
 
-        let mut block = assemble_block(&ctx, &[]).unwrap();
+        let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
         mine_block_with_limit(&mut block, 10_000_000).unwrap();
 
         let target = block.header.bits.to_full_target();
