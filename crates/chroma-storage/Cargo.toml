@@ -1,0 +1,17 @@
+[package]
+name = "chroma-storage"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma storage: RocksDB backend for blocks and state"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+chroma-block = { path = "../chroma-block" }
+chroma-state = { path = "../chroma-state" }
+chroma-tx = { path = "../chroma-tx" }
+blake3 = "1.5"
+sled = "0.34"
+
+[dev-dependencies]
+proptest = "1.5"

@@ -1,0 +1,16 @@
+[package]
+name = "chroma-block"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma blocks: header, block, validation"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+chroma-crypto = { path = "../chroma-crypto" }
+chroma-tx = { path = "../chroma-tx" }
+chroma-state = { path = "../chroma-state" }
+blake3 = "1.5"
+
+[dev-dependencies]
+proptest = "1.5"

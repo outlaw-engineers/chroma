@@ -1,0 +1,13 @@
+[package]
+name = "chroma-state"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma state model: Merkle tree, state transition, journal"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+blake3 = "1.5"
+
+[dev-dependencies]
+proptest = "1.5"

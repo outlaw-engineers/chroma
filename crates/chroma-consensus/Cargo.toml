@@ -1,0 +1,20 @@
+[package]
+name = "chroma-consensus"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma consensus: fork choice, difficulty, PoW verify, RandomX"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+chroma-crypto = { path = "../chroma-crypto" }
+chroma-block = { path = "../chroma-block" }
+chroma-tx = { path = "../chroma-tx" }
+chroma-state = { path = "../chroma-state" }
+blake3 = "1.5"
+
+[dev-dependencies]
+proptest = "1.5"
+chroma-storage = { path = "../chroma-storage" }
+chroma-p2p = { path = "../chroma-p2p" }
+chroma-wallet = { path = "../chroma-wallet" }

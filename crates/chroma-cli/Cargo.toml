@@ -1,0 +1,27 @@
+[package]
+name = "chroma-cli"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma CLI: all-in-one node/wallet/miner binary"
+default-run = "chroma"
+
+[[bin]]
+name = "chroma"
+path = "src/main.rs"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+chroma-crypto = { path = "../chroma-crypto" }
+chroma-state = { path = "../chroma-state" }
+chroma-tx = { path = "../chroma-tx" }
+chroma-block = { path = "../chroma-block" }
+chroma-consensus = { path = "../chroma-consensus" }
+chroma-storage = { path = "../chroma-storage" }
+chroma-p2p = { path = "../chroma-p2p" }
+chroma-wallet = { path = "../chroma-wallet" }
+blake3 = "1.5"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+hex = "0.4"
+anyhow = "1"

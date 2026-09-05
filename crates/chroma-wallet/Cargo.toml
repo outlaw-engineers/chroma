@@ -1,0 +1,19 @@
+[package]
+name = "chroma-wallet"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Chroma wallet: key management, signing"
+
+[dependencies]
+chroma-core = { path = "../chroma-core" }
+chroma-crypto = { path = "../chroma-crypto" }
+chroma-tx = { path = "../chroma-tx" }
+chroma-state = { path = "../chroma-state" }
+blake3 = "1.5"
+zeroize = "1.7"
+rpassword = "7"
+hex = "0.4"
+
+[dev-dependencies]
+proptest = "1.5"
