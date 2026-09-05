@@ -88,4 +88,29 @@ mod tests {
         let d = Discovery::new();
         assert_eq!(d.seed_failures, 0);
     }
+
+    /// `discover_peers` registers addresses but never dials them, so its
+    /// return value is the only way the caller learns what to connect to.
+    /// `Node::run` depends on that: anything discovery reports must come back
+    /// out, or a peer learned from a seed would be registered and then never
+    /// connected to.
+    #[tokio::test]
+    async fn test_discover_peers_reports_what_it_registers() {
+        let pm = Arc::new(RwLock::new(PeerManager::new()));
+        let a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:8334".parse().unwrap();
+
+        let mut d = Discovery::new();
+        let found = d.discover_peers(pm.clone(), &[a, b]).await;
+        assert_eq!(found, vec![a, b], "configured peers must be reported back");
+
+        let guard = pm.read().await;
+        assert!(guard.get_peer(&a).is_some());
+        assert!(guard.get_peer(&b).is_some());
+        drop(guard);
+
+        // Already-known peers are not reported a second time.
+        let again = d.discover_peers(pm.clone(), &[a, b]).await;
+        assert!(again.is_empty());
+    }
 }

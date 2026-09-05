@@ -342,7 +342,7 @@ impl Node {
         let listen_port = bound.port();
         self.local_addr = Some(bound);
 
-        let _ = self
+        let discovered = self
             .discovery
             .discover_peers(self.peer_manager.clone(), &self.config.connect_addrs)
             .await;
@@ -370,8 +370,19 @@ impl Node {
             }));
         }
 
-        for addr in &self.config.connect_addrs {
-            let _ = outbound_tx.send(OutboundCommand::Connect(*addr));
+        // Dial the explicitly configured peers *and* whatever discovery turned
+        // up from the seed lists. Discovery only registers addresses in the
+        // peer manager; without dialing what it returns, a peer learned from a
+        // seed would sit in the table forever and never be connected to.
+        // Repeats are harmless — begin_connection rejects a second dial.
+        for addr in self
+            .config
+            .connect_addrs
+            .iter()
+            .copied()
+            .chain(discovered.into_iter())
+        {
+            let _ = outbound_tx.send(OutboundCommand::Connect(addr));
         }
 
         {
