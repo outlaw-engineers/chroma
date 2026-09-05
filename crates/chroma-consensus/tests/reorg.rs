@@ -227,3 +227,146 @@ fn block_with_an_unknown_parent_is_refused() {
     );
     assert_eq!(chain.tip.height.0, 0);
 }
+
+// ---------------------------------------------------------------------------
+// State journal (spec §2.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_records_the_active_chain() {
+    let params = ChainParams::regtest();
+    let genesis = build_genesis_block_with(&params);
+    let mut blocks = MemoryBlocks::default();
+    blocks.put(&genesis);
+
+    let branch = build_branch(&genesis.header, &State::new(), 4, miner(0xAA), &mut blocks);
+    let mut chain = ChainState::with_params(params);
+    assert_eq!(chain.journal_depth(), 0);
+
+    for (i, block) in branch.iter().enumerate() {
+        chain.apply_block_with(block, &blocks).unwrap();
+        assert_eq!(
+            chain.journal_depth(),
+            i + 1,
+            "each accepted block should leave a way back"
+        );
+    }
+}
+
+#[test]
+fn reorg_within_the_journal_needs_no_block_source() {
+    // The point of the journal: a shallow reorg rolls the state back instead
+    // of replaying the chain. If it is doing that, it never has to read the
+    // active chain's blocks back — so a source that refuses to hand them over
+    // must still work.
+    struct BranchOnly {
+        inner: MemoryBlocks,
+        withheld: Vec<Hash>,
+    }
+    impl BlockSource for BranchOnly {
+        fn get_block(&self, hash: &Hash) -> Option<Block> {
+            if self.withheld.contains(hash) {
+                return None;
+            }
+            self.inner.get_block(hash)
+        }
+    }
+
+    let params = ChainParams::regtest();
+    let genesis = build_genesis_block_with(&params);
+    let mut blocks = MemoryBlocks::default();
+    blocks.put(&genesis);
+
+    let empty = State::new();
+    let short = build_branch(&genesis.header, &empty, 2, miner(0xAA), &mut blocks);
+    let long = build_branch(&genesis.header, &empty, 3, miner(0xBB), &mut blocks);
+
+    let mut chain = ChainState::with_params(params);
+    for block in &short {
+        chain.apply_block_with(block, &blocks).unwrap();
+    }
+
+    // Withhold exactly the blocks of the chain we are leaving.
+    let source = BranchOnly {
+        inner: blocks,
+        withheld: short.iter().map(|b| b.hash()).collect(),
+    };
+
+    for block in &long[..2] {
+        chain.apply_block_with(block, &source).unwrap();
+    }
+    match chain.apply_block_with(&long[2], &source).unwrap() {
+        BlockOutcome::Reorganized { depth } => assert_eq!(depth, 2),
+        other => panic!("expected a reorg, got {:?}", other),
+    }
+
+    assert_eq!(chain.tip.hash, long[2].hash());
+    assert_eq!(chain.state.get_account(&miner(0xBB)).balance, 3_000_000);
+    assert_eq!(chain.state.get_account(&miner(0xAA)).balance, 0);
+}
+
+#[test]
+fn journal_is_dropped_when_the_chain_changes_under_it() {
+    // After a reorg the journal describes a chain that is no longer active,
+    // so keeping it would unwind into the wrong branch.
+    //
+    // The branches differ in length so the switch happens on a known block:
+    // with equal work the tie-break decides, and the reorg could land on
+    // either apply.
+    let params = ChainParams::regtest();
+    let genesis = build_genesis_block_with(&params);
+    let mut blocks = MemoryBlocks::default();
+    blocks.put(&genesis);
+
+    let empty = State::new();
+    let short = build_branch(&genesis.header, &empty, 2, miner(0xAA), &mut blocks);
+    let long = build_branch(&genesis.header, &empty, 3, miner(0xBB), &mut blocks);
+
+    let mut chain = ChainState::with_params(params);
+    for block in &short {
+        chain.apply_block_with(block, &blocks).unwrap();
+    }
+    assert_eq!(chain.journal_depth(), 2);
+
+    // The first two are side branches; the third carries more work and wins.
+    chain.apply_block_with(&long[0], &blocks).unwrap();
+    chain.apply_block_with(&long[1], &blocks).unwrap();
+    assert_eq!(chain.journal_depth(), 2, "a side branch does not touch it");
+
+    match chain.apply_block_with(&long[2], &blocks).unwrap() {
+        BlockOutcome::Reorganized { .. } => {}
+        other => panic!("expected a reorg, got {:?}", other),
+    }
+    assert_eq!(
+        chain.journal_depth(),
+        0,
+        "the old chain's journal must not survive the switch"
+    );
+
+    // And the chain keeps journalling from the new tip.
+    let more = build_branch(&long[2].header, &chain.state, 1, miner(0xBB), &mut blocks);
+    chain.apply_block_with(&more[0], &blocks).unwrap();
+    assert_eq!(chain.tip.height.0, 4);
+    assert_eq!(chain.journal_depth(), 1);
+}
+
+#[test]
+fn journal_is_bounded_by_the_spec_depth() {
+    use chroma_core::constants::REORG_JOURNAL_DEPTH;
+    // Not worth mining 2000 blocks here; what matters is that the bound is the
+    // one the spec names and that the journal never exceeds the blocks applied.
+    assert_eq!(REORG_JOURNAL_DEPTH, 2000);
+
+    let params = ChainParams::regtest();
+    let genesis = build_genesis_block_with(&params);
+    let mut blocks = MemoryBlocks::default();
+    blocks.put(&genesis);
+    let branch = build_branch(&genesis.header, &State::new(), 6, miner(0xAA), &mut blocks);
+
+    let mut chain = ChainState::with_params(params);
+    for block in &branch {
+        chain.apply_block_with(block, &blocks).unwrap();
+        assert!(chain.journal_depth() <= REORG_JOURNAL_DEPTH as usize);
+    }
+    assert_eq!(chain.journal_depth(), 6);
+}

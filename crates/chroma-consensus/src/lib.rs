@@ -303,6 +303,20 @@ pub struct ChainState {
     pub state: State,
     /// All known chain tips (for fork choice).
     pub tips: BTreeMap<Hash, ChainTip>,
+    /// Undo records for the most recent blocks of the active chain, oldest
+    /// first (spec §2.3).
+    ///
+    /// A reorg inside this window rolls the state back block by block instead
+    /// of rebuilding it from genesis, so its cost follows the depth of the
+    /// reorg rather than the length of the chain.
+    journal: std::collections::VecDeque<JournalEntry>,
+}
+
+/// One block's worth of rollback information.
+#[derive(Clone, Debug)]
+struct JournalEntry {
+    hash: Hash,
+    undo: chroma_state::UndoRecord,
 }
 
 impl ChainState {
@@ -339,6 +353,7 @@ impl ChainState {
             tip: tip.clone(),
             state: State::new(),
             tips,
+            journal: std::collections::VecDeque::new(),
         }
     }
 
@@ -406,7 +421,13 @@ impl ChainState {
         if extends_tip {
             // The common case: validate against the state we already hold.
             let ctx = self.validation_context(block, &self.headers)?;
-            chroma_block::validate_block(block, &ctx, &mut self.state)?;
+            self.state.start_recording();
+            let outcome = chroma_block::validate_block(block, &ctx, &mut self.state);
+            let undo = self.state.finish_recording();
+            outcome?;
+            if let Some(undo) = undo {
+                self.push_journal(hash, undo);
+            }
             self.record(block, cumulative_work);
             self.headers.insert(height, block.header.clone());
             self.set_tip(block, cumulative_work);
@@ -429,6 +450,45 @@ impl ChainState {
         // This branch now has the most work: switch to it.
         let depth = self.reorganize(block, cumulative_work, scratch);
         Ok(BlockOutcome::Reorganized { depth })
+    }
+
+    /// Record how to undo the block that was just applied, dropping anything
+    /// older than the journal depth.
+    fn push_journal(&mut self, hash: Hash, undo: chroma_state::UndoRecord) {
+        use chroma_core::constants::REORG_JOURNAL_DEPTH;
+
+        self.journal.push_back(JournalEntry { hash, undo });
+        while self.journal.len() > REORG_JOURNAL_DEPTH as usize {
+            self.journal.pop_front();
+        }
+    }
+
+    /// How many blocks of the active chain can be rolled back without
+    /// rebuilding the state from genesis.
+    pub fn journal_depth(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Roll the active chain's state back to `target`, using the journal.
+    ///
+    /// Returns `None` when `target` is not within the journalled window, in
+    /// which case the caller has to rebuild instead.
+    fn unwind_to(&self, target: &Hash) -> Option<State> {
+        if *target == self.tip.hash {
+            return Some(self.state.clone());
+        }
+
+        // Walk back from the tip, undoing one block at a time, until the
+        // target is the block below the one just undone.
+        let mut state = self.state.clone();
+        for entry in self.journal.iter().rev() {
+            state.undo(&entry.undo);
+            let parent = self.index.get(&entry.hash)?.header.previous_hash;
+            if parent == *target {
+                return Some(state);
+            }
+        }
+        None
     }
 
     /// Fork-choice comparison: more work wins; on a tie, the smaller hash.
@@ -489,6 +549,10 @@ impl ChainState {
 
         self.headers = headers;
         self.state = new_state;
+        // The journal described the chain we just left, so it no longer says
+        // how to undo anything. Keeping it would roll back into a branch that
+        // is not the active one.
+        self.journal.clear();
         self.set_tip(block, cumulative_work);
 
         old_height.saturating_sub(fork_height)
@@ -517,6 +581,59 @@ impl ChainState {
         headers
     }
 
+    /// Rebuild the state at `hash` by unwinding to the fork point and
+    /// replaying that branch, when the fork point is inside the journal.
+    ///
+    /// Spec §2.3: reorgs within the journal window roll back; deeper ones fall
+    /// through to recomputing from genesis.
+    fn state_via_journal(
+        &self,
+        hash: &Hash,
+        source: &dyn BlockSource,
+    ) -> Result<Option<State>> {
+        // Collect the branch from `hash` down to the first block that is on
+        // the active chain.
+        let mut branch: Vec<Hash> = Vec::new();
+        let mut cursor = *hash;
+        let fork = loop {
+            let entry = match self.index.get(&cursor) {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+            let height = entry.header.height.0;
+            if self.headers.get(&height).map(|h| h.hash()) == Some(cursor) {
+                break cursor;
+            }
+            branch.push(cursor);
+            if height == 0 {
+                return Ok(None);
+            }
+            cursor = entry.header.previous_hash;
+        };
+
+        let mut state = match self.unwind_to(&fork) {
+            Some(state) => state,
+            // The fork point is older than the journal keeps.
+            None => return Ok(None),
+        };
+
+        // Replay the branch forward. Its headers are needed for the target and
+        // median-time checks, so they are assembled as we go.
+        let mut headers = self.branch_headers(&fork);
+        branch.reverse();
+        for block_hash in branch {
+            let block = match source.get_block(&block_hash) {
+                Some(block) => block,
+                None => return Ok(None),
+            };
+            let ctx = self.validation_context(&block, &headers)?;
+            chroma_block::validate_block(&block, &ctx, &mut state)?;
+            headers.insert(block.header.height.0, block.header.clone());
+        }
+
+        Ok(Some(state))
+    }
+
     /// The account state as of `hash`, rebuilt by replaying its branch.
     ///
     /// Replays from genesis. Spec §2.3 calls for a 2000-block journal so a
@@ -525,6 +642,14 @@ impl ChainState {
     fn state_at(&self, hash: &Hash, source: &dyn BlockSource) -> Result<State> {
         if *hash == self.tip.hash {
             return Ok(self.state.clone());
+        }
+
+        // The target may be an ancestor of the tip, or on a branch that leaves
+        // the active chain within the journalled window. Either way, unwinding
+        // to the fork point and replaying only the branch beats rebuilding
+        // from genesis.
+        if let Some(state) = self.state_via_journal(hash, source)? {
+            return Ok(state);
         }
 
         // Collect the branch, genesis first.

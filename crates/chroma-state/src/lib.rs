@@ -69,6 +69,29 @@ impl Account {
 // State
 // ============================================================================
 
+/// Everything needed to put the state back as it was before a block.
+///
+/// Holds the prior value of every account the block touched — `None` for an
+/// account that did not exist — plus the supply. That is bounded by what the
+/// block changed rather than by the size of the state, which is what makes
+/// rolling back a reorg cheaper than replaying the chain.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UndoRecord {
+    accounts: BTreeMap<[u8; 20], Option<Account>>,
+    total_supply: u64,
+}
+
+impl UndoRecord {
+    /// How many accounts this record has to restore.
+    pub fn len(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+}
+
 /// Global account state. Deterministic, ordered by address for commitment.
 #[derive(Clone, Debug, Default)]
 pub struct State {
@@ -76,6 +99,9 @@ pub struct State {
     accounts: BTreeMap<[u8; 20], Account>,
     /// Total circulating supply in atomic units.
     total_supply: u64,
+    /// Collects prior values while a block is being applied. `None` when not
+    /// recording, so ordinary use pays nothing.
+    undo: Option<UndoRecord>,
 }
 
 impl State {
@@ -84,7 +110,44 @@ impl State {
         State {
             accounts: BTreeMap::new(),
             total_supply: 0,
+            undo: None,
         }
+    }
+
+    /// Begin collecting an undo record.
+    ///
+    /// Recording survives a clone, so a caller can start recording, hand the
+    /// state to validation (which works on a copy and commits it back), and
+    /// collect the record afterwards.
+    pub fn start_recording(&mut self) {
+        self.undo = Some(UndoRecord {
+            accounts: BTreeMap::new(),
+            total_supply: self.total_supply,
+        });
+    }
+
+    /// Stop recording and take the record collected so far.
+    pub fn finish_recording(&mut self) -> Option<UndoRecord> {
+        self.undo.take()
+    }
+
+    /// Put the state back as it was before the block this record came from.
+    ///
+    /// Undoing while recording would mix two blocks' records together, so the
+    /// recorder is cleared first.
+    pub fn undo(&mut self, record: &UndoRecord) {
+        self.undo = None;
+        for (key, previous) in &record.accounts {
+            match previous {
+                Some(account) => {
+                    self.accounts.insert(*key, *account);
+                }
+                None => {
+                    self.accounts.remove(key);
+                }
+            }
+        }
+        self.total_supply = record.total_supply;
     }
 
     /// Get account, returning default (zero) if not found.
@@ -131,9 +194,20 @@ impl State {
 
     /// Set account (used by state transitions and genesis).
     fn set_account(&mut self, address: &Address, account: Account) {
+        let key = *address.as_hash160().as_bytes();
+
+        // Capture the value from before this block, once. A later write in the
+        // same block must not overwrite what the first one saved, or undoing
+        // would restore a mid-block value.
+        if let Some(undo) = self.undo.as_mut() {
+            undo.accounts
+                .entry(key)
+                .or_insert_with(|| self.accounts.get(&key).copied());
+        }
+
         *self
             .accounts
-            .entry(*address.as_hash160().as_bytes())
+            .entry(key)
             .or_insert_with(Account::default) = account;
     }
 
@@ -570,6 +644,120 @@ mod tests {
         state.total_supply = (MAX_SUPPLY_UNITS - 500_000) as u64;
         let subsidy = state.block_subsidy(0).unwrap();
         assert_eq!(subsidy, 500_000);
+    }
+
+    #[test]
+    fn test_undo_restores_the_exact_prior_state() {
+        let mut state = State::new();
+        state.apply_subsidy(&alice(), 0).unwrap();
+        state.apply_subsidy(&bob(), 1).unwrap();
+        let before_root = state.compute_state_root();
+        let before_supply = state.total_supply();
+
+        state.start_recording();
+        state.apply_subsidy(&alice(), 2).unwrap();
+        state.apply_transaction(&alice(), &bob(), 500_000, 0).unwrap();
+        let record = state.finish_recording().unwrap();
+
+        assert_ne!(state.compute_state_root(), before_root);
+
+        state.undo(&record);
+        assert_eq!(state.compute_state_root(), before_root);
+        assert_eq!(state.total_supply(), before_supply);
+        assert_eq!(state.get_account(&alice()).nonce, 0);
+    }
+
+    #[test]
+    fn test_undo_removes_accounts_the_block_created() {
+        // An account that did not exist before must not survive the undo, or
+        // the state root will not match the one the chain committed to.
+        let mut state = State::new();
+        let before_root = state.compute_state_root();
+
+        state.start_recording();
+        state.apply_subsidy(&alice(), 0).unwrap();
+        let record = state.finish_recording().unwrap();
+        assert_eq!(state.account_count(), 1);
+
+        state.undo(&record);
+        assert_eq!(state.account_count(), 0, "a created account must be removed");
+        assert_eq!(state.compute_state_root(), before_root);
+        assert_eq!(state.total_supply(), 0);
+    }
+
+    #[test]
+    fn test_undo_keeps_the_value_from_before_the_block() {
+        // Two writes to the same account inside one block: the record must
+        // hold the value from before the block, not the one in between.
+        let mut state = State::new();
+        state.apply_subsidy(&alice(), 0).unwrap();
+        let original = state.get_account(&alice());
+
+        state.start_recording();
+        state.apply_subsidy(&alice(), 1).unwrap();
+        state.apply_subsidy(&alice(), 2).unwrap();
+        let record = state.finish_recording().unwrap();
+        assert_eq!(record.len(), 1);
+
+        state.undo(&record);
+        assert_eq!(state.get_account(&alice()), original);
+    }
+
+    #[test]
+    fn test_undo_records_stack_back_to_the_start() {
+        // Rolling several blocks back one at a time must land exactly where
+        // the chain was, which is what a reorg depends on.
+        let mut state = State::new();
+        let mut roots = vec![state.compute_state_root()];
+        let mut records = Vec::new();
+
+        for round in 0..8u32 {
+            state.start_recording();
+            state.apply_subsidy(&alice(), round).unwrap();
+            if round % 2 == 0 {
+                state.apply_subsidy(&bob(), round).unwrap();
+            }
+            records.push(state.finish_recording().unwrap());
+            roots.push(state.compute_state_root());
+        }
+
+        for round in (0..8usize).rev() {
+            state.undo(&records[round]);
+            assert_eq!(
+                state.compute_state_root(),
+                roots[round],
+                "unwinding to round {} gave the wrong state",
+                round
+            );
+        }
+        assert_eq!(state.account_count(), 0);
+        assert_eq!(state.total_supply(), 0);
+    }
+
+    #[test]
+    fn test_recording_survives_a_clone() {
+        // Validation works on a copy and commits it back, so the recorder has
+        // to travel with the clone or nothing is captured.
+        let mut state = State::new();
+        state.apply_subsidy(&alice(), 0).unwrap();
+        let before = state.compute_state_root();
+
+        state.start_recording();
+        let mut working = state.clone();
+        working.apply_subsidy(&bob(), 1).unwrap();
+        state = working;
+
+        let record = state.finish_recording().unwrap();
+        assert_eq!(record.len(), 1);
+        state.undo(&record);
+        assert_eq!(state.compute_state_root(), before);
+    }
+
+    #[test]
+    fn test_not_recording_costs_nothing() {
+        let mut state = State::new();
+        state.apply_subsidy(&alice(), 0).unwrap();
+        assert!(state.finish_recording().is_none());
     }
 
     #[test]

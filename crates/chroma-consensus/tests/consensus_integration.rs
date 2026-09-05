@@ -919,18 +919,18 @@ fn test_chain_state_loads_from_storage() {
     let mut tips = BTreeMap::new();
     tips.insert(loaded_tip.hash, chain_tip.clone());
 
-    let chain = ChainState {
-        params: chroma_consensus::ChainParams::devnet(),
-        headers,
-        index: std::collections::HashMap::new(),
-        tip: chain_tip,
-        state: chroma_state::State::new(),
-        tips,
-    };
+    // What the round trip has to preserve is the tip: the same block, at the
+    // same height, with the work that was recorded for it.
+    assert_eq!(chain_tip.height, BlockHeight(0));
+    assert_eq!(chain_tip.hash, genesis_hash);
+    assert!(chain_tip.cumulative_work > U256::ZERO);
+    assert_eq!(headers.get(&0).map(|h| h.hash()), Some(genesis_hash));
+    assert!(tips.contains_key(&genesis_hash));
 
-    assert_eq!(chain.tip.height, BlockHeight(0));
-    assert_eq!(chain.tip.hash, genesis_hash);
-    assert!(chain.best_tip().cumulative_work > U256::ZERO);
+    // ...and a chain built from the same parameters agrees with it.
+    let chain = ChainState::with_params(chroma_consensus::ChainParams::devnet());
+    assert_eq!(chain.tip.hash, chain_tip.hash);
+    assert_eq!(chain.best_tip().cumulative_work, chain_tip.cumulative_work);
 }
 
 #[test]
