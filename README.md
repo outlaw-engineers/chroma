@@ -10,6 +10,7 @@ Chroma（CHR）は、Rustで開発されている独立型のProof-of-Work（PoW
 Chromaは、独立した分散型PoWネットワークの構築を目的としたブロックチェーンプロジェクトです。
 
 プロトコルの仕様は [`protocol/SPEC.md`](protocol/SPEC.md) に定義されています。
+DNSシードレコードの形式と内容は [`SEED_RECORD.md`](SEED_RECORD.md) にあります。
 
 ## ワークスペース構成
 
