@@ -1087,6 +1087,13 @@ impl Node {
 
                 let _ = ctx.event_tx.send(NodeEvent::HeadersAccepted(batch.accepted));
 
+                // Now fetch the blocks behind those headers, oldest first.
+                // Without this, blocks only arrive as live announcements and
+                // the historical ones are pulled in one at a time by the
+                // orphan handler walking backwards — one round trip per
+                // block, in the wrong direction.
+                Self::request_missing_blocks(ctx, out_tx, &resp.headers[..batch.accepted]).await?;
+
                 // A full batch means the peer probably has more.
                 if batch.accepted == offered {
                     let more = GetHeadersMessage {
@@ -1193,6 +1200,39 @@ impl Node {
         }
     }
 
+
+    /// Ask for the blocks behind `headers` that we do not already hold.
+    ///
+    /// Requested in ascending height so that parents arrive before children:
+    /// responses come back in order on one connection, so each block can be
+    /// connected as it lands instead of being parked as an orphan.
+    async fn request_missing_blocks(
+        ctx: &ConnectionContext,
+        out_tx: &mpsc::Sender<Vec<u8>>,
+        headers: &[chroma_block::BlockHeader],
+    ) -> Result<(), P2pError> {
+        let mut wanted = Vec::new();
+        for header in headers {
+            let hash = header.hash();
+            if Self::have_block(ctx, &hash).await {
+                continue;
+            }
+            wanted.push(InvEntry {
+                inv_type: InvType::Block,
+                hash,
+            });
+            if wanted.len() >= MAX_INVENTORY {
+                break;
+            }
+        }
+
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let req = GetDataMessage { inventory: wanted };
+        Self::send(out_tx, Message::new(MessageType::GetData, req.encode())).await
+    }
 
     /// True if this block is already on disk.
     ///

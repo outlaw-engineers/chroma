@@ -827,3 +827,78 @@ async fn transaction_reaches_a_peer_and_gets_mined() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// A node joining an existing chain must fetch the history forward, driven by
+/// the headers it just accepted.
+///
+/// Without that, blocks are only pulled in by the orphan handler asking for
+/// each parent in turn: one round trip per block, walking backwards. The
+/// ordering is what distinguishes the two, so that is what this asserts.
+#[tokio::test]
+async fn late_joining_node_downloads_history_in_order() {
+    let secret = SecretKey32::generate();
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let miner_payout = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+
+    let dir_a = temp_dir("catchup_miner");
+    let params = chroma_consensus::ChainParams::regtest();
+    let config_a = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir_a.clone())
+        .with_mining(true)
+        .with_miner_address(miner_payout);
+    let mut miner = Node::new(config_a);
+    miner.run().await.expect("miner failed to start");
+    let miner_addr = miner.local_addr().unwrap();
+
+    // Build some history before the second node exists.
+    wait_for("the miner to build a chain", || async {
+        miner.chain_height() >= 4
+    })
+    .await;
+    let history = miner.chain_height();
+
+    let dir_b = temp_dir("catchup_joiner");
+    let config_b = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir_b.clone())
+        .with_mining(false)
+        .with_connect_addrs(vec![miner_addr]);
+    let mut joiner = Node::new(config_b);
+    let mut events = joiner.event_rx().expect("event receiver already taken");
+    joiner.run().await.expect("joiner failed to start");
+
+    wait_for("the joiner to catch up", || async {
+        joiner.chain_height() >= history
+    })
+    .await;
+
+    // The first blocks it took must be the bottom of the chain, in order.
+    let mut heights = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let NodeEvent::BlockReceived(_, height) = event {
+            heights.push(height);
+        }
+    }
+    assert!(
+        heights.len() >= history as usize,
+        "expected at least {} blocks, saw {:?}",
+        history,
+        heights
+    );
+    let ordered: Vec<u32> = heights.iter().copied().take(history as usize).collect();
+    let mut expected: Vec<u32> = (1..=history).collect();
+    expected.truncate(ordered.len());
+    assert_eq!(
+        ordered, expected,
+        "history should arrive oldest first; walking backwards would give {:?} reversed",
+        expected
+    );
+
+    let mut miner = miner;
+    let mut joiner = joiner;
+    miner.shutdown().await;
+    joiner.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
