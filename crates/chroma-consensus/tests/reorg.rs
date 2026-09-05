@@ -45,7 +45,7 @@ fn mine_on(parent: &chroma_block::BlockHeader, state: &State, recipient: Address
         coinbase_recipient: recipient,
     };
     let mut block = assemble_block(&ctx, &[], state).unwrap();
-    mine_block_with_limit(&mut block, 100_000).expect("regtest mining is trivial");
+    mine_block_with_limit(&mut block, 100_000, &chroma_consensus::miner::PowContext::blake3()).expect("regtest mining is trivial");
     block
 }
 

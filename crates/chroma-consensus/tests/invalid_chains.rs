@@ -32,7 +32,7 @@ fn good_block() -> (Block, BlockValidationContext, State) {
         coinbase_recipient: payout(),
     };
     let mut block = assemble_block(&ctx, &[], &state).unwrap();
-    mine_block_with_limit(&mut block, 100_000).unwrap();
+    mine_block_with_limit(&mut block, 100_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let vctx = BlockValidationContext {
         previous_hash: genesis.hash(),
@@ -43,6 +43,8 @@ fn good_block() -> (Block, BlockValidationContext, State) {
         current_supply: 0,
         previous_state_root: genesis.header.state_root,
         network_time: now_secs(),
+        pow_algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+        pow_seed: chroma_core::hash::Hash::ZERO,
     };
     (block, vctx, state)
 }
@@ -187,7 +189,7 @@ fn rejects_transaction_with_a_broken_signature() {
 
     // Corrupt the signature after assembly.
     block.transactions[1].signature.0[0] ^= 0xFF;
-    mine_block_with_limit(&mut block, 100_000).unwrap();
+    mine_block_with_limit(&mut block, 100_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let vctx = BlockValidationContext {
         previous_hash: genesis.hash(),
@@ -198,6 +200,8 @@ fn rejects_transaction_with_a_broken_signature() {
         current_supply: 0,
         previous_state_root: genesis.header.state_root,
         network_time: now_secs(),
+        pow_algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+        pow_seed: chroma_core::hash::Hash::ZERO,
     };
 
     let before = state.clone();
@@ -227,7 +231,7 @@ fn chain_refuses_to_build_on_an_invalid_block() {
         coinbase_recipient: payout(),
     };
     let mut bad = assemble_block(&ctx, &[], &chain.state).unwrap();
-    mine_block_with_limit(&mut bad, 100_000).unwrap();
+    mine_block_with_limit(&mut bad, 100_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
     bad.header.state_root = Hash::blake3(b"wrong");
 
     assert!(chain.apply_block(&bad).is_err());
@@ -246,7 +250,7 @@ fn chain_refuses_to_build_on_an_invalid_block() {
         coinbase_recipient: payout(),
     };
     let mut child = assemble_block(&child_ctx, &[], &chain.state).unwrap();
-    mine_block_with_limit(&mut child, 100_000).unwrap();
+    mine_block_with_limit(&mut child, 100_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
     let err = chain.apply_block(&child).unwrap_err();
     assert!(err.to_string().contains("missing parent"), "got: {}", err);
 }

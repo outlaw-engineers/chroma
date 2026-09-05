@@ -47,6 +47,8 @@ fn validation_ctx(
         current_supply: supply,
         previous_state_root: parent.state_root,
         network_time: now_secs(),
+        pow_algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+        pow_seed: chroma_core::hash::Hash::ZERO,
     }
 }
 
@@ -56,7 +58,7 @@ fn mined_block_passes_validation() {
     let mut state = State::new();
 
     let mut block = assemble_block(&assembly_ctx(1, &genesis.header), &[], &state).unwrap();
-    mine_block_with_limit(&mut block, 20_000_000).expect("mining should succeed at easy bits");
+    mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).expect("mining should succeed at easy bits");
 
     let root = validate_block(&block, &validation_ctx(1, &genesis.header, 0), &mut state)
         .expect("a freshly mined block must validate");
@@ -74,7 +76,7 @@ fn mined_block_survives_the_codec() {
     let state = State::new();
 
     let mut block = assemble_block(&assembly_ctx(1, &genesis.header), &[], &state).unwrap();
-    mine_block_with_limit(&mut block, 20_000_000).unwrap();
+    mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let decoded = Block::decode_block(&block.encode_block()).expect("mined block must decode");
     assert_eq!(decoded.hash(), block.hash());
@@ -94,7 +96,7 @@ fn chain_of_blocks_accumulates_supply() {
 
     for height in 1..=3u32 {
         let mut block = assemble_block(&assembly_ctx(height, &parent), &[], &state).unwrap();
-        mine_block_with_limit(&mut block, 20_000_000).unwrap();
+        mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
         validate_block(
             &block,
             &validation_ctx(height, &parent, state.total_supply()),
@@ -117,7 +119,7 @@ fn rejected_block_leaves_state_untouched() {
     let mut state = State::new();
 
     let mut block = assemble_block(&assembly_ctx(1, &genesis.header), &[], &state).unwrap();
-    mine_block_with_limit(&mut block, 20_000_000).unwrap();
+    mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
     block.header.state_root = Hash::blake3(b"not the real root");
 
     let before_root = state.compute_state_root();
@@ -145,7 +147,7 @@ fn block_carrying_a_transfer_validates() {
         ..assembly_ctx(1, &genesis.header)
     };
     let mut funding = assemble_block(&funding_ctx, &[], &state).unwrap();
-    mine_block_with_limit(&mut funding, 20_000_000).unwrap();
+    mine_block_with_limit(&mut funding, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
     validate_block(&funding, &validation_ctx(1, &genesis.header, 0), &mut state).unwrap();
 
     // Now spend some of it in the next block.
@@ -162,7 +164,7 @@ fn block_carrying_a_transfer_validates() {
     let mut block =
         assemble_block(&assembly_ctx(2, &funding.header), &[tx.clone()], &state).unwrap();
     assert_eq!(block.transactions.len(), 2, "the transfer must be included");
-    mine_block_with_limit(&mut block, 20_000_000).unwrap();
+    mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     validate_block(
         &block,
@@ -190,7 +192,7 @@ fn a_second_coinbase_cannot_mint() {
         .transactions
         .push(chroma_tx::Transaction::coinbase(thief, Amount(1_000_000)));
     block.header.tx_merkle_root = Block::compute_tx_merkle_root(&block.transactions);
-    mine_block_with_limit(&mut block, 20_000_000).unwrap();
+    mine_block_with_limit(&mut block, 20_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let result = validate_block(&block, &validation_ctx(1, &genesis.header, 0), &mut state);
     assert!(result.is_err(), "a second coinbase must be rejected");
@@ -222,7 +224,7 @@ fn regtest_chain_advances() {
             coinbase_recipient: miner_address(),
         };
         let mut block = assemble_block(&ctx, &[], &chain.state).unwrap();
-        mine_block_with_limit(&mut block, 1_000)
+        mine_block_with_limit(&mut block, 1_000, &chroma_consensus::miner::PowContext::blake3())
             .unwrap_or_else(|e| panic!("regtest mining should be trivial: {}", e));
 
         chain
@@ -254,7 +256,7 @@ fn regtest_never_retargets() {
             coinbase_recipient: miner_address(),
         };
         let mut block = assemble_block(&ctx, &[], &chain.state).unwrap();
-        mine_block_with_limit(&mut block, 1_000).unwrap();
+        mine_block_with_limit(&mut block, 1_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
         chain.apply_block(&block).unwrap();
         assert_eq!(
             chain.tip.header.bits, genesis_bits,

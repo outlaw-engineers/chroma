@@ -180,7 +180,7 @@ fn test_block_assembly_and_mining() {
     assert_eq!(block.transactions.len(), 1);
     assert_eq!(block.transactions[0].amount.0, BLOCK_REWARD_UNITS);
 
-    mine_block_with_limit(&mut block, 10_000_000).unwrap();
+    mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let target = block.header.bits.to_full_target();
     assert!(chroma_crypto::randomx::hash_meets_target(&block.header.hash(), &target));
@@ -709,7 +709,7 @@ fn test_end_to_end_devnet() {
     };
 
     let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
-    mine_block_with_limit(&mut block, 10_000_000).unwrap();
+    mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let target = block.header.bits.to_full_target();
     assert!(
@@ -779,6 +779,8 @@ fn test_mtp_enforced_in_block_validation() {
         current_supply: 0,
         previous_state_root: Hash::ZERO,
         network_time: genesis.header.timestamp + 2000,
+        pow_algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+        pow_seed: chroma_core::hash::Hash::ZERO,
     };
 
     let block = Block {
@@ -985,7 +987,7 @@ fn test_devnet_multi_block_mining_and_storage() {
 
         let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
         block.header.timestamp = prev_ts + 10;
-        mine_block_with_limit(&mut block, 10_000_000).unwrap();
+        mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
         let block_hash = block.hash();
         chain.headers.insert(expected_height, block.header.clone());

@@ -5,6 +5,13 @@ edition = { workspace = true }
 license = { workspace = true }
 description = "Chroma cryptography: Schnorr, BLAKE3, Bech32m, RandomX bindings"
 
+[features]
+default = ["randomx"]
+# RandomX pulls in a C++ library built with cmake. Turning it off keeps the
+# crate buildable where that toolchain is not available; the real networks
+# require it.
+randomx = ["dep:randomx-rs"]
+
 [dependencies]
 chroma-core = { path = "../chroma-core" }
 blake3 = "1.5"
@@ -15,6 +22,8 @@ secp256k1 = { version = "0.27", features = ["rand", "rand-std"] }
 bech32 = "0.11"
 thiserror = "1.0"
 getrandom = "0.2"
+
+randomx-rs = { version = "1.3", optional = true }
 
 [dev-dependencies]
 proptest = "1.5"

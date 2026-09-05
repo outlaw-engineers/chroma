@@ -571,6 +571,28 @@ impl ChainState {
         Ok(state)
     }
 
+    /// The RandomX epoch seed for `height`, taken from the branch in
+    /// `headers`.
+    ///
+    /// Spec §3: the seed is the hash of the block at `epoch_start - lag`.
+    /// Before that block exists — and whenever the branch does not reach back
+    /// that far — the genesis seed stands in.
+    pub fn pow_seed_for(&self, height: u32, headers: &BTreeMap<u32, BlockHeader>) -> Hash {
+        use chroma_core::constants::{RANDOMX_EPOCH_LENGTH, RANDOMX_SEED_LAG};
+
+        match chroma_crypto::randomx::seed_height_for(
+            height,
+            RANDOMX_EPOCH_LENGTH,
+            RANDOMX_SEED_LAG,
+        ) {
+            Some(seed_height) => match headers.get(&seed_height) {
+                Some(header) => chroma_crypto::randomx::derive_seed(&header.hash()),
+                None => genesis_randomx_seed(),
+            },
+            None => genesis_randomx_seed(),
+        }
+    }
+
     /// Build the validation context for `block` against a given header chain.
     fn validation_context(
         &self,
@@ -590,6 +612,8 @@ impl ChainState {
             expected_bits: calculate_target_for_height_with(height, headers, &self.params)?,
             current_supply: self.tip.supply,
             previous_state_root: parent.state_root,
+            pow_algorithm: self.params.pow,
+            pow_seed: self.pow_seed_for(height, headers),
             // Wall-clock time, not the block's own timestamp. Passing the
             // block's timestamp made the "not too far in the future" check
             // compare the value against itself, so it always passed and

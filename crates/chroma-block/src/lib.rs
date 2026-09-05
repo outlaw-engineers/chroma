@@ -214,6 +214,10 @@ pub struct BlockValidationContext {
     pub previous_state_root: Hash,
     /// Network-adjusted time (for future timestamp check)
     pub network_time: u64,
+    /// Proof-of-work function this network uses.
+    pub pow_algorithm: chroma_crypto::randomx::PowAlgorithm,
+    /// RandomX epoch seed for this height (ignored by BLAKE3).
+    pub pow_seed: Hash,
 }
 
 /// Validate a complete block against the chain context.
@@ -278,12 +282,20 @@ pub fn validate_block(
     }
 
     // --- PoW ---
-    let header_hash = header.hash();
+    // The proof-of-work hash is not the block's identity. RandomX is keyed by
+    // the epoch seed and is deliberately expensive; the block is still
+    // identified by the BLAKE3 hash of its header.
+    let pow = chroma_crypto::randomx::pow_hash(
+        ctx.pow_algorithm,
+        &ctx.pow_seed,
+        &header.encode(),
+    )
+    .map_err(|e| CoreError::InvalidProofOfWork(format!("cannot compute proof of work: {}", e)))?;
     let target = header.bits.to_full_target();
-    if !chroma_crypto::randomx::hash_meets_target(&header_hash, &target) {
-        return Err(CoreError::InvalidProofOfWork(format!(
-            "block hash does not meet target"
-        )));
+    if !chroma_crypto::randomx::hash_meets_target(&pow, &target) {
+        return Err(CoreError::InvalidProofOfWork(
+            "proof of work does not meet target".to_string(),
+        ));
     }
 
     // --- Transaction count ---

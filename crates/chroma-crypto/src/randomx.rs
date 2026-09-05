@@ -1,11 +1,11 @@
 //! RandomX Proof of Work
 //!
-//! RandomX is a CPU-oriented proof-of-work algorithm.
-//! For Chroma v1 (devnet), we use a placeholder PoW:
-//! BLAKE3 hash with difficulty target.
+//! RandomX is a CPU-oriented proof-of-work algorithm, bound here through
+//! `randomx-rs` (which builds the reference C++ implementation).
 //!
-//! The full RandomX integration will be done via FFI binding to the
-//! reference RandomX implementation (monero-project/rust-randomx or similar).
+//! The real networks use it; regtest uses BLAKE3, so local development and
+//! the test suite are not paying tens of milliseconds and a multi-second
+//! cache build per hash for work that proves nothing about consensus.
 //!
 //! Security properties (from spec v0.1):
 //! - Seed: H(block at height epoch_start - 100)
@@ -15,6 +15,159 @@
 
 use chroma_core::{Hash, blake3};
 use crate::error::{CryptoError, CryptoResult as Result};
+
+// ============================================================================
+// Proof-of-work algorithm
+// ============================================================================
+
+/// Which proof-of-work function a network uses.
+///
+/// The real networks use RandomX, as the spec requires. Regtest uses BLAKE3 so
+/// that local development and the test suite are not paying 40 ms per hash and
+/// a 600 ms cache build for work that proves nothing about consensus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowAlgorithm {
+    Blake3,
+    RandomX,
+}
+
+impl PowAlgorithm {
+    pub fn name(&self) -> &'static str {
+        match self {
+            PowAlgorithm::Blake3 => "blake3",
+            PowAlgorithm::RandomX => "randomx",
+        }
+    }
+}
+
+/// Compute the proof-of-work hash of `header_bytes` under `algorithm`.
+///
+/// `seed` selects the RandomX dataset for the current epoch and is ignored by
+/// BLAKE3.
+pub fn pow_hash(algorithm: PowAlgorithm, seed: &Hash, header_bytes: &[u8]) -> Result<Hash> {
+    match algorithm {
+        PowAlgorithm::Blake3 => Ok(blake3(header_bytes)),
+        PowAlgorithm::RandomX => randomx_hash(seed, header_bytes),
+    }
+}
+
+// ============================================================================
+// RandomX
+// ============================================================================
+
+/// How many epoch caches to keep. Two covers the boundary, where blocks from
+/// the previous epoch are still being validated while the new one starts.
+const CACHE_SLOTS: usize = 2;
+
+#[cfg(feature = "randomx")]
+mod vm {
+    use super::*;
+    use randomx_rs::{RandomXCache, RandomXFlag, RandomXVM};
+    use std::cell::RefCell;
+
+    // RandomXCache is neither Send nor Sync, so the caches cannot be shared
+    // between threads. They are kept per thread instead, which is how RandomX
+    // is normally used: each hashing thread owns its own VM. The cost is one
+    // cache per thread that hashes (a few hundred milliseconds to build, and
+    // ~256 MiB resident in light mode), so hashing should be confined to a
+    // small number of threads.
+    thread_local! {
+        static SLOTS: RefCell<Vec<(Hash, RandomXCache)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn flags() -> RandomXFlag {
+        RandomXFlag::get_recommended_flags()
+    }
+
+    /// Run `f` with a VM bound to `seed`, building the cache if this thread
+    /// has not seen that seed before.
+    fn with_vm<T>(seed: &Hash, f: impl FnOnce(&RandomXVM) -> Result<T>) -> Result<T> {
+        SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+
+            let cache = match slots.iter().position(|(s, _)| s == seed) {
+                Some(index) => {
+                    // Move to the back so the least recently used is dropped
+                    // first when the epoch turns.
+                    let entry = slots.remove(index);
+                    let cache = entry.1.clone();
+                    slots.push(entry);
+                    cache
+                }
+                None => {
+                    let cache = RandomXCache::new(flags(), seed.as_bytes())
+                        .map_err(|e| CryptoError::RandomX(format!("cache init failed: {}", e)))?;
+                    slots.push((*seed, cache.clone()));
+                    while slots.len() > CACHE_SLOTS {
+                        slots.remove(0);
+                    }
+                    cache
+                }
+            };
+
+            let vm = RandomXVM::new(flags(), Some(cache), None)
+                .map_err(|e| CryptoError::RandomX(format!("vm init failed: {}", e)))?;
+            f(&vm)
+        })
+    }
+
+    pub(super) fn hash(seed: &Hash, input: &[u8]) -> Result<Hash> {
+        with_vm(seed, |vm| {
+            let out = vm
+                .calculate_hash(input)
+                .map_err(|e| CryptoError::RandomX(format!("hash failed: {}", e)))?;
+            Hash::from_slice(&out)
+                .map_err(|e| CryptoError::RandomX(format!("unexpected hash length: {}", e)))
+        })
+    }
+
+    pub(super) fn warm(seed: &Hash) -> Result<()> {
+        with_vm(seed, |_| Ok(()))
+    }
+
+    pub(super) fn available() -> bool {
+        true
+    }
+}
+
+#[cfg(not(feature = "randomx"))]
+mod vm {
+    use super::*;
+
+    pub(super) fn hash(_seed: &Hash, _input: &[u8]) -> Result<Hash> {
+        Err(CryptoError::RandomX(
+            "this build was compiled without the randomx feature".to_string(),
+        ))
+    }
+
+    pub(super) fn warm(_seed: &Hash) -> Result<()> {
+        Err(CryptoError::RandomX(
+            "this build was compiled without the randomx feature".to_string(),
+        ))
+    }
+
+    pub(super) fn available() -> bool {
+        false
+    }
+}
+
+/// Hash `input` with RandomX under `seed`.
+pub fn randomx_hash(seed: &Hash, input: &[u8]) -> Result<Hash> {
+    vm::hash(seed, input)
+}
+
+/// Build the RandomX cache for `seed` before it is needed.
+///
+/// Worth calling when the epoch is about to turn: otherwise the first block of
+/// the new epoch pays the cache build inside validation.
+pub fn warm_seed(seed: &Hash) -> Result<()> {
+    vm::warm(seed)
+}
+
+/// Whether this build can compute RandomX hashes at all.
+pub fn randomx_available() -> bool {
+    vm::available()
+}
 
 /// RandomX PoW result
 /// In production: 32-byte hash, compared against target
@@ -71,6 +224,21 @@ pub fn calculate_work(target: &[u8; 32]) -> [u8; 32] {
 /// seed = H(block_hash_at_height(epoch_start - SEED_LAG))
 pub fn derive_seed(block_hash: &Hash) -> Hash {
     *block_hash
+}
+
+/// The height whose block hash seeds the epoch containing `height`.
+///
+/// Spec §3: the seed comes from `epoch_start - lag`, not from the epoch
+/// boundary itself. The lag is what stops a miner from grinding the seed: by
+/// the time a block could influence which seed is used, it is already a
+/// hundred blocks deep, and withholding it to steer the seed means abandoning
+/// that much work.
+///
+/// Heights whose epoch starts before the lag has elapsed have no such block,
+/// so they use the genesis seed instead.
+pub fn seed_height_for(height: u32, epoch_length: u32, lag: u32) -> Option<u32> {
+    let epoch_start = (height / epoch_length) * epoch_length;
+    epoch_start.checked_sub(lag)
 }
 
 /// Epoch calculation: height / EPOCH_LENGTH
@@ -182,6 +350,92 @@ mod tests {
         bug_target[0] = 0x02;
         bug_target[1] = 0x00;
         assert!(hash_meets_target(&bug_hash, &bug_target));
+    }
+
+    #[test]
+    fn test_seed_height_follows_the_lag() {
+        // Spec §3: epoch 1000 blocks, seed lag 100.
+        let (epoch, lag) = (1000u32, 100u32);
+
+        // The first epoch's start is before the lag, so there is no seed block.
+        assert_eq!(seed_height_for(0, epoch, lag), None);
+        assert_eq!(seed_height_for(999, epoch, lag), None);
+
+        // Epoch 1 starts at 1000, so its seed is the block at 900.
+        assert_eq!(seed_height_for(1000, epoch, lag), Some(900));
+        assert_eq!(seed_height_for(1500, epoch, lag), Some(900));
+        assert_eq!(seed_height_for(1999, epoch, lag), Some(900));
+
+        // Epoch 2 moves the seed on by exactly one epoch.
+        assert_eq!(seed_height_for(2000, epoch, lag), Some(1900));
+    }
+
+    #[test]
+    fn test_seed_is_stable_across_an_epoch() {
+        let (epoch, lag) = (1000u32, 100u32);
+        let expected = seed_height_for(1000, epoch, lag);
+        for height in 1000..2000u32 {
+            assert_eq!(
+                seed_height_for(height, epoch, lag),
+                expected,
+                "the seed must not change inside an epoch (height {})",
+                height
+            );
+        }
+        assert_ne!(seed_height_for(2000, epoch, lag), expected);
+    }
+
+    #[test]
+    fn test_seed_block_is_deep_enough_to_resist_grinding() {
+        // The block that decides an epoch's seed is always at least `lag`
+        // blocks below the epoch it seeds, so influencing it means giving up
+        // that many blocks of work.
+        let (epoch, lag) = (1000u32, 100u32);
+        for height in (1000..10_000u32).step_by(137) {
+            let seed_height = seed_height_for(height, epoch, lag).unwrap();
+            assert!(
+                height - seed_height >= lag,
+                "height {} used a seed only {} blocks back",
+                height,
+                height - seed_height
+            );
+        }
+    }
+
+    #[test]
+    fn test_pow_algorithm_blake3_is_deterministic_and_ignores_the_seed() {
+        let a = pow_hash(PowAlgorithm::Blake3, &Hash::blake3(b"seed a"), b"header").unwrap();
+        let b = pow_hash(PowAlgorithm::Blake3, &Hash::blake3(b"seed b"), b"header").unwrap();
+        assert_eq!(a, b, "blake3 proof of work does not use the seed");
+        assert_ne!(
+            a,
+            pow_hash(PowAlgorithm::Blake3, &Hash::ZERO, b"other header").unwrap()
+        );
+    }
+
+    #[cfg(feature = "randomx")]
+    #[test]
+    fn test_randomx_is_deterministic_and_seed_dependent() {
+        let seed_a = Hash::blake3(b"epoch seed a");
+        let seed_b = Hash::blake3(b"epoch seed b");
+
+        let first = pow_hash(PowAlgorithm::RandomX, &seed_a, b"header bytes").unwrap();
+        let again = pow_hash(PowAlgorithm::RandomX, &seed_a, b"header bytes").unwrap();
+        assert_eq!(first, again, "the same seed and input must give the same hash");
+
+        let other_input = pow_hash(PowAlgorithm::RandomX, &seed_a, b"different header").unwrap();
+        assert_ne!(first, other_input);
+
+        // Changing the epoch seed changes the function, which is the whole
+        // point of rotating it.
+        let other_seed = pow_hash(PowAlgorithm::RandomX, &seed_b, b"header bytes").unwrap();
+        assert_ne!(first, other_seed, "a different seed must give a different hash");
+    }
+
+    #[cfg(feature = "randomx")]
+    #[test]
+    fn test_randomx_is_available_when_compiled_in() {
+        assert!(randomx_available());
     }
 
     #[test]

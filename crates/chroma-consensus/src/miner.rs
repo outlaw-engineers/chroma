@@ -1,7 +1,7 @@
 //! Block Assembly and Mining
 //!
 //! Assembles blocks from the mempool, creates coinbase transactions,
-//! and performs Proof-of-Work (BLAKE3 placeholder for devnet).
+//! and performs proof of work using the network's algorithm.
 
 use chroma_core::constants::{
     BLOCK_REWARD_UNITS, MAX_FUTURE_TIMESTAMP_OFFSET,
@@ -10,6 +10,7 @@ use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
 use chroma_core::types::{Amount, BlockHeight, CompactTarget};
 use chroma_block::{Block, BlockHeader};
+use chroma_core::serialize::CanonicalEncode;
 use chroma_tx::Transaction;
 
 /// Maximum number of transactions to include in a block.
@@ -110,44 +111,50 @@ pub fn assemble_block(
     })
 }
 
-/// Mine a block by searching for a valid nonce.
-///
-/// Iterates the nonce field of the block header until the hash meets the target.
-/// Returns the block with a valid nonce, or an error if no solution found within
-/// the search space.
-///
-/// For devnet (BLAKE3 placeholder): expects to find a solution relatively quickly
-/// with the default difficulty target.
-pub fn mine_block(block: &mut Block) -> Result<()> {
-    let target = block.header.bits.to_full_target();
+/// What the miner needs to compute proof of work: the network's function and
+/// the current epoch's seed.
+#[derive(Clone, Copy, Debug)]
+pub struct PowContext {
+    pub algorithm: chroma_crypto::randomx::PowAlgorithm,
+    pub seed: Hash,
+}
 
-    for nonce in 0..=u64::MAX {
-        block.header.nonce = nonce;
-        let header_hash = block.header.hash();
-        if chroma_crypto::randomx::hash_meets_target(&header_hash, &target) {
-            return Ok(());
-        }
-
-        if nonce % 10_000_000 == 0 && nonce > 0 {
-            // Progress heartbeat — in production, this would yield to the runtime
+impl PowContext {
+    /// BLAKE3 proof of work, as regtest uses.
+    pub fn blake3() -> Self {
+        PowContext {
+            algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+            seed: Hash::ZERO,
         }
     }
 
-    Err(CoreError::InvalidProofOfWork(
-        "exhausted nonce search space".into(),
-    ))
+    /// Compute the proof-of-work hash of a header.
+    ///
+    /// This is not the block's identity: RandomX is keyed by the epoch seed
+    /// and is deliberately expensive, while the block is still identified by
+    /// the BLAKE3 hash of its header.
+    pub fn hash_header(&self, header: &BlockHeader) -> Result<Hash> {
+        chroma_crypto::randomx::pow_hash(self.algorithm, &self.seed, &header.encode())
+            .map_err(|e| CoreError::InvalidProofOfWork(format!("proof of work failed: {}", e)))
+    }
 }
 
-/// Mine a block with timeout.
+/// Mine a block by searching for a valid nonce.
 ///
-/// Searches for at most `max_nonces` nonce values before returning an error.
-pub fn mine_block_with_limit(block: &mut Block, max_nonces: u64) -> Result<()> {
+/// Iterates the nonce field of the block header until the proof-of-work hash
+/// meets the target.
+pub fn mine_block(block: &mut Block, pow: &PowContext) -> Result<()> {
+    mine_block_with_limit(block, u64::MAX, pow)
+}
+
+/// Mine a block, searching at most `max_nonces` values.
+pub fn mine_block_with_limit(block: &mut Block, max_nonces: u64, pow: &PowContext) -> Result<()> {
     let target = block.header.bits.to_full_target();
 
     for nonce in 0..max_nonces {
         block.header.nonce = nonce;
-        let header_hash = block.header.hash();
-        if chroma_crypto::randomx::hash_meets_target(&header_hash, &target) {
+        let candidate = pow.hash_header(&block.header)?;
+        if chroma_crypto::randomx::hash_meets_target(&candidate, &target) {
             return Ok(());
         }
     }
@@ -336,7 +343,7 @@ mod tests {
         };
 
         let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
-        mine_block_with_limit(&mut block, 10_000_000).unwrap();
+        mine_block_with_limit(&mut block, 10_000_000, &PowContext::blake3()).unwrap();
 
         let target = block.header.bits.to_full_target();
         let hash = block.header.hash();
@@ -406,7 +413,7 @@ mod tests {
         };
 
         let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
-        mine_block_with_limit(&mut block, 10_000_000).unwrap();
+        mine_block_with_limit(&mut block, 10_000_000, &PowContext::blake3()).unwrap();
 
         let target = block.header.bits.to_full_target();
         assert!(chroma_crypto::randomx::hash_meets_target(&block.header.hash(), &target));

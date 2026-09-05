@@ -1672,7 +1672,7 @@ impl Node {
     ) {
         use chroma_consensus::miner::{
             assemble_block, mine_block_with_limit, next_block_timestamp, timestamp_is_valid,
-            BlockAssemblyContext,
+            BlockAssemblyContext, PowContext,
         };
         use chroma_core::types::BlockHeight;
 
@@ -1682,7 +1682,7 @@ impl Node {
             if shutdown.try_recv().is_ok() {
                 break;
             }
-            let (height, previous_hash, mtp, bits, parent_state) = {
+            let (height, previous_hash, mtp, bits, parent_state, pow) = {
                 let cs = chain_state.read().await;
                 let tip = &cs.tip;
                 let next_height = tip.height.0 + 1;
@@ -1692,6 +1692,13 @@ impl Node {
                     cs.compute_median_time_past(next_height),
                     tip.header.bits,
                     cs.state.clone(),
+                    // The proof-of-work function and epoch seed have to match
+                    // what validation will use, or every block we find is
+                    // rejected by our own rules.
+                    PowContext {
+                        algorithm: cs.params.pow,
+                        seed: cs.pow_seed_for(next_height, &cs.headers),
+                    },
                 )
             };
 
@@ -1714,7 +1721,7 @@ impl Node {
 
             match assemble_block(&ctx, &candidates, &parent_state) {
                 Ok(mut block) => {
-                    match mine_block_with_limit(&mut block, 10_000_000) {
+                    match mine_block_with_limit(&mut block, 10_000_000, &pow) {
                         Ok(()) => {
                             // Mining can take a while; if the stamp has gone
                             // stale meanwhile, rebuild rather than submit a

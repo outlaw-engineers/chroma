@@ -7,6 +7,7 @@
 
 use chroma_core::constants::{GENESIS_TARGET_BITS, GENESIS_TIMESTAMP};
 use chroma_core::types::{CompactTarget, NetworkId};
+use chroma_crypto::randomx::PowAlgorithm;
 
 /// Hardest target the retarget algorithm may produce (smallest value).
 pub const DEFAULT_MIN_TARGET: [u8; 32] = {
@@ -47,6 +48,10 @@ pub struct ChainParams {
     /// regtest so that block production stays instant and deterministic no
     /// matter how fast blocks are produced.
     pub no_retargeting: bool,
+    /// Proof-of-work function. The real networks use RandomX as the spec
+    /// requires; regtest uses BLAKE3 so the test suite is not paying 40 ms and
+    /// a cache build per hash for work that proves nothing about consensus.
+    pub pow: PowAlgorithm,
 }
 
 impl ChainParams {
@@ -58,6 +63,7 @@ impl ChainParams {
             min_target: DEFAULT_MIN_TARGET,
             max_target: DEFAULT_MAX_TARGET,
             no_retargeting: false,
+            pow: PowAlgorithm::RandomX,
         }
     }
 
@@ -91,6 +97,7 @@ impl ChainParams {
             // The genesis target is already the easiest one allowed.
             max_target: [0xFF; 32],
             no_retargeting: true,
+            pow: PowAlgorithm::Blake3,
         }
     }
 
@@ -172,6 +179,11 @@ mod tests {
         ] {
             assert_eq!(params.genesis_bits, CompactTarget(GENESIS_TARGET_BITS));
             assert!(!params.no_retargeting, "only regtest freezes difficulty");
+            assert_eq!(
+                params.pow,
+                PowAlgorithm::RandomX,
+                "the real networks must use the spec's proof of work"
+            );
         }
     }
 
