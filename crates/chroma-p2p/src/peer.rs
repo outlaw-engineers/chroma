@@ -23,6 +23,19 @@ pub enum PeerState {
     Banned,
 }
 
+/// Outcome of claiming a connection slot for a peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConnectionSlot {
+    /// The slot was claimed; the caller owns this connection.
+    Accepted,
+    /// A connection to this peer is already live.
+    Duplicate,
+    /// The peer is banned.
+    Banned,
+    /// The relevant connection limit is already reached.
+    Full,
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub addr: SocketAddr,
@@ -31,10 +44,14 @@ pub struct PeerInfo {
     pub connected_at: Option<Instant>,
     pub last_seen: Option<Instant>,
     pub last_ping_nonce: Option<u64>,
+    /// When the outstanding ping was sent, for timeout detection.
+    pub last_ping_at: Option<Instant>,
     pub height: u32,
     pub version: u32,
     pub services: u64,
     pub ban_until: Option<Instant>,
+    /// True if the remote opened the connection to us.
+    pub inbound: bool,
 }
 
 impl PeerInfo {
@@ -46,10 +63,29 @@ impl PeerInfo {
             connected_at: None,
             last_seen: None,
             last_ping_nonce: None,
+            last_ping_at: None,
             height: 0,
             version: 0,
             services: 0,
             ban_until: None,
+            inbound: false,
+        }
+    }
+
+    /// True while a connection to this peer is live or being established.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.state,
+            PeerState::Connecting | PeerState::Connected | PeerState::Handshaking | PeerState::Ready
+        )
+    }
+
+    /// True if the peer has gone quiet for longer than `timeout`.
+    pub fn is_stale(&self, timeout: Duration) -> bool {
+        let reference = self.last_seen.or(self.connected_at);
+        match reference {
+            Some(t) => t.elapsed() > timeout,
+            None => false,
         }
     }
 
@@ -102,6 +138,75 @@ impl PeerManager {
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
         self.peers.remove(addr);
         self.channels.remove(addr);
+    }
+
+    /// Atomically claim a connection slot for `addr`.
+    ///
+    /// Checking "is this peer already connected?" and marking it connected must
+    /// happen under one lock acquisition, otherwise two simultaneous dials to
+    /// the same peer both observe "not connected" and both proceed.
+    pub fn begin_connection(&mut self, addr: SocketAddr, inbound: bool) -> ConnectionSlot {
+        if let Some(peer) = self.peers.get(&addr) {
+            if peer.is_banned() {
+                return ConnectionSlot::Banned;
+            }
+            if peer.is_active() {
+                return ConnectionSlot::Duplicate;
+            }
+        }
+
+        let limit_reached = if inbound {
+            self.inbound_count() >= MAX_INBOUND_PEERS
+        } else {
+            self.outbound_count() >= MAX_OUTBOUND_PEERS
+        };
+        if limit_reached {
+            return ConnectionSlot::Full;
+        }
+
+        let peer = self.peers.entry(addr).or_insert_with(|| PeerInfo::new(addr));
+        peer.state = PeerState::Connecting;
+        peer.inbound = inbound;
+        peer.connected_at = Some(Instant::now());
+        peer.last_seen = None;
+        peer.last_ping_nonce = None;
+        peer.last_ping_at = None;
+        ConnectionSlot::Accepted
+    }
+
+    /// Mark a peer's connection as closed.
+    ///
+    /// The `PeerInfo` is kept so the accumulated score and any ban survive the
+    /// disconnect — dropping the entry would let a misbehaving peer clear its
+    /// own ban simply by reconnecting.
+    pub fn mark_disconnected(&mut self, addr: &SocketAddr) {
+        self.channels.remove(addr);
+        if let Some(peer) = self.peers.get_mut(addr) {
+            if peer.state != PeerState::Banned {
+                peer.state = PeerState::Disconnected;
+            }
+            peer.last_ping_nonce = None;
+            peer.last_ping_at = None;
+        }
+    }
+
+    /// Number of live inbound connections.
+    pub fn inbound_count(&self) -> usize {
+        self.peers.values().filter(|p| p.inbound && p.is_active()).count()
+    }
+
+    /// Number of live outbound connections.
+    pub fn outbound_count(&self) -> usize {
+        self.peers.values().filter(|p| !p.inbound && p.is_active()).count()
+    }
+
+    /// Peers that have gone quiet for longer than `timeout` and should be cut.
+    pub fn stale_peers(&self, timeout: Duration) -> Vec<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.is_active() && p.is_stale(timeout))
+            .map(|p| p.addr)
+            .collect()
     }
 
     pub fn get_peer(&self, addr: &SocketAddr) -> Option<&PeerInfo> {
@@ -166,11 +271,13 @@ impl PeerManager {
         }
     }
 
+    /// Drop entries for peers that are disconnected and not banned.
+    /// Banned peers are retained so that the ban outlives the connection.
     pub fn prune_disconnected(&mut self) {
         let addrs: Vec<SocketAddr> = self
             .peers
             .iter()
-            .filter(|(_, p)| p.state == PeerState::Disconnected)
+            .filter(|(_, p)| p.state == PeerState::Disconnected && !p.is_banned())
             .map(|(a, _)| *a)
             .collect();
         for addr in addrs {
@@ -287,6 +394,103 @@ mod tests {
         pm.prune_disconnected();
         assert!(pm.get_peer(&a1).is_some());
         assert!(pm.get_peer(&a2).is_none());
+    }
+
+    #[test]
+    fn test_begin_connection_rejects_duplicate() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+        // A second dial while the first is live must not open another socket.
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Duplicate);
+
+        // ...but reconnecting after a clean disconnect is allowed.
+        pm.mark_disconnected(&addr);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+    }
+
+    #[test]
+    fn test_begin_connection_rejects_banned() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        pm.add_peer(addr);
+        pm.ban_peer(&addr);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Banned);
+    }
+
+    #[test]
+    fn test_begin_connection_enforces_separate_limits() {
+        let mut pm = PeerManager::new();
+        for i in 0..MAX_OUTBOUND_PEERS {
+            let addr = test_addr(9000 + i as u16);
+            assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+        }
+        assert_eq!(
+            pm.begin_connection(test_addr(9999), false),
+            ConnectionSlot::Full
+        );
+        // The inbound budget is separate and still has room.
+        assert_eq!(
+            pm.begin_connection(test_addr(9998), true),
+            ConnectionSlot::Accepted
+        );
+
+        for i in 1..MAX_INBOUND_PEERS {
+            let addr = test_addr(10_000 + i as u16);
+            assert_eq!(pm.begin_connection(addr, true), ConnectionSlot::Accepted);
+        }
+        assert_eq!(
+            pm.begin_connection(test_addr(11_000), true),
+            ConnectionSlot::Full
+        );
+    }
+
+    #[test]
+    fn test_ban_survives_disconnect() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        pm.add_peer(addr);
+        pm.ban_peer(&addr);
+
+        // Disconnect must not erase the ban (remove_peer would have).
+        pm.mark_disconnected(&addr);
+        assert!(pm.get_peer(&addr).unwrap().is_banned());
+        pm.prune_disconnected();
+        assert!(
+            pm.get_peer(&addr).is_some_and(|p| p.is_banned()),
+            "a banned peer must not be pruned away"
+        );
+        assert_eq!(pm.begin_connection(addr, true), ConnectionSlot::Banned);
+    }
+
+    #[test]
+    fn test_mark_disconnected_clears_channel() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        pm.begin_connection(addr, false);
+        pm.set_channel(addr, tx);
+        assert!(pm.get_channel(&addr).is_some());
+        pm.mark_disconnected(&addr);
+        assert!(pm.get_channel(&addr).is_none());
+        assert_eq!(pm.get_peer(&addr).unwrap().state, PeerState::Disconnected);
+    }
+
+    #[test]
+    fn test_stale_peers() {
+        let mut pm = PeerManager::new();
+        let fresh = test_addr(8333);
+        let quiet = test_addr(8334);
+        pm.begin_connection(fresh, false);
+        pm.begin_connection(quiet, false);
+        pm.get_peer_mut(&fresh).unwrap().state = PeerState::Ready;
+        pm.get_peer_mut(&fresh).unwrap().last_seen = Some(Instant::now());
+        pm.get_peer_mut(&quiet).unwrap().state = PeerState::Ready;
+        pm.get_peer_mut(&quiet).unwrap().last_seen =
+            Some(Instant::now() - Duration::from_secs(PEER_TIMEOUT_SECS + 5));
+
+        let stale = pm.stale_peers(Duration::from_secs(PEER_TIMEOUT_SECS));
+        assert_eq!(stale, vec![quiet]);
     }
 
     #[test]

@@ -134,6 +134,8 @@ async fn main() -> anyhow::Result<()> {
             node.run().await?;
             tokio::signal::ctrl_c().await?;
             println!("Shutting down...");
+            node.shutdown().await;
+            println!("Stopped cleanly.");
         }
         Commands::Wallet { command } => match command {
             WalletCommands::Create { name } => {

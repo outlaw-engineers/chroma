@@ -465,6 +465,7 @@ fn test_wire_message_roundtrip() {
         timestamp: 1767225600,
         height: 42,
         nonce: 0xDEADBEEF,
+        listen_port: 8333,
     };
     let msg = Message::new(MessageType::Version, version.encode());
     let encoded = msg.encode();
@@ -478,6 +479,7 @@ fn test_wire_message_roundtrip() {
     assert_eq!(decoded_version.version, 1);
     assert_eq!(decoded_version.height, 42);
     assert_eq!(decoded_version.nonce, 0xDEADBEEF);
+    assert_eq!(decoded_version.listen_port, 8333);
 }
 
 #[test]

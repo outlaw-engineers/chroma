@@ -1,0 +1,476 @@
+//! P2P integration tests over real TCP sockets.
+//!
+//! These exercise the behaviours that unit tests on `PeerManager` and the wire
+//! codec cannot reach: that a connection stays open and usable across many
+//! messages, that a frame larger than one socket read is reassembled instead of
+//! killing the peer, that received transactions reach the mempool, and that
+//! shutdown actually stops.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use chroma_core::hash::Hash160;
+use chroma_core::serialize::CanonicalEncode;
+use chroma_core::types::{Address, Amount, Nonce};
+use chroma_crypto::hash::hash160;
+use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
+use chroma_p2p::peer::PeerState;
+use chroma_p2p::wire::{
+    decode_frame, FrameDecode, Message, MessageType, PingMessage, VersionMessage,
+};
+use chroma_p2p::{Node, NodeConfig, NodeEvent, PROTOCOL_VERSION};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "chroma_p2p_it_{}_{}_{}",
+        tag,
+        std::process::id(),
+        id
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// Start a node on an ephemeral port with mining off (these tests are about
+/// networking, and the miner would only add noise and CPU load).
+async fn start_node(tag: &str) -> (Node, SocketAddr, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let genesis = chroma_consensus::build_genesis_block().hash();
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir.clone())
+        .with_mining(false);
+    let mut node = Node::new(config);
+    node.run().await.expect("node failed to start");
+    let addr = node.local_addr().expect("listener not bound");
+    (node, addr, dir)
+}
+
+/// A minimal peer implementation driven by the test, so we can control exactly
+/// what goes on the wire and observe exactly what comes back.
+struct RawPeer {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    listen_port: u16,
+}
+
+impl RawPeer {
+    async fn connect(addr: SocketAddr, listen_port: u16) -> Self {
+        let stream = TcpStream::connect(addr).await.expect("dial failed");
+        RawPeer {
+            stream,
+            buf: Vec::new(),
+            listen_port,
+        }
+    }
+
+    async fn send(&mut self, msg: Message) {
+        self.stream
+            .write_all(&msg.encode())
+            .await
+            .expect("write failed");
+    }
+
+    /// Read until one full frame is decoded, or the deadline expires.
+    async fn recv(&mut self) -> Option<Message> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match decode_frame(&self.buf).expect("peer sent a malformed frame") {
+                FrameDecode::Complete { message, consumed } => {
+                    self.buf.drain(..consumed);
+                    return Some(message);
+                }
+                FrameDecode::Incomplete { .. } => {}
+            }
+            let mut chunk = vec![0u8; 8192];
+            let n = match tokio::time::timeout_at(deadline, self.stream.read(&mut chunk)).await {
+                Ok(Ok(0)) => return None,
+                Ok(Ok(n)) => n,
+                _ => return None,
+            };
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    async fn recv_expect(&mut self, want: MessageType) -> Message {
+        loop {
+            let msg = self.recv().await.unwrap_or_else(|| {
+                panic!("connection closed while waiting for {:?}", want);
+            });
+            if msg.msg_type == want {
+                return msg;
+            }
+        }
+    }
+
+    /// Complete the version/verack handshake as the initiating side.
+    async fn handshake(&mut self) {
+        let version = VersionMessage {
+            version: PROTOCOL_VERSION,
+            services: 0,
+            timestamp: 1_700_000_000,
+            height: 0,
+            nonce: 0xFEED_BEEF_1234_5678,
+            listen_port: self.listen_port,
+        };
+        self.send(Message::new(MessageType::Version, version.encode()))
+            .await;
+
+        // The node answers with its own version and a verack; order is not
+        // guaranteed, so accept them in either order.
+        let mut got_version = false;
+        let mut got_verack = false;
+        while !(got_version && got_verack) {
+            match self.recv().await.expect("closed during handshake").msg_type {
+                MessageType::Version => got_version = true,
+                MessageType::VerAck => got_verack = true,
+                _ => {}
+            }
+        }
+
+        // Acknowledge theirs so the node marks us Ready.
+        self.send(Message::new(MessageType::VerAck, vec![])).await;
+    }
+}
+
+/// Poll a condition until it holds or the timeout expires.
+async fn wait_for<F, Fut>(what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if f().await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for: {}", what);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn signed_transaction(nonce: u64) -> chroma_tx::Transaction {
+    let secret = SecretKey32::generate();
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let sender = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+    let recipient = Address::from_hash160(Hash160([0x77u8; 20]));
+    chroma_tx::create_transaction(
+        &secret,
+        sender,
+        recipient,
+        Amount(1_000),
+        Nonce(nonce),
+    )
+    .expect("failed to build transaction")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Two real nodes: one dials the other, both reach Ready, and both report the
+/// peer under its *listening* address rather than an ephemeral port.
+#[tokio::test]
+async fn two_nodes_complete_handshake() {
+    let (node_a, addr_a, dir_a) = start_node("hs_a").await;
+
+    let dir_b = temp_dir("hs_b");
+    let genesis = chroma_consensus::build_genesis_block().hash();
+    let config_b = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir_b.clone())
+        .with_mining(false)
+        .with_connect_addrs(vec![addr_a]);
+    let mut node_b = Node::new(config_b);
+    node_b.run().await.expect("node b failed to start");
+    let addr_b = node_b.local_addr().unwrap();
+
+    let pm_b = node_b.peer_manager();
+    wait_for("node B to mark node A ready", || {
+        let pm = pm_b.clone();
+        async move {
+            let pm = pm.read().await;
+            pm.get_peer(&addr_a).map(|p| p.state == PeerState::Ready) == Some(true)
+        }
+    })
+    .await;
+
+    // The inbound side must have re-keyed node B from its ephemeral source
+    // port to the port B actually listens on.
+    let pm_a = node_a.peer_manager();
+    wait_for("node A to key node B by its listen address", || {
+        let pm = pm_a.clone();
+        async move {
+            let pm = pm.read().await;
+            pm.get_peer(&addr_b).map(|p| p.state == PeerState::Ready) == Some(true)
+        }
+    })
+    .await;
+
+    let mut node_a = node_a;
+    let mut node_b = node_b;
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A frame far larger than one socket read must be reassembled, and the
+/// connection must stay usable afterwards.
+///
+/// The old reader used a fixed 8 KiB buffer and treated a partial frame as a
+/// fatal decode error, so anything over 8 KiB silently killed the peer.
+#[tokio::test]
+async fn large_frame_does_not_drop_the_connection() {
+    let (mut node, addr, dir) = start_node("bigframe").await;
+
+    let mut peer = RawPeer::connect(addr, 40_001).await;
+    peer.handshake().await;
+
+    // 900 KiB of payload: ~56 socket reads on the node's side, and far past
+    // the old buffer. The payload is not a valid block, so the node will log a
+    // decode error — the point is that the *connection* survives, proving the
+    // frame was reassembled and consumed as one message.
+    let big = vec![0x5Au8; 900 * 1024];
+    peer.send(Message::new(MessageType::Block, big)).await;
+
+    // Round-trip a ping afterwards: if framing had desynchronised or the
+    // connection had been torn down, no pong would come back.
+    peer.send(Message::new(
+        MessageType::Ping,
+        PingMessage { nonce: 0xABCD }.encode(),
+    ))
+    .await;
+    let pong = peer.recv_expect(MessageType::Pong).await;
+    assert_eq!(
+        PingMessage::decode(&pong.payload).unwrap().nonce,
+        0xABCD,
+        "connection must still be framed correctly after a 900 KiB message"
+    );
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Several messages must travel over the *same* connection. Previously each
+/// outgoing message opened a fresh TCP connection, so a peer never saw more
+/// than one message per socket.
+#[tokio::test]
+async fn many_messages_share_one_connection() {
+    let (mut node, addr, dir) = start_node("persist").await;
+
+    let mut peer = RawPeer::connect(addr, 40_002).await;
+    peer.handshake().await;
+
+    for i in 0..50u64 {
+        peer.send(Message::new(
+            MessageType::Ping,
+            PingMessage { nonce: i }.encode(),
+        ))
+        .await;
+        let pong = peer.recv_expect(MessageType::Pong).await;
+        assert_eq!(
+            PingMessage::decode(&pong.payload).unwrap().nonce,
+            i,
+            "pong {} came back on the same connection with the wrong nonce",
+            i
+        );
+    }
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A transaction received from a peer must be verified and stored.
+#[tokio::test]
+async fn received_transaction_enters_mempool() {
+    let (mut node, addr, dir) = start_node("mempool").await;
+    let mut events = node.event_rx().expect("event receiver already taken");
+
+    let mut peer = RawPeer::connect(addr, 40_003).await;
+    peer.handshake().await;
+
+    let tx = signed_transaction(0);
+    let tx_hash = chroma_core::hash::Hash::blake3(&tx.encode());
+    peer.send(Message::new(MessageType::Tx, tx.encode())).await;
+
+    let pool = node.mempool();
+    wait_for("transaction to reach the mempool", || {
+        let pool = pool.clone();
+        async move {
+            let pool = pool.read().await;
+            pool.has_transaction(&tx_hash)
+        }
+    })
+    .await;
+
+    {
+        let pool = pool.read().await;
+        assert_eq!(pool.len(), 1);
+        assert_eq!(
+            pool.get_transaction(&tx_hash).map(|t| t.amount),
+            Some(Amount(1_000))
+        );
+    }
+
+    // The node should have announced it.
+    let mut saw_event = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, NodeEvent::TxReceived(h) if h == tx_hash) {
+            saw_event = true;
+        }
+    }
+    assert!(saw_event, "expected a TxReceived event for the accepted tx");
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A transaction whose signature does not verify must be rejected, not stored.
+#[tokio::test]
+async fn invalid_transaction_is_rejected() {
+    let (mut node, addr, dir) = start_node("badtx").await;
+
+    let mut peer = RawPeer::connect(addr, 40_004).await;
+    peer.handshake().await;
+
+    // Corrupt the signature while keeping the encoding structurally valid.
+    let good = signed_transaction(0);
+    let mut bytes = good.encode();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    let tampered =
+        <chroma_tx::Transaction as chroma_core::serialize::CanonicalDecode>::decode(&bytes)
+            .expect("tampered tx should still decode");
+
+    peer.send(Message::new(MessageType::Tx, tampered.encode()))
+        .await;
+
+    let reject = peer.recv_expect(MessageType::Reject).await;
+    assert!(!reject.payload.is_empty());
+
+    let pool = node.mempool();
+    let pool = pool.read().await;
+    assert_eq!(pool.len(), 0, "an invalid tx must not be stored");
+    drop(pool);
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A second connection from a peer we are already connected to must be
+/// dropped, leaving exactly one live connection.
+#[tokio::test]
+async fn duplicate_connection_is_refused() {
+    let (mut node, addr, dir) = start_node("dupe").await;
+
+    // Both raw peers claim the same listening port, so the node must treat
+    // them as the same peer.
+    let mut first = RawPeer::connect(addr, 40_005).await;
+    first.handshake().await;
+
+    let mut second = RawPeer::connect(addr, 40_005).await;
+    let version = VersionMessage {
+        version: PROTOCOL_VERSION,
+        services: 0,
+        timestamp: 1_700_000_000,
+        height: 0,
+        nonce: 0x1111_2222_3333_4444,
+        listen_port: 40_005,
+    };
+    second
+        .send(Message::new(MessageType::Version, version.encode()))
+        .await;
+
+    // The duplicate is closed without a handshake.
+    assert!(
+        second.recv().await.is_none(),
+        "the node should have closed the duplicate connection"
+    );
+
+    // The original connection is untouched.
+    first
+        .send(Message::new(
+            MessageType::Ping,
+            PingMessage { nonce: 7 }.encode(),
+        ))
+        .await;
+    let pong = first.recv_expect(MessageType::Pong).await;
+    assert_eq!(PingMessage::decode(&pong.payload).unwrap().nonce, 7);
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A node that dials itself must notice via the identity nonce and hang up.
+#[tokio::test]
+async fn self_connection_is_dropped() {
+    let (mut node, addr, dir) = start_node("selfconn").await;
+
+    node.connect(addr);
+
+    // Give the dial time to complete and be rejected.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let pm = node.peer_manager();
+    let pm = pm.read().await;
+    let ready = pm.ready_peers().len();
+    drop(pm);
+    assert_eq!(ready, 0, "a node must not end up peered with itself");
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Shutdown must complete promptly, close peer connections, and release the
+/// listening port.
+#[tokio::test]
+async fn shutdown_is_graceful_and_releases_the_port() {
+    let (mut node, addr, dir) = start_node("shutdown").await;
+
+    let mut peer = RawPeer::connect(addr, 40_006).await;
+    peer.handshake().await;
+
+    let started = std::time::Instant::now();
+    node.shutdown().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown took {:?}, which suggests a task never observed the signal",
+        elapsed
+    );
+
+    // The peer sees a clean EOF, promptly. `recv` reports a stalled
+    // connection the same way it reports EOF, so the elapsed time is what
+    // distinguishes "closed" from "left hanging until the idle timeout".
+    let closed_at = std::time::Instant::now();
+    assert!(
+        peer.recv().await.is_none(),
+        "peer connections should be closed by shutdown"
+    );
+    assert!(
+        closed_at.elapsed() < Duration::from_secs(2),
+        "peer waited {:?} for EOF — shutdown left the connection hanging",
+        closed_at.elapsed()
+    );
+
+    // The port is free again, so the listener really stopped.
+    wait_for("the listening port to be released", || async move {
+        tokio::net::TcpListener::bind(addr).await.is_ok()
+    })
+    .await;
+
+    // Shutting down twice must not panic.
+    node.shutdown().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

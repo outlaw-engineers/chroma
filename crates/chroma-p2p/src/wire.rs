@@ -63,6 +63,56 @@ impl InvType {
     }
 }
 
+/// Result of attempting to decode one frame from a stream buffer.
+///
+/// A stream reader must distinguish "the rest of this frame has not arrived
+/// yet" from "this peer sent garbage". The former means read more; the latter
+/// means drop (and score) the peer.
+#[derive(Clone, Debug)]
+pub enum FrameDecode {
+    /// A complete frame was decoded, consuming `consumed` bytes.
+    Complete { message: Message, consumed: usize },
+    /// The buffer holds a valid prefix but not a whole frame yet.
+    /// `needed` is the total frame length once known, else None.
+    Incomplete { needed: Option<usize> },
+}
+
+/// Decode one frame from the front of a stream buffer.
+///
+/// Unlike [`Message::decode`], a short buffer is reported as
+/// [`FrameDecode::Incomplete`] rather than an error, so the caller can wait for
+/// more bytes instead of tearing the connection down.
+pub fn decode_frame(data: &[u8]) -> Result<FrameDecode> {
+    if data.len() < HEADER_SIZE {
+        return Ok(FrameDecode::Incomplete { needed: None });
+    }
+    if data[0..4] != MAGIC {
+        return Err(CoreError::Serialization("message: bad magic".to_string()));
+    }
+    let msg_type = MessageType::from_u8(data[4])?;
+    let len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CoreError::Serialization(format!(
+            "message: payload too large: {}",
+            len
+        )));
+    }
+    let total = HEADER_SIZE + len;
+    if data.len() < total {
+        return Ok(FrameDecode::Incomplete { needed: Some(total) });
+    }
+    let checksum = [data[9], data[10], data[11], data[12]];
+    let payload = data[HEADER_SIZE..total].to_vec();
+    let expected = blake3::hash(&payload);
+    if checksum != expected.as_bytes()[..4] {
+        return Err(CoreError::Serialization("message: checksum mismatch".to_string()));
+    }
+    Ok(FrameDecode::Complete {
+        message: Message { msg_type, payload },
+        consumed: total,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Message {
     pub msg_type: MessageType,
@@ -115,6 +165,15 @@ impl Message {
     }
 }
 
+/// Version handshake payload (34 bytes).
+///
+/// `listen_port` is the port the sender accepts inbound connections on. An
+/// inbound TCP connection arrives from an ephemeral source port, which is
+/// useless as a peer identity, so peers are keyed by
+/// `(remote_ip, listen_port)` once the version is known.
+///
+/// `nonce` is the sender's per-process identity nonce, used to detect and drop
+/// self-connections.
 #[derive(Clone, Debug)]
 pub struct VersionMessage {
     pub version: u32,
@@ -122,21 +181,26 @@ pub struct VersionMessage {
     pub timestamp: u64,
     pub height: u32,
     pub nonce: u64,
+    pub listen_port: u16,
 }
 
 impl VersionMessage {
+    /// Canonical encoded size.
+    pub const SERIALIZED_SIZE: usize = 4 + 8 + 8 + 4 + 8 + 2;
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32);
+        let mut buf = Vec::with_capacity(Self::SERIALIZED_SIZE);
         buf.extend_from_slice(&self.version.to_le_bytes());
         buf.extend_from_slice(&self.services.to_le_bytes());
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
         buf.extend_from_slice(&self.height.to_le_bytes());
         buf.extend_from_slice(&self.nonce.to_le_bytes());
+        buf.extend_from_slice(&self.listen_port.to_le_bytes());
         buf
     }
 
     pub fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < 32 {
+        if data.len() < Self::SERIALIZED_SIZE {
             return Err(CoreError::Serialization("version: too short".to_string()));
         }
         Ok(VersionMessage {
@@ -145,6 +209,7 @@ impl VersionMessage {
             timestamp: u64::from_le_bytes(data[12..20].try_into().unwrap()),
             height: u32::from_le_bytes(data[20..24].try_into().unwrap()),
             nonce: u64::from_le_bytes(data[24..32].try_into().unwrap()),
+            listen_port: u16::from_le_bytes(data[32..34].try_into().unwrap()),
         })
     }
 }
@@ -393,17 +458,120 @@ mod tests {
             timestamp: 1700000000,
             height: 100,
             nonce: 42,
+            listen_port: 8333,
         };
         let enc = v.encode();
+        assert_eq!(enc.len(), VersionMessage::SERIALIZED_SIZE);
         let dec = VersionMessage::decode(&enc).unwrap();
         assert_eq!(dec.version, 1);
         assert_eq!(dec.height, 100);
         assert_eq!(dec.nonce, 42);
+        assert_eq!(dec.listen_port, 8333);
     }
 
     #[test]
     fn test_version_rejects_short() {
         assert!(VersionMessage::decode(&[0u8; 31]).is_err());
+        // One byte short of the listen_port field.
+        assert!(VersionMessage::decode(&[0u8; 33]).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Stream framing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_frame_complete() {
+        let msg = Message::new(MessageType::Ping, vec![1, 2, 3, 4]);
+        let encoded = msg.encode();
+        match decode_frame(&encoded).unwrap() {
+            FrameDecode::Complete { message, consumed } => {
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(message.msg_type, MessageType::Ping);
+                assert_eq!(message.payload, vec![1, 2, 3, 4]);
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_frame_incomplete_is_not_an_error() {
+        let encoded = Message::new(MessageType::Block, vec![7u8; 4096]).encode();
+
+        // Fewer bytes than the header: length not yet known.
+        match decode_frame(&encoded[..HEADER_SIZE - 1]).unwrap() {
+            FrameDecode::Incomplete { needed } => assert_eq!(needed, None),
+            other => panic!("expected Incomplete, got {:?}", other),
+        }
+
+        // Header present, payload partial: total length is known.
+        match decode_frame(&encoded[..encoded.len() - 1]).unwrap() {
+            FrameDecode::Incomplete { needed } => assert_eq!(needed, Some(encoded.len())),
+            other => panic!("expected Incomplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_frame_rejects_garbage() {
+        let mut data = Message::new(MessageType::Ping, vec![0]).encode();
+        data[0] = 0xFF;
+        assert!(decode_frame(&data).is_err(), "bad magic must be an error");
+
+        let mut data = Message::new(MessageType::Ping, vec![0]).encode();
+        data[9] ^= 0xFF;
+        assert!(decode_frame(&data).is_err(), "bad checksum must be an error");
+
+        // An oversized declared length is an error even before the payload
+        // arrives — otherwise a peer could pin unbounded memory.
+        let mut data = Message::new(MessageType::Block, vec![]).encode();
+        data[5..9].copy_from_slice(&((MAX_MESSAGE_SIZE + 1) as u32).to_le_bytes());
+        assert!(decode_frame(&data).is_err(), "oversized length must be an error");
+    }
+
+    #[test]
+    fn test_decode_frame_stream_of_messages() {
+        // Two frames back to back, delivered one byte at a time, must decode
+        // in order with no loss — the property the old fixed-buffer reader
+        // violated.
+        let m1 = Message::new(MessageType::Ping, PingMessage { nonce: 1 }.encode());
+        let m2 = Message::new(MessageType::Block, vec![9u8; 20_000]);
+        let mut wire = m1.encode();
+        wire.extend_from_slice(&m2.encode());
+
+        let mut acc: Vec<u8> = Vec::new();
+        let mut decoded: Vec<Message> = Vec::new();
+        for byte in &wire {
+            acc.push(*byte);
+            loop {
+                match decode_frame(&acc).unwrap() {
+                    FrameDecode::Complete { message, consumed } => {
+                        acc.drain(..consumed);
+                        decoded.push(message);
+                    }
+                    FrameDecode::Incomplete { .. } => break,
+                }
+            }
+        }
+
+        assert!(acc.is_empty(), "no bytes should be left over");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].msg_type, MessageType::Ping);
+        assert_eq!(decoded[1].msg_type, MessageType::Block);
+        assert_eq!(decoded[1].payload.len(), 20_000);
+    }
+
+    #[test]
+    fn test_decode_frame_max_size_payload() {
+        // A 1 MiB block (the protocol maximum) must survive framing.
+        let payload = vec![0xABu8; chroma_core::constants::MAX_BLOCK_SIZE];
+        let encoded = Message::new(MessageType::Block, payload.clone()).encode();
+        match decode_frame(&encoded).unwrap() {
+            FrameDecode::Complete { message, consumed } => {
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(message.payload.len(), payload.len());
+            }
+            other => panic!("expected Complete, got {:?}", other),
+        }
     }
 
     #[test]
