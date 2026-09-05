@@ -50,6 +50,11 @@ const SHUTDOWN_GRACE_SECS: u64 = 5;
 const MAX_INVENTORY: usize = 500;
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Oldest protocol version we will talk to. A peer below this is disconnected
+/// during the handshake rather than left to fail in confusing ways later.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
 pub const SERVICES: u64 = 0;
 
 #[derive(Debug)]
@@ -930,9 +935,36 @@ impl Node {
         src: SocketAddr,
         inbound: bool,
     ) -> Result<bool, P2pError> {
+        // Charge the message against the peer's allowance before doing any
+        // work on it.
+        {
+            let mut pm = ctx.peer_manager.write().await;
+            if let Some(peer) = pm.get_peer_mut(peer_key) {
+                if !peer.allow_message() {
+                    peer.score_bad(20);
+                    return Err(P2pError::Protocol("peer exceeded its message rate".into()));
+                }
+            }
+        }
+
         match msg.msg_type {
             MessageType::Version => {
                 let ver = VersionMessage::decode(&msg.payload)?;
+
+                // Version negotiation: refuse anything we cannot speak, and
+                // say why rather than dropping the connection silently.
+                if ver.version < MIN_PROTOCOL_VERSION {
+                    let reject = RejectMessage {
+                        message: "version".to_string(),
+                        code: 0x02,
+                        reason: format!(
+                            "protocol version {} is older than the minimum {}",
+                            ver.version, MIN_PROTOCOL_VERSION
+                        ),
+                    };
+                    Self::send(out_tx, Message::new(MessageType::Reject, reject.encode())).await?;
+                    return Ok(false);
+                }
 
                 // We dialed ourselves, or an attacker is reflecting our own
                 // handshake back at us. Either way, drop it.
@@ -962,7 +994,8 @@ impl Node {
                 {
                     let mut pm = ctx.peer_manager.write().await;
                     if let Some(peer) = pm.get_peer_mut(peer_key) {
-                        peer.version = ver.version;
+                        // The version we actually speak is the lower of the two.
+                        peer.version = std::cmp::min(ver.version, PROTOCOL_VERSION);
                         peer.height = ver.height;
                         peer.services = ver.services;
                         peer.state = PeerState::Handshaking;
@@ -1057,6 +1090,21 @@ impl Node {
             }
 
             MessageType::Tx => {
+                // Transactions get a tighter allowance of their own: each one
+                // costs a signature verification, which is orders of magnitude
+                // more than parsing a ping.
+                {
+                    let mut pm = ctx.peer_manager.write().await;
+                    if let Some(peer) = pm.get_peer_mut(peer_key) {
+                        if !peer.allow_transaction() {
+                            peer.score_bad(10);
+                            return Err(P2pError::Protocol(
+                                "peer exceeded its transaction rate".into(),
+                            ));
+                        }
+                    }
+                }
+
                 let tx = <chroma_tx::Transaction as chroma_core::serialize::CanonicalDecode>::decode(
                     &msg.payload,
                 )?;

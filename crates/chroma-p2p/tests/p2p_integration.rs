@@ -76,7 +76,7 @@ async fn start_regtest_node(
 
 /// A minimal peer implementation driven by the test, so we can control exactly
 /// what goes on the wire and observe exactly what comes back.
-struct RawPeer {
+pub struct RawPeer {
     stream: TcpStream,
     buf: Vec<u8>,
     listen_port: u16,
@@ -964,5 +964,76 @@ async fn node_restart_restores_chain_and_balances() {
     );
     drop(cs);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening
+// ---------------------------------------------------------------------------
+
+/// A peer announcing a protocol version we do not speak must be rejected
+/// during the handshake, with a reason.
+#[tokio::test]
+async fn obsolete_protocol_version_is_rejected() {
+    let (mut node, addr, dir) = start_regtest_node("oldver", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(addr, 40_020).await;
+    let version = VersionMessage {
+        version: 0, // below MIN_PROTOCOL_VERSION
+        services: 0,
+        timestamp: 1_700_000_000,
+        height: 0,
+        nonce: 0x1234_5678_9ABC_DEF0,
+        listen_port: 40_020,
+    };
+    peer.send(Message::new(MessageType::Version, version.encode()))
+        .await;
+
+    let reject = peer.recv_expect(MessageType::Reject).await;
+    let reject = chroma_p2p::wire::RejectMessage::decode(&reject.payload).unwrap();
+    assert!(
+        reject.reason.contains("version"),
+        "unexpected reject reason: {}",
+        reject.reason
+    );
+
+    // ...and the connection is closed rather than left half-open.
+    assert!(peer.recv().await.is_none());
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer flooding messages must be cut off rather than allowed to make us
+/// spend unbounded work.
+#[tokio::test]
+async fn message_flood_disconnects_the_peer() {
+    let (mut node, addr, dir) = start_regtest_node("flood", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(addr, 40_021).await;
+    peer.handshake().await;
+
+    // Well past the per-second allowance, sent as fast as possible.
+    let ping = Message::new(MessageType::Ping, PingMessage { nonce: 1 }.encode()).encode();
+    let mut blast = Vec::new();
+    for _ in 0..(chroma_p2p::peer::MSG_RATE_LIMIT * 3) {
+        blast.extend_from_slice(&ping);
+    }
+    // A closed connection makes the write fail, which is itself the outcome we
+    // are looking for.
+    let _ = peer.stream.write_all(&blast).await;
+
+    // The node should hang up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        if peer.recv().await.is_none() {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "the node kept serving a peer that blew past its rate limit");
+
+    node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

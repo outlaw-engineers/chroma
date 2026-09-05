@@ -13,6 +13,36 @@ pub const PEER_TIMEOUT_SECS: u64 = 30;
 pub const PING_INTERVAL_SECS: u64 = 5;
 pub const VERSION_TIMEOUT_SECS: u64 = 10;
 
+/// Per-peer rate limits (spec §5). Enforced over a rolling one-second window.
+pub const MSG_RATE_LIMIT: u32 = 100;
+pub const TX_RATE_LIMIT: u32 = 10;
+
+/// Counters for one peer's rolling rate-limit window.
+#[derive(Clone, Debug)]
+pub struct RateWindow {
+    started: Instant,
+    messages: u32,
+    transactions: u32,
+}
+
+impl RateWindow {
+    fn new() -> Self {
+        RateWindow {
+            started: Instant::now(),
+            messages: 0,
+            transactions: 0,
+        }
+    }
+
+    fn roll(&mut self, now: Instant) {
+        if now.duration_since(self.started) >= Duration::from_secs(1) {
+            self.started = now;
+            self.messages = 0;
+            self.transactions = 0;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerState {
     Connecting,
@@ -52,6 +82,8 @@ pub struct PeerInfo {
     pub ban_until: Option<Instant>,
     /// True if the remote opened the connection to us.
     pub inbound: bool,
+    /// Rolling counters backing the per-peer rate limits.
+    rate: RateWindow,
 }
 
 impl PeerInfo {
@@ -69,7 +101,35 @@ impl PeerInfo {
             services: 0,
             ban_until: None,
             inbound: false,
+            rate: RateWindow::new(),
         }
+    }
+
+    /// Count a received message against the peer's allowance.
+    ///
+    /// Returns false once the peer is over its limit for the current second.
+    /// Without this a single peer can make us spend unbounded work — signature
+    /// verification alone costs ~84 µs per transaction.
+    pub fn allow_message(&mut self) -> bool {
+        self.allow_message_at(Instant::now())
+    }
+
+    pub fn allow_message_at(&mut self, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.messages = self.rate.messages.saturating_add(1);
+        self.rate.messages <= MSG_RATE_LIMIT
+    }
+
+    /// Count a received transaction against the peer's separate, tighter
+    /// transaction allowance.
+    pub fn allow_transaction(&mut self) -> bool {
+        self.allow_transaction_at(Instant::now())
+    }
+
+    pub fn allow_transaction_at(&mut self, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.transactions = self.rate.transactions.saturating_add(1);
+        self.rate.transactions <= TX_RATE_LIMIT
     }
 
     /// True while a connection to this peer is live or being established.
@@ -491,6 +551,52 @@ mod tests {
 
         let stale = pm.stale_peers(Duration::from_secs(PEER_TIMEOUT_SECS));
         assert_eq!(stale, vec![quiet]);
+    }
+
+    #[test]
+    fn test_message_rate_limit() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let now = Instant::now();
+
+        for i in 0..MSG_RATE_LIMIT {
+            assert!(
+                peer.allow_message_at(now),
+                "message {} should be within the allowance",
+                i
+            );
+        }
+        assert!(!peer.allow_message_at(now), "one past the limit must be refused");
+
+        // The window rolls, and the peer is allowed again.
+        let later = now + Duration::from_millis(1_100);
+        assert!(peer.allow_message_at(later));
+    }
+
+    #[test]
+    fn test_transaction_rate_limit_is_separate_and_tighter() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let now = Instant::now();
+
+        for _ in 0..TX_RATE_LIMIT {
+            assert!(peer.allow_transaction_at(now));
+        }
+        assert!(!peer.allow_transaction_at(now));
+
+        // Messages have their own, larger budget, untouched by the above.
+        assert!(peer.allow_message_at(now));
+    }
+
+    #[test]
+    fn test_rate_window_rolls_forward() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            for _ in 0..TX_RATE_LIMIT {
+                assert!(peer.allow_transaction_at(now));
+            }
+            assert!(!peer.allow_transaction_at(now));
+            now += Duration::from_secs(1);
+        }
     }
 
     #[test]
