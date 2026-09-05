@@ -24,6 +24,8 @@ thiserror = "1.0"
 getrandom = "0.2"
 
 randomx-rs = { version = "1.3", optional = true }
+snow = "0.9"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
 proptest = "1.5"
