@@ -407,11 +407,21 @@ fn load_or_create_node_key(data_dir: &std::path::Path) -> anyhow::Result<[u8; 32
         .map_err(|e| anyhow::anyhow!("failed to generate node identity: {}", e))?;
     let secret = keypair.secret_bytes();
     std::fs::create_dir_all(data_dir)?;
-    std::fs::write(&path, hex::encode(secret))?;
-    #[cfg(unix)]
+
+    // Owner-only from the moment it exists, and an error if that cannot be
+    // arranged: anyone who can read this file can impersonate the node.
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(hex::encode(secret).as_bytes())?;
+        file.sync_all()?;
     }
     Ok(secret)
 }

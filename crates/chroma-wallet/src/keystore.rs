@@ -301,14 +301,34 @@ pub fn save(data_dir: &std::path::Path, wallet: &Wallet, passphrase: &str) -> Re
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::InvalidFormat(format!("{}: {}", parent.display(), e)))?;
     }
-    std::fs::write(&path, encoded)
+    write_private(&path, encoded.as_bytes())
         .map_err(|e| CoreError::InvalidFormat(format!("{}: {}", path.display(), e)))?;
+    Ok(path)
+}
+
+/// Create a file readable only by its owner and write to it.
+///
+/// The mode is set when the file is created, not after: writing first and
+/// tightening afterwards leaves the key readable to anyone for as long as
+/// that takes, and if the permission change fails the file simply stays
+/// readable. A failure here is an error, not something to log and continue
+/// past — the whole point of the file is that others cannot read it.
+///
+/// `create_new` also means an existing file is never truncated, so the check
+/// in `save` cannot be raced by something that appears in between.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    Ok(path)
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 /// Read and decrypt a named wallet.

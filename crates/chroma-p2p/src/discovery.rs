@@ -253,10 +253,21 @@ mod tests {
 
     /// An unresolvable seed must be counted, not panic or hang, and must stop
     /// being retried once the failure budget is spent.
+    ///
+    /// The entry is well-formed on purpose: one missing a key would be
+    /// rejected by the parser, and the test would pass without the lookup
+    /// ever being attempted.
     #[tokio::test]
     async fn test_unresolvable_seed_is_counted() {
-        let id = NodeId::from_bytes([7u8; 32]).to_hex();
-        let seed = format!("{}@this-host-does-not-exist.invalid:8333", id);
+        let seed = format!(
+            "{}.{}@this-host-does-not-exist.invalid:8333",
+            NodeId::from_bytes([7u8; 32]).to_hex(),
+            NoiseKey::from_bytes([8u8; 32]).to_hex()
+        );
+        assert!(
+            Discovery::parse_txt_entry(&format!("{}{}", SEED_TXT_PREFIX, seed)).is_none(),
+            "the host is a name, so this is only reachable through a lookup"
+        );
         assert!(Discovery::resolve_seed(&seed).await.is_none());
 
         let pm = Arc::new(RwLock::new(PeerManager::new()));
