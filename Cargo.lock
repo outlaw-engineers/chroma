@@ -233,8 +233,10 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "chroma-block",
+ "chroma-consensus",
  "chroma-core",
  "chroma-crypto",
+ "chroma-state",
  "chroma-storage",
  "chroma-tx",
  "proptest",

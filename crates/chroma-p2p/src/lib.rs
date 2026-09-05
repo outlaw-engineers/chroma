@@ -6,8 +6,9 @@ pub mod sync;
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use chroma_core::hash::Hash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,7 +60,8 @@ pub struct NodeConfig {
     pub listen_addr: SocketAddr,
     pub connect_addrs: Vec<SocketAddr>,
     pub genesis_hash: Hash,
-    pub chain_height: Arc<tokio::sync::RwLock<u32>>,
+    pub chain_height: Arc<AtomicU32>,
+    pub data_dir: PathBuf,
 }
 
 impl NodeConfig {
@@ -68,8 +70,14 @@ impl NodeConfig {
             listen_addr,
             connect_addrs: Vec::new(),
             genesis_hash,
-            chain_height: Arc::new(tokio::sync::RwLock::new(0)),
+            chain_height: Arc::new(AtomicU32::new(0)),
+            data_dir: PathBuf::from("chroma_data"),
         }
+    }
+
+    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = data_dir;
+        self
     }
 }
 
@@ -77,8 +85,9 @@ pub struct Node {
     config: NodeConfig,
     peer_manager: Arc<RwLock<PeerManager>>,
     mempool: Arc<RwLock<Mempool>>,
-    #[allow(dead_code)]
     discovery: Discovery,
+    storage: Arc<chroma_storage::Storage>,
+    chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     event_tx: mpsc::UnboundedSender<NodeEvent>,
     event_rx: Option<mpsc::UnboundedReceiver<NodeEvent>>,
     outbound_tx: Option<mpsc::UnboundedSender<OutboundCommand>>,
@@ -90,6 +99,7 @@ pub enum NodeEvent {
     PeerConnected(SocketAddr),
     PeerDisconnected(SocketAddr),
     BlockReceived(Hash, u32),
+    BlockMined(Hash, u32),
     TxReceived(Hash),
     SyncComplete,
     Error(String),
@@ -106,16 +116,123 @@ impl Node {
     pub fn new(config: NodeConfig) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+
+        let db_path = config.data_dir.clone();
+        let storage = chroma_storage::Storage::open(&db_path)
+            .expect("failed to open storage database");
+
+        let chain_state = Self::init_chain_state(&storage, config.genesis_hash);
+
+        let height = chain_state.tip.height.0;
+        config.chain_height.store(height, Ordering::Relaxed);
+
         Node {
             config,
             peer_manager: Arc::new(RwLock::new(PeerManager::new())),
             mempool: Arc::new(RwLock::new(Mempool::new())),
             discovery: Discovery::new(),
+            storage: Arc::new(storage),
+            chain_state: Arc::new(RwLock::new(chain_state)),
             event_tx,
             event_rx: Some(event_rx),
             outbound_tx: Some(outbound_tx),
             outbound_rx: Some(outbound_rx),
         }
+    }
+
+    fn init_chain_state(
+        storage: &chroma_storage::Storage,
+        expected_genesis_hash: Hash,
+    ) -> chroma_consensus::ChainState {
+        use chroma_consensus::{build_genesis_block, ChainTip, ChainState};
+        use chroma_core::types::BlockHeight;
+        use chroma_core::u256::U256;
+        use std::collections::BTreeMap;
+
+        match storage.get_tip() {
+            Ok(Some(persisted_tip)) => {
+                let mut headers = BTreeMap::new();
+                let mut current_height = 0u32;
+                while let Ok(Some(header)) = storage.get_header(current_height) {
+                    headers.insert(current_height, header);
+                    if current_height == persisted_tip.height {
+                        break;
+                    }
+                    current_height += 1;
+                }
+
+                let mut state = chroma_state::State::new();
+                let total_supply = storage.get_supply().unwrap_or(0);
+                if total_supply > 0 {
+                    state.apply_subsidy(&chroma_core::types::Address::from_hash160(
+                        chroma_core::hash::Hash160([0u8; 20]),
+                    ), persisted_tip.height).ok();
+                }
+
+                let cumulative_work = U256::from_be_bytes(&persisted_tip.cumulative_work);
+                let tip_header = headers.get(&persisted_tip.height).cloned().unwrap_or_else(|| {
+                    build_genesis_block().header
+                });
+
+                let tip = ChainTip {
+                    height: BlockHeight(persisted_tip.height),
+                    hash: persisted_tip.hash,
+                    header: tip_header,
+                    cumulative_work,
+                    supply: persisted_tip.supply,
+                };
+
+                let mut tips = BTreeMap::new();
+                tips.insert(persisted_tip.hash, tip.clone());
+
+                println!("Loaded chain from storage: height={}, supply={} units",
+                    persisted_tip.height, persisted_tip.supply);
+
+                ChainState {
+                    headers,
+                    tip,
+                    state,
+                    tips,
+                }
+            }
+            _ => {
+                let chain = ChainState::with_genesis();
+                let genesis = build_genesis_block();
+                let genesis_hash = genesis.hash();
+
+                if expected_genesis_hash != genesis_hash {
+                    eprintln!("Warning: expected genesis hash {} but computed {}",
+                        expected_genesis_hash.to_hex(), genesis_hash.to_hex());
+                }
+
+                storage.apply_block(&genesis).ok();
+
+                let genesis_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+                    &genesis.header.bits.to_full_target(),
+                ));
+                let tip = chroma_storage::PersistedTip {
+                    height: 0,
+                    hash: genesis_hash,
+                    cumulative_work: genesis_work.to_be_bytes(),
+                    supply: 0,
+                };
+                storage.put_tip(&tip).ok();
+                storage.put_genesis_hash(&genesis_hash).ok();
+                storage.flush().ok();
+
+                println!("Created genesis block: {}", genesis_hash.to_hex());
+
+                chain
+            }
+        }
+    }
+
+    pub fn storage(&self) -> &chroma_storage::Storage {
+        &self.storage
+    }
+
+    pub fn chain_height(&self) -> u32 {
+        self.config.chain_height.load(Ordering::Relaxed)
     }
 
     pub fn event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<NodeEvent>> {
@@ -147,6 +264,8 @@ impl Node {
         let mempool_in = mempool.clone();
         let event_tx_in = event_tx.clone();
         let chain_height_in = self.config.chain_height.clone();
+        let storage_in = self.storage.clone();
+        let chain_state_in = self.chain_state.clone();
         tokio::spawn(async move {
             Self::run_inbound(
                 listener,
@@ -155,6 +274,8 @@ impl Node {
                 event_tx_in,
                 genesis_hash,
                 chain_height_in,
+                storage_in,
+                chain_state_in,
             )
             .await;
         });
@@ -164,6 +285,14 @@ impl Node {
             Self::run_peer_tick(peer_mgr_tick).await;
         });
 
+        let mining_storage = self.storage.clone();
+        let mining_chain_state = self.chain_state.clone();
+        let mining_event_tx = self.event_tx.clone();
+        let mining_height = self.config.chain_height.clone();
+        tokio::spawn(async move {
+            Self::run_miner(mining_storage, mining_chain_state, mining_event_tx, mining_height).await;
+        });
+
         Ok(())
     }
 
@@ -171,7 +300,7 @@ impl Node {
         peer_manager: Arc<RwLock<PeerManager>>,
         mut outbound_rx: mpsc::UnboundedReceiver<OutboundCommand>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
-        chain_height: Arc<tokio::sync::RwLock<u32>>,
+        chain_height: Arc<AtomicU32>,
     ) {
         while let Some(cmd) = outbound_rx.recv().await {
             match cmd {
@@ -199,7 +328,7 @@ impl Node {
                             drop(pm);
                             let _ = event_tx.send(NodeEvent::PeerConnected(addr));
 
-                            let height = *chain_height.read().await;
+                            let height = chain_height.load(Ordering::Relaxed);
                             let version = VersionMessage {
                                 version: PROTOCOL_VERSION,
                                 services: SERVICES,
@@ -243,7 +372,9 @@ impl Node {
         _mempool: Arc<RwLock<Mempool>>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
         _genesis_hash: Hash,
-        chain_height: Arc<tokio::sync::RwLock<u32>>,
+        chain_height: Arc<AtomicU32>,
+        storage: Arc<chroma_storage::Storage>,
+        chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     ) {
         loop {
             let (stream, addr) = match listener.accept().await {
@@ -265,9 +396,11 @@ impl Node {
             let et = event_tx.clone();
             let et2 = event_tx.clone();
             let ch = chain_height.clone();
+            let st = storage.clone();
+            let cs = chain_state.clone();
 
             tokio::spawn(async move {
-                match Self::handle_connection(stream, addr, pm, et, ch).await {
+                match Self::handle_connection(stream, addr, pm, et, ch, st, cs).await {
                     Ok(()) => {}
                     Err(e) => {
                         let _ = et2.send(NodeEvent::Error(format!("{}: {}", addr, e)));
@@ -282,7 +415,9 @@ impl Node {
         addr: SocketAddr,
         peer_manager: Arc<RwLock<PeerManager>>,
         event_tx: mpsc::UnboundedSender<NodeEvent>,
-        chain_height: Arc<tokio::sync::RwLock<u32>>,
+        chain_height: Arc<AtomicU32>,
+        storage: Arc<chroma_storage::Storage>,
+        chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
     ) -> Result<(), P2pError> {
         {
             let mut pm = peer_manager.write().await;
@@ -293,7 +428,7 @@ impl Node {
             }
         }
 
-        let height = *chain_height.read().await;
+        let height = chain_height.load(Ordering::Relaxed);
         let version = VersionMessage {
             version: PROTOCOL_VERSION,
             services: SERVICES,
@@ -388,9 +523,46 @@ impl Node {
                                     stream.write_all(&resp.encode()).await?;
                                 }
                             }
+                            MessageType::Block => {
+                                let block_data = msg.payload;
+                                match chroma_block::Block::decode_block(&block_data) {
+                                    Ok(block) => {
+                                        let block_hash = block.hash();
+                                        let block_height = block.header.height.0;
+
+                                        {
+                                            let mut cs = chain_state.write().await;
+                                            if let Err(e) = cs.apply_block(&block) {
+                                                let _ = event_tx.send(NodeEvent::Error(
+                                                    format!("block validation failed: {}", e)
+                                                ));
+                                            } else {
+                                                let _ = storage.apply_block(&block);
+                                                let tip = &cs.tip;
+                                                let persisted = chroma_storage::PersistedTip {
+                                                    height: tip.height.0,
+                                                    hash: tip.hash,
+                                                    cumulative_work: tip.cumulative_work.to_be_bytes(),
+                                                    supply: tip.supply,
+                                                };
+                                                let _ = storage.put_tip(&persisted);
+                                                let _ = storage.put_state(&cs.state);
+                                                let _ = storage.flush();
+
+                                                chain_height.store(block_height, Ordering::Relaxed);
+                                                let _ = event_tx.send(NodeEvent::BlockReceived(block_hash, block_height));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(NodeEvent::Error(
+                                            format!("block decode failed from {}: {}", addr, e)
+                                        ));
+                                    }
+                                }
+                            }
                             MessageType::GetData
                             | MessageType::Tx
-                            | MessageType::Block
                             | MessageType::Addr
                             | MessageType::GetAddr
                             | MessageType::Reject
@@ -426,6 +598,96 @@ impl Node {
                     let _ = stream.write_all(&msg.encode()).await;
                 }
             }
+        }
+    }
+
+    async fn run_miner(
+        storage: Arc<chroma_storage::Storage>,
+        chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
+        event_tx: mpsc::UnboundedSender<NodeEvent>,
+        chain_height: Arc<AtomicU32>,
+    ) {
+        use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext};
+        use chroma_core::constants::TARGET_BLOCK_TIME_SECS;
+        use chroma_core::types::BlockHeight;
+        use chroma_core::hash::Hash160;
+
+        let miner_address = {
+            let mut addr = [0u8; 20];
+            addr[0] = 0xDE;
+            addr[1] = 0xAD;
+            addr[2] = 0xBE;
+            addr[3] = 0xEF;
+            chroma_core::types::Address::from_hash160(Hash160(addr))
+        };
+
+        loop {
+            let (height, previous_hash, previous_timestamp, state_root, bits) = {
+                let cs = chain_state.read().await;
+                let tip = &cs.tip;
+                (tip.height.0 + 1, tip.hash, tip.header.timestamp, tip.header.state_root, tip.header.bits)
+            };
+
+            let network_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let timestamp = std::cmp::max(
+                previous_timestamp + TARGET_BLOCK_TIME_SECS,
+                network_time,
+            );
+
+            let ctx = BlockAssemblyContext {
+                height: BlockHeight(height),
+                previous_hash,
+                previous_timestamp: timestamp.saturating_sub(TARGET_BLOCK_TIME_SECS),
+                state_root,
+                bits,
+                coinbase_recipient: miner_address.clone(),
+            };
+
+            match assemble_block(&ctx, &[]) {
+                Ok(mut block) => {
+                    block.header.timestamp = timestamp;
+                    match mine_block_with_limit(&mut block, 10_000_000) {
+                        Ok(()) => {
+                            let mut cs = chain_state.write().await;
+                            match cs.apply_block(&block) {
+                                Ok(()) => {
+                                    let block_hash = block.hash();
+                                    let tip = &cs.tip;
+                                    let persisted = chroma_storage::PersistedTip {
+                                        height: tip.height.0,
+                                        hash: tip.hash,
+                                        cumulative_work: tip.cumulative_work.to_be_bytes(),
+                                        supply: tip.supply,
+                                    };
+                                    let _ = storage.apply_block(&block);
+                                    let _ = storage.put_tip(&persisted);
+                                    let _ = storage.put_state(&cs.state);
+                                    let _ = storage.flush();
+
+                                                            chain_height.store(height, Ordering::Relaxed);
+                                    let _ = event_tx.send(NodeEvent::BlockMined(block_hash, height));
+                                    println!("Mined block #{}: {}", height, block_hash.to_hex());
+                                }
+                                Err(e) => {
+                                    eprintln!("Mined block rejected: {}", e);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Block assembly failed: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }
 
@@ -504,6 +766,15 @@ mod tests {
         SocketAddr::new(IpAddr::V4([127, 0, 0, 1].into()), n)
     }
 
+    fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("chroma_test_{}", id));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn test_node_config() {
         let addr = test_addr(8333);
@@ -517,11 +788,14 @@ mod tests {
     #[test]
     fn test_node_creation() {
         let addr = test_addr(8333);
-        let genesis = Hash::blake3(b"genesis");
-        let config = NodeConfig::new(addr, genesis);
+        let genesis = chroma_consensus::build_genesis_block();
+        let genesis_hash = genesis.hash();
+        let dir = temp_dir();
+        let config = NodeConfig::new(addr, genesis_hash).with_data_dir(dir.clone());
         let node = Node::new(config);
         assert!(node.event_rx.is_some());
         assert!(node.outbound_rx.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

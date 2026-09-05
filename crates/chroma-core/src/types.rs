@@ -239,8 +239,20 @@ impl CanonicalDecode for NetworkId {
 
 /// Chroma address in canonical string form.
 /// Internally represented as Hash160 (20-byte RIPEMD160(SHA256(pubkey)))
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Address(pub Hash160);
+
+impl std::fmt::Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{}", self.0.to_hex())
+    }
+}
 
 impl Address {
     pub const ZERO: Address = Address(Hash160::ZERO);

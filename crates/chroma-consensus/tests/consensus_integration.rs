@@ -825,3 +825,198 @@ fn test_header_decode_rejects_short_data() {
     let result = BlockHeader::decode(&[0u8; 50]);
     assert!(result.is_err());
 }
+
+// ============================================================================
+// Storage + Chain Persistence Integration Test
+// ============================================================================
+
+#[test]
+fn test_storage_genesis_and_persistence() {
+    use chroma_storage::Storage;
+    use chroma_core::u256::U256;
+
+    let storage = Storage::open_temporary().unwrap();
+    let genesis = chroma_consensus::build_genesis_block();
+    let genesis_hash = genesis.hash();
+
+    storage.apply_block(&genesis).unwrap();
+    storage.put_genesis_hash(&genesis_hash).unwrap();
+
+    let genesis_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+        &genesis.header.bits.to_full_target(),
+    ));
+    let tip = chroma_storage::PersistedTip {
+        height: 0,
+        hash: genesis_hash,
+        cumulative_work: genesis_work.to_be_bytes(),
+        supply: 0,
+    };
+    storage.put_tip(&tip).unwrap();
+    storage.put_supply(0).unwrap();
+    storage.flush().unwrap();
+
+    let loaded_tip = storage.get_tip().unwrap().unwrap();
+    assert_eq!(loaded_tip.height, 0);
+    assert_eq!(loaded_tip.hash, genesis_hash);
+    assert_eq!(loaded_tip.supply, 0);
+
+    let loaded_hash = storage.get_genesis_hash().unwrap().unwrap();
+    assert_eq!(loaded_hash, genesis_hash);
+
+    let loaded_header = storage.get_header(0).unwrap().unwrap();
+    assert_eq!(loaded_header.height.0, 0);
+    assert_eq!(loaded_header.timestamp, genesis.header.timestamp);
+}
+
+#[test]
+fn test_chain_state_loads_from_storage() {
+    use chroma_storage::Storage;
+    use chroma_consensus::{ChainState, build_genesis_block, ChainTip};
+    use chroma_core::types::BlockHeight;
+    use chroma_core::u256::U256;
+    use std::collections::BTreeMap;
+
+    let storage = Storage::open_temporary().unwrap();
+    let genesis = build_genesis_block();
+    let genesis_hash = genesis.hash();
+
+    storage.apply_block(&genesis).unwrap();
+
+    let genesis_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+        &genesis.header.bits.to_full_target(),
+    ));
+    let tip = chroma_storage::PersistedTip {
+        height: 0,
+        hash: genesis_hash,
+        cumulative_work: genesis_work.to_be_bytes(),
+        supply: 0,
+    };
+    storage.put_tip(&tip).unwrap();
+    storage.flush().unwrap();
+
+    let loaded_tip = storage.get_tip().unwrap().unwrap();
+    assert_eq!(loaded_tip.height, 0);
+
+    let mut headers = BTreeMap::new();
+    let mut h = 0u32;
+    while let Ok(Some(header)) = storage.get_header(h) {
+        headers.insert(h, header);
+        if h == loaded_tip.height { break; }
+        h += 1;
+    }
+
+    let cumulative_work = U256::from_be_bytes(&loaded_tip.cumulative_work);
+    let tip_header = headers.get(&loaded_tip.height).cloned().unwrap_or(genesis.header.clone());
+    let chain_tip = ChainTip {
+        height: BlockHeight(loaded_tip.height),
+        hash: loaded_tip.hash,
+        header: tip_header,
+        cumulative_work,
+        supply: loaded_tip.supply,
+    };
+
+    let mut tips = BTreeMap::new();
+    tips.insert(loaded_tip.hash, chain_tip.clone());
+
+    let chain = ChainState {
+        headers,
+        tip: chain_tip,
+        state: chroma_state::State::new(),
+        tips,
+    };
+
+    assert_eq!(chain.tip.height, BlockHeight(0));
+    assert_eq!(chain.tip.hash, genesis_hash);
+    assert!(chain.best_tip().cumulative_work > U256::ZERO);
+}
+
+#[test]
+fn test_devnet_multi_block_mining_and_storage() {
+    use chroma_storage::Storage;
+    use chroma_consensus::{
+        build_genesis_block, ChainState, calculate_target_for_height,
+        miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext},
+    };
+    use chroma_core::types::{BlockHeight, Address, CompactTarget};
+    use chroma_core::hash::Hash160;
+    use chroma_core::u256::U256;
+
+    let easy_bits = CompactTarget(0x1f00ffff);
+
+    let storage = Storage::open_temporary().unwrap();
+    let mut chain = ChainState::with_genesis();
+
+    let genesis = build_genesis_block();
+    storage.apply_block(&genesis).unwrap();
+    let genesis_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+        &genesis.header.bits.to_full_target(),
+    ));
+    let tip = chroma_storage::PersistedTip {
+        height: 0,
+        hash: genesis.hash(),
+        cumulative_work: genesis_work.to_be_bytes(),
+        supply: 0,
+    };
+    storage.put_tip(&tip).unwrap();
+    storage.flush().unwrap();
+
+    let miner_addr = {
+        let mut h = [0u8; 20];
+        h[0] = 0xDE; h[1] = 0xAD; h[2] = 0xBE; h[3] = 0xEF;
+        Address::from_hash160(Hash160(h))
+    };
+
+    let blocks_to_mine = 3u32;
+
+    for expected_height in 1..=blocks_to_mine {
+        let (prev_hash, prev_ts, state_root) = {
+            let tip = chain.best_tip();
+            (tip.hash, tip.header.timestamp, tip.header.state_root)
+        };
+
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(expected_height),
+            previous_hash: prev_hash,
+            previous_timestamp: prev_ts,
+            state_root,
+            bits: easy_bits,
+            coinbase_recipient: miner_addr.clone(),
+        };
+
+        let mut block = assemble_block(&ctx, &[]).unwrap();
+        block.header.timestamp = prev_ts + 10;
+        mine_block_with_limit(&mut block, 10_000_000).unwrap();
+
+        let block_hash = block.hash();
+        chain.headers.insert(expected_height, block.header.clone());
+        let block_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
+            &block.header.bits.to_full_target(),
+        ));
+        let new_cumulative = chain.tip.cumulative_work.checked_add(&block_work).unwrap();
+        chain.tip = chroma_consensus::ChainTip {
+            height: BlockHeight(expected_height),
+            hash: block_hash,
+            header: block.header.clone(),
+            cumulative_work: new_cumulative,
+            supply: chain.tip.supply + chroma_core::constants::BLOCK_REWARD_UNITS,
+        };
+        chain.tips.insert(block_hash, chain.tip.clone());
+
+        storage.apply_block(&block).unwrap();
+        let tip = chain.best_tip();
+        let persisted = chroma_storage::PersistedTip {
+            height: tip.height.0,
+            hash: tip.hash,
+            cumulative_work: tip.cumulative_work.to_be_bytes(),
+            supply: tip.supply,
+        };
+        storage.put_tip(&persisted).unwrap();
+        storage.flush().unwrap();
+
+        assert_eq!(chain.best_tip().height.0, expected_height);
+        assert_eq!(chain.best_tip().hash, block_hash);
+    }
+
+    let final_tip = storage.get_tip().unwrap().unwrap();
+    assert_eq!(final_tip.height, blocks_to_mine);
+}
