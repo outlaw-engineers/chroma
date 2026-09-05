@@ -2,7 +2,8 @@
 //!
 //! Account/balance model. State transitions are pure functions.
 //! The state is a mapping from Address → Account.
-//! State commitment: BLAKE3 of sorted (address, account) encodings.
+//! State commitment: a sorted Merkle tree over (address, account) pairs
+//! (spec §7.2).
 
 use std::collections::BTreeMap;
 
@@ -103,15 +104,105 @@ impl State {
             .or_insert_with(Account::default) = account;
     }
 
-    /// Compute state root: BLAKE3 of concatenated sorted (address_20bytes || account_16bytes).
-    pub fn compute_state_root(&self) -> Hash {
-        let mut buf = Vec::new();
-        for (addr, account) in &self.accounts {
-            buf.extend_from_slice(addr);
-            buf.extend_from_slice(&account.encode_value());
-        }
+    /// Hash of one `(key, value)` pair as a Merkle leaf.
+    ///
+    /// Spec §7.2: `Leaf = H(encode(key) || encode(value))`.
+    fn leaf_hash(address: &[u8; 20], account: &Account) -> Hash {
+        let mut buf = Vec::with_capacity(36);
+        buf.extend_from_slice(address);
+        buf.extend_from_slice(&account.encode_value());
         Hash::blake3(&buf)
     }
+
+    /// Hash of an internal node: `H(left || right)`.
+    fn node_hash(left: &Hash, right: &Hash) -> Hash {
+        let mut buf = Vec::with_capacity(64);
+        buf.extend_from_slice(left.as_bytes());
+        buf.extend_from_slice(right.as_bytes());
+        Hash::blake3(&buf)
+    }
+
+    /// The leaves of the state tree, in key order.
+    fn leaves(&self) -> Vec<Hash> {
+        self.accounts
+            .iter()
+            .map(|(addr, account)| Self::leaf_hash(addr, account))
+            .collect()
+    }
+
+    /// Compute the state root as a sorted Merkle tree over `(key, value)`
+    /// pairs (spec §7.2).
+    ///
+    /// An empty state hashes to `Hash::ZERO`, per the spec's empty root — not
+    /// to the hash of an empty buffer. Genesis declares a zero state root, so
+    /// anything else would leave genesis inconsistent with its own state.
+    ///
+    /// A level with an odd number of nodes carries the last node up unchanged
+    /// rather than duplicating it. The spec does not pin this down; promotion
+    /// avoids any chance of two different trees sharing a root, which is the
+    /// failure mode duplication is known for.
+    pub fn compute_state_root(&self) -> Hash {
+        let mut level = self.leaves();
+        if level.is_empty() {
+            return Hash::ZERO;
+        }
+
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                match pair {
+                    [left, right] => next.push(Self::node_hash(left, right)),
+                    [odd] => next.push(*odd),
+                    _ => unreachable!("chunks(2) yields one or two elements"),
+                }
+            }
+            level = next;
+        }
+
+        level[0]
+    }
+
+    /// Merkle path proving `address`'s account is committed to by the state
+    /// root, as sibling hashes from the leaf upwards.
+    ///
+    /// Returns `None` for an address with no account, since there is no leaf
+    /// to prove.
+    pub fn merkle_proof(&self, address: &Address) -> Option<MerkleProof> {
+        let key = *address.as_hash160().as_bytes();
+        let mut index = self.accounts.keys().position(|k| *k == key)?;
+
+        let mut level = self.leaves();
+        let mut steps = Vec::new();
+
+        while level.len() > 1 {
+            let sibling = if index % 2 == 0 { index + 1 } else { index - 1 };
+            // A promoted odd node has no sibling at this level, so nothing is
+            // recorded and it simply moves up.
+            if sibling < level.len() {
+                steps.push(ProofStep {
+                    hash: level[sibling],
+                    sibling_on_right: index % 2 == 0,
+                });
+            }
+
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            for pair in level.chunks(2) {
+                match pair {
+                    [left, right] => next.push(Self::node_hash(left, right)),
+                    [odd] => next.push(*odd),
+                    _ => unreachable!(),
+                }
+            }
+            level = next;
+            index /= 2;
+        }
+
+        Some(MerkleProof {
+            account: self.get_account(address),
+            steps,
+        })
+    }
+
 
     // ========================================================================
     // State Transitions
@@ -237,6 +328,45 @@ impl State {
 }
 
 // ============================================================================
+// Merkle Proofs
+// ============================================================================
+
+/// One sibling on a Merkle path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofStep {
+    pub hash: Hash,
+    /// True when the sibling sits to the right of the node being proved.
+    pub sibling_on_right: bool,
+}
+
+/// A Merkle path from an account leaf to the state root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerkleProof {
+    pub account: Account,
+    pub steps: Vec<ProofStep>,
+}
+
+impl MerkleProof {
+    /// Recompute the root this proof implies for `address`.
+    pub fn compute_root(&self, address: &Address) -> Hash {
+        let mut current = State::leaf_hash(address.as_hash160().as_bytes(), &self.account);
+        for step in &self.steps {
+            current = if step.sibling_on_right {
+                State::node_hash(&current, &step.hash)
+            } else {
+                State::node_hash(&step.hash, &current)
+            };
+        }
+        current
+    }
+
+    /// Check the proof against a known state root.
+    pub fn verify(&self, address: &Address, root: &Hash) -> bool {
+        self.compute_root(address) == *root
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -253,6 +383,14 @@ mod tests {
     fn bob() -> Address {
         let mut h = [0u8; 20];
         h[0] = 0xBB;
+        Address::from_hash160(chroma_core::hash::Hash160(h))
+    }
+
+    /// Distinct addresses for Merkle tree tests.
+    fn test_address(n: u8) -> Address {
+        let mut h = [0u8; 20];
+        h[0] = n;
+        h[1] = n.wrapping_mul(31);
         Address::from_hash160(chroma_core::hash::Hash160(h))
     }
 
@@ -399,6 +537,119 @@ mod tests {
         state.total_supply = (MAX_SUPPLY_UNITS - 500_000) as u64;
         let subsidy = state.block_subsidy(0).unwrap();
         assert_eq!(subsidy, 500_000);
+    }
+
+    #[test]
+    fn test_empty_state_root_is_zero() {
+        // Spec §7.2: the empty root is 32 zero bytes. Genesis declares a zero
+        // state root, so an empty state must agree with it.
+        let state = State::new();
+        assert_eq!(state.compute_state_root(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_single_account_root_is_its_leaf() {
+        let mut state = State::new();
+        let addr = test_address(1);
+        state.set_account(&addr, Account::new(500, 0));
+
+        let expected = State::leaf_hash(addr.as_hash160().as_bytes(), &Account::new(500, 0));
+        assert_eq!(state.compute_state_root(), expected);
+    }
+
+    #[test]
+    fn test_root_changes_with_any_field() {
+        let mut state = State::new();
+        state.set_account(&test_address(1), Account::new(100, 0));
+        let base = state.compute_state_root();
+
+        let mut balance_changed = state.clone();
+        balance_changed.set_account(&test_address(1), Account::new(101, 0));
+        assert_ne!(balance_changed.compute_state_root(), base);
+
+        let mut nonce_changed = state.clone();
+        nonce_changed.set_account(&test_address(1), Account::new(100, 1));
+        assert_ne!(nonce_changed.compute_state_root(), base);
+
+        let mut key_added = state.clone();
+        key_added.set_account(&test_address(2), Account::new(0, 0));
+        assert_ne!(key_added.compute_state_root(), base);
+    }
+
+    #[test]
+    fn test_root_is_independent_of_insertion_order() {
+        let mut forwards = State::new();
+        let mut backwards = State::new();
+        for i in 0..7u8 {
+            forwards.set_account(&test_address(i), Account::new(i as u64 * 10, i as u64));
+        }
+        for i in (0..7u8).rev() {
+            backwards.set_account(&test_address(i), Account::new(i as u64 * 10, i as u64));
+        }
+        assert_eq!(forwards.compute_state_root(), backwards.compute_state_root());
+    }
+
+    #[test]
+    fn test_merkle_proof_verifies_for_every_account() {
+        // Odd counts exercise the promoted-node path at several levels.
+        for count in 1..=9u8 {
+            let mut state = State::new();
+            for i in 0..count {
+                state.set_account(&test_address(i), Account::new(i as u64 * 7 + 1, i as u64));
+            }
+            let root = state.compute_state_root();
+
+            for i in 0..count {
+                let addr = test_address(i);
+                let proof = state
+                    .merkle_proof(&addr)
+                    .unwrap_or_else(|| panic!("no proof for account {} of {}", i, count));
+                assert!(
+                    proof.verify(&addr, &root),
+                    "proof failed for account {} in a tree of {}",
+                    i,
+                    count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_merkle_proof_rejects_wrong_account_data() {
+        let mut state = State::new();
+        for i in 0..5u8 {
+            state.set_account(&test_address(i), Account::new(i as u64 * 3, 0));
+        }
+        let root = state.compute_state_root();
+        let addr = test_address(2);
+
+        let mut tampered = state.merkle_proof(&addr).unwrap();
+        tampered.account.balance += 1;
+        assert!(
+            !tampered.verify(&addr, &root),
+            "a proof carrying the wrong balance must not verify"
+        );
+
+        // A proof for one account must not verify for another.
+        let other = state.merkle_proof(&test_address(3)).unwrap();
+        assert!(!other.verify(&addr, &root));
+    }
+
+    #[test]
+    fn test_merkle_proof_absent_account() {
+        let mut state = State::new();
+        state.set_account(&test_address(1), Account::new(10, 0));
+        assert!(state.merkle_proof(&test_address(9)).is_none());
+    }
+
+    #[test]
+    fn test_proof_length_is_logarithmic() {
+        let mut state = State::new();
+        for i in 0..16u8 {
+            state.set_account(&test_address(i), Account::new(i as u64, 0));
+        }
+        let proof = state.merkle_proof(&test_address(0)).unwrap();
+        assert_eq!(proof.steps.len(), 4, "16 leaves should need log2(16) siblings");
     }
 
     #[test]
