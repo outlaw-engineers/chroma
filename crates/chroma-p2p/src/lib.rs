@@ -27,9 +27,9 @@ use crate::peer::{
     VERSION_TIMEOUT_SECS,
 };
 use crate::wire::{
-    decode_frame, FrameDecode, GetDataMessage, GetHeadersMessage, HeadersMessage, InvEntry,
-    InvMessage, InvType, Message, MessageType, PingMessage, RejectMessage, VersionMessage,
-    MAX_MESSAGE_SIZE,
+    decode_frame, AddrMessage, FrameDecode, GetDataMessage, GetHeadersMessage, HeadersMessage,
+    InvEntry, InvMessage, InvType, Message, MessageType, PingMessage, RejectMessage,
+    VersionMessage, MAX_ADDRS_PER_MESSAGE, MAX_MESSAGE_SIZE,
 };
 
 /// Capacity of the per-connection outbound queue. Bounded so that a peer that
@@ -1026,7 +1026,24 @@ impl Node {
                     }
                 };
                 if announce {
+                    {
+                        let mut pm = ctx.peer_manager.write().await;
+                        if let Some(peer) = pm.get_peer_mut(peer_key) {
+                            peer.handshaked = true;
+                        }
+                    }
                     let _ = ctx.event_tx.send(NodeEvent::PeerConnected(*peer_key));
+
+                    // Ask for more peers while we have outbound slots free, so
+                    // the network does not depend on every node being told
+                    // about every other one by hand.
+                    let wants_peers = {
+                        let pm = ctx.peer_manager.read().await;
+                        pm.outbound_deficit() > 0
+                    };
+                    if wants_peers {
+                        Self::send(out_tx, Message::new(MessageType::GetAddr, vec![])).await?;
+                    }
 
                     // Ask a peer that claims a longer chain for the headers we
                     // are missing. Without this the handshake completes and
@@ -1314,10 +1331,45 @@ impl Node {
                 Ok(true)
             }
 
-            MessageType::Addr
-            | MessageType::GetAddr
-            | MessageType::Reject
-            | MessageType::NotFound => Ok(true),
+            MessageType::GetAddr => {
+                let addrs = {
+                    let pm = ctx.peer_manager.read().await;
+                    // Never hand a peer its own address back.
+                    pm.shareable_addrs(MAX_ADDRS_PER_MESSAGE, Some(*peer_key))
+                };
+                Self::send(
+                    out_tx,
+                    Message::new(MessageType::Addr, AddrMessage { addrs }.encode()),
+                )
+                .await?;
+                Ok(true)
+            }
+
+            MessageType::Addr => {
+                let msg = AddrMessage::decode(&msg.payload)?;
+
+                // Record what is new, then dial only as far as our outbound
+                // budget allows — a peer cannot make us open connections
+                // beyond the limit by sending a long list.
+                let to_dial = {
+                    let mut pm = ctx.peer_manager.write().await;
+                    for addr in msg.addrs.iter().take(MAX_ADDRS_PER_MESSAGE) {
+                        if !Self::is_routable(addr) {
+                            continue;
+                        }
+                        pm.add_peer(*addr);
+                    }
+                    let deficit = pm.outbound_deficit();
+                    pm.dialable_addrs(deficit)
+                };
+
+                for addr in to_dial {
+                    let _ = ctx.outbound_tx.send(OutboundCommand::Connect(addr));
+                }
+                Ok(true)
+            }
+
+            MessageType::Reject | MessageType::NotFound => Ok(true),
         }
     }
 
@@ -1353,6 +1405,18 @@ impl Node {
 
         let req = GetDataMessage { inventory: wanted };
         Self::send(out_tx, Message::new(MessageType::GetData, req.encode())).await
+    }
+
+    /// Reject addresses that cannot be a peer: the unspecified address, and
+    /// port zero. Loopback is allowed on purpose so local testing works.
+    fn is_routable(addr: &SocketAddr) -> bool {
+        if addr.port() == 0 {
+            return false;
+        }
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_broadcast() && !v4.is_multicast(),
+            std::net::IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_multicast(),
+        }
     }
 
     /// True if this block is already on disk.

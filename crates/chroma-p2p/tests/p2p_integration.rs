@@ -1037,3 +1037,82 @@ async fn message_flood_disconnects_the_peer() {
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Three nodes, but only two of them are told about anyone: C is given B's
+/// address, B is given A's, and C must reach A through gossip alone.
+///
+/// This is what peer discovery is for — without it, every node has to be
+/// configured with every other one by hand.
+#[tokio::test]
+async fn peers_are_discovered_through_gossip() {
+    let (node_a, addr_a, dir_a) = start_regtest_node("gossip_a", false, vec![]).await;
+    let (node_b, addr_b, dir_b) = start_regtest_node("gossip_b", false, vec![addr_a]).await;
+
+    // Let B finish handshaking with A, so A is worth passing on.
+    wait_for("B to connect to A", || async {
+        let pm = node_b.peer_manager();
+        let pm = pm.read().await;
+        pm.get_peer(&addr_a).map(|p| p.state == PeerState::Ready) == Some(true)
+    })
+    .await;
+
+    // C only knows about B.
+    let (node_c, _addr_c, dir_c) = start_regtest_node("gossip_c", false, vec![addr_b]).await;
+
+    wait_for("C to learn about A and connect", || async {
+        let pm = node_c.peer_manager();
+        let pm = pm.read().await;
+        pm.get_peer(&addr_a).map(|p| p.state == PeerState::Ready) == Some(true)
+    })
+    .await;
+
+    {
+        let pm = node_c.peer_manager();
+        let pm = pm.read().await;
+        assert!(
+            pm.get_peer(&addr_a).is_some(),
+            "C should have learned A's address from B"
+        );
+        assert!(pm.ready_peers().len() >= 2, "C should be connected to both");
+    }
+
+    let mut node_a = node_a;
+    let mut node_b = node_b;
+    let mut node_c = node_c;
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    node_c.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_c);
+}
+
+/// A node must not hand a peer back its own address, and must only pass on
+/// peers it actually completed a handshake with.
+#[tokio::test]
+async fn getaddr_shares_only_verified_peers() {
+    let (mut node, addr, dir) = start_regtest_node("getaddr", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(addr, 40_030).await;
+    peer.handshake().await;
+
+    peer.send(Message::new(MessageType::GetAddr, vec![])).await;
+    let reply = peer.recv_expect(MessageType::Addr).await;
+    let addrs = chroma_p2p::wire::AddrMessage::decode(&reply.payload).unwrap();
+
+    let own: SocketAddr = format!("127.0.0.1:{}", 40_030).parse().unwrap();
+    assert!(
+        !addrs.addrs.contains(&own),
+        "a peer must not be told about itself, got {:?}",
+        addrs.addrs
+    );
+    // The node has no other handshaked peers, so it has nothing to offer.
+    assert!(
+        addrs.addrs.is_empty(),
+        "only handshaked peers should be shared, got {:?}",
+        addrs.addrs
+    );
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

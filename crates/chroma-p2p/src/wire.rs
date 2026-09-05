@@ -5,6 +5,10 @@ pub const MAGIC: [u8; 4] = [0xC4, 0x48, 0x52, 0x4F];
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 pub const HEADER_SIZE: usize = 13;
 
+/// Largest address list we will send or act on in one message. Bounds both the
+/// work a peer can ask of us and how fast a hostile peer can seed our table.
+pub const MAX_ADDRS_PER_MESSAGE: usize = 1000;
+
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum MessageType {
@@ -409,6 +413,103 @@ impl GetDataMessage {
     }
 }
 
+/// A list of peer addresses, exchanged so nodes can find each other without
+/// every one of them having to be configured by hand.
+///
+/// Each entry is a one-byte address family (4 or 6), the address bytes, then a
+/// little-endian port. Only addresses a peer completed a handshake on are
+/// worth sharing, so what travels here is dialable rather than merely seen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddrMessage {
+    pub addrs: Vec<std::net::SocketAddr>,
+}
+
+impl AddrMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        use std::net::IpAddr;
+        let count = std::cmp::min(self.addrs.len(), MAX_ADDRS_PER_MESSAGE);
+        let mut buf = chroma_core::serialize::encode_leb128(count as u64);
+        for addr in self.addrs.iter().take(count) {
+            match addr.ip() {
+                IpAddr::V4(v4) => {
+                    buf.push(4);
+                    buf.extend_from_slice(&v4.octets());
+                }
+                IpAddr::V6(v6) => {
+                    buf.push(6);
+                    buf.extend_from_slice(&v6.octets());
+                }
+            }
+            buf.extend_from_slice(&addr.port().to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let (count, mut pos) = chroma_core::serialize::decode_leb128(data, 0)?;
+        let count = count as usize;
+        if count > MAX_ADDRS_PER_MESSAGE {
+            return Err(CoreError::Serialization(format!(
+                "addr: {} entries exceeds the {} limit",
+                count, MAX_ADDRS_PER_MESSAGE
+            )));
+        }
+
+        let mut addrs = Vec::with_capacity(count);
+        for _ in 0..count {
+            if pos >= data.len() {
+                return Err(CoreError::Serialization("addr: truncated".to_string()));
+            }
+            let family = data[pos];
+            pos += 1;
+
+            let ip = match family {
+                4 => {
+                    if pos + 4 > data.len() {
+                        return Err(CoreError::Serialization("addr: truncated v4".to_string()));
+                    }
+                    let mut octets = [0u8; 4];
+                    octets.copy_from_slice(&data[pos..pos + 4]);
+                    pos += 4;
+                    IpAddr::V4(Ipv4Addr::from(octets))
+                }
+                6 => {
+                    if pos + 16 > data.len() {
+                        return Err(CoreError::Serialization("addr: truncated v6".to_string()));
+                    }
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&data[pos..pos + 16]);
+                    pos += 16;
+                    IpAddr::V6(Ipv6Addr::from(octets))
+                }
+                other => {
+                    return Err(CoreError::Serialization(format!(
+                        "addr: unknown address family {}",
+                        other
+                    )))
+                }
+            };
+
+            if pos + 2 > data.len() {
+                return Err(CoreError::Serialization("addr: truncated port".to_string()));
+            }
+            let port = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            addrs.push(SocketAddr::new(ip, port));
+        }
+
+        if pos != data.len() {
+            return Err(CoreError::Serialization(format!(
+                "addr: {} trailing bytes",
+                data.len() - pos
+            )));
+        }
+        Ok(AddrMessage { addrs })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RejectMessage {
     pub message: String,
@@ -760,6 +861,70 @@ mod tests {
         let enc = gd.encode();
         let dec = GetDataMessage::decode(&enc).unwrap();
         assert_eq!(dec.inventory.len(), 1);
+    }
+
+    #[test]
+    fn test_addr_roundtrip() {
+        use std::net::SocketAddr;
+        let addrs: Vec<SocketAddr> = vec![
+            "127.0.0.1:8333".parse().unwrap(),
+            "192.0.2.42:19000".parse().unwrap(),
+            "[2001:db8::1]:8333".parse().unwrap(),
+        ];
+        let msg = AddrMessage {
+            addrs: addrs.clone(),
+        };
+        let decoded = AddrMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded.addrs, addrs, "v4 and v6 must both survive");
+    }
+
+    #[test]
+    fn test_addr_empty() {
+        let msg = AddrMessage { addrs: vec![] };
+        assert_eq!(AddrMessage::decode(&msg.encode()).unwrap().addrs.len(), 0);
+    }
+
+    #[test]
+    fn test_addr_rejects_oversized_count() {
+        // A declared count beyond the cap must be refused before anything is
+        // allocated for it.
+        let mut payload = chroma_core::serialize::encode_leb128((MAX_ADDRS_PER_MESSAGE + 1) as u64);
+        payload.push(4);
+        payload.extend_from_slice(&[127, 0, 0, 1]);
+        payload.extend_from_slice(&8333u16.to_le_bytes());
+        assert!(AddrMessage::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn test_addr_rejects_truncated_and_trailing() {
+        let msg = AddrMessage {
+            addrs: vec!["127.0.0.1:8333".parse().unwrap()],
+        };
+        let encoded = msg.encode();
+        assert!(AddrMessage::decode(&encoded[..encoded.len() - 1]).is_err());
+
+        let mut extra = encoded.clone();
+        extra.push(0);
+        assert!(AddrMessage::decode(&extra).is_err());
+    }
+
+    #[test]
+    fn test_addr_rejects_unknown_family() {
+        let mut payload = chroma_core::serialize::encode_leb128(1);
+        payload.push(9); // neither 4 nor 6
+        payload.extend_from_slice(&[0; 4]);
+        payload.extend_from_slice(&8333u16.to_le_bytes());
+        assert!(AddrMessage::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn test_addr_encode_caps_the_list() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let addrs: Vec<SocketAddr> = (0..(MAX_ADDRS_PER_MESSAGE + 50))
+            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 8333))
+            .collect();
+        let decoded = AddrMessage::decode(&AddrMessage { addrs }.encode()).unwrap();
+        assert_eq!(decoded.addrs.len(), MAX_ADDRS_PER_MESSAGE);
     }
 
     #[test]

@@ -82,6 +82,11 @@ pub struct PeerInfo {
     pub ban_until: Option<Instant>,
     /// True if the remote opened the connection to us.
     pub inbound: bool,
+    /// True once a handshake completed on this address at least once.
+    ///
+    /// Only these are worth passing to other nodes: an address we merely heard
+    /// about, or one we failed to reach, would just spread noise.
+    pub handshaked: bool,
     /// Rolling counters backing the per-peer rate limits.
     rate: RateWindow,
 }
@@ -101,6 +106,7 @@ impl PeerInfo {
             services: 0,
             ban_until: None,
             inbound: false,
+            handshaked: false,
             rate: RateWindow::new(),
         }
     }
@@ -258,6 +264,37 @@ impl PeerManager {
     /// Number of live outbound connections.
     pub fn outbound_count(&self) -> usize {
         self.peers.values().filter(|p| !p.inbound && p.is_active()).count()
+    }
+
+    /// Addresses worth telling other nodes about.
+    ///
+    /// Restricted to peers we have actually completed a handshake with and
+    /// that are not banned, so gossip spreads reachable nodes rather than
+    /// whatever a peer chose to claim.
+    pub fn shareable_addrs(&self, limit: usize, except: Option<SocketAddr>) -> Vec<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.handshaked && !p.is_banned())
+            .map(|p| p.addr)
+            .filter(|addr| Some(*addr) != except)
+            .take(limit)
+            .collect()
+    }
+
+    /// Addresses we know of but are not connected to, for filling out our
+    /// outbound slots.
+    pub fn dialable_addrs(&self, limit: usize) -> Vec<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| !p.is_active() && !p.is_banned())
+            .map(|p| p.addr)
+            .take(limit)
+            .collect()
+    }
+
+    /// How many more outbound connections we would like.
+    pub fn outbound_deficit(&self) -> usize {
+        MAX_OUTBOUND_PEERS.saturating_sub(self.outbound_count())
     }
 
     /// Peers that have gone quiet for longer than `timeout` and should be cut.
