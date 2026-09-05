@@ -97,7 +97,7 @@ pub fn random_address() -> chroma_core::types::Address {
 
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
-    pub connect_addrs: Vec<SocketAddr>,
+    pub connect_addrs: Vec<crate::peer::PeerAddress>,
     pub genesis_hash: Hash,
     pub chain_height: Arc<AtomicU32>,
     pub data_dir: PathBuf,
@@ -105,6 +105,9 @@ pub struct NodeConfig {
     pub mining_enabled: bool,
     /// Consensus parameters for the network this node is on.
     pub params: chroma_consensus::ChainParams,
+    /// This node's Noise identity. Generated if not supplied, which means a
+    /// restarted node gets a new id — pass one to keep it stable.
+    pub node_secret: Option<[u8; 32]>,
     /// Address the block reward is paid to.
     ///
     /// Two nodes mining to the same address with the same empty block and the
@@ -124,7 +127,13 @@ impl NodeConfig {
             mining_enabled: true,
             params: chroma_consensus::ChainParams::devnet(),
             miner_address: random_address(),
+            node_secret: None,
         }
+    }
+
+    pub fn with_node_secret(mut self, secret: [u8; 32]) -> Self {
+        self.node_secret = Some(secret);
+        self
     }
 
     pub fn with_miner_address(mut self, address: chroma_core::types::Address) -> Self {
@@ -145,7 +154,7 @@ impl NodeConfig {
         self
     }
 
-    pub fn with_connect_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
+    pub fn with_connect_addrs(mut self, addrs: Vec<crate::peer::PeerAddress>) -> Self {
         self.connect_addrs = addrs;
         self
     }
@@ -172,6 +181,9 @@ pub struct Node {
     /// Identity nonce echoed in our version message, used to spot the case
     /// where we dial ourselves.
     identity_nonce: u64,
+    /// Static Noise key. Every handshake, inbound or outbound, authenticates
+    /// us as this key, and it is the identity peers gossip us under.
+    identity: Arc<chroma_crypto::noise::NodeKeypair>,
     shutdown_tx: broadcast::Sender<()>,
     tasks: Vec<JoinHandle<()>>,
     /// Address actually bound by `run()`. Differs from `config.listen_addr`
@@ -196,7 +208,7 @@ pub enum NodeEvent {
 
 enum OutboundCommand {
     Send(SocketAddr, Message),
-    Connect(SocketAddr),
+    Connect(crate::peer::PeerAddress),
     Disconnect(SocketAddr),
 }
 
@@ -208,6 +220,19 @@ impl chroma_consensus::BlockSource for StorageBlocks<'_> {
     fn get_block(&self, hash: &Hash) -> Option<chroma_block::Block> {
         self.0.get_block_by_hash(hash).ok().flatten()
     }
+}
+
+/// What the connection itself established about the far end, as opposed to
+/// what the peer goes on to claim about itself in its messages.
+#[derive(Clone, Copy)]
+struct ConnectionOrigin {
+    /// The socket's remote address. For an inbound connection this is an
+    /// ephemeral port, so it is only good for the IP.
+    src: SocketAddr,
+    inbound: bool,
+    /// Proved by the Noise handshake, so it is the one thing here that a peer
+    /// cannot lie about.
+    remote_id: chroma_crypto::noise::NodeId,
 }
 
 /// Everything a live connection needs from the node.
@@ -229,6 +254,8 @@ struct ConnectionContext {
     chain_height: Arc<AtomicU32>,
     listen_port: u16,
     identity_nonce: u64,
+    /// This node's Noise identity, used for every handshake.
+    identity: Arc<chroma_crypto::noise::NodeKeypair>,
     /// Connection handlers are spawned detached, so they need their own way to
     /// learn about shutdown. Dropping the peer's send channel is not enough:
     /// the handler holds a clone of it, so the writer task would never see the
@@ -264,6 +291,16 @@ impl Node {
         let storage = chroma_storage::Storage::open(&db_path)
             .expect("failed to open storage database");
 
+        // A node without a configured secret gets a fresh identity each run.
+        // That is fine for a throwaway node but means peers cannot pin it, so
+        // anything long-lived should pass one in.
+        let identity = match config.node_secret {
+            Some(secret) => chroma_crypto::noise::NodeKeypair::from_secret(secret)
+                .expect("invalid node secret"),
+            None => chroma_crypto::noise::NodeKeypair::generate()
+                .expect("failed to generate node identity"),
+        };
+
         let chain_state = Self::init_chain_state(&storage, config.genesis_hash, config.params);
 
         let height = chain_state.tip.height.0;
@@ -290,6 +327,7 @@ impl Node {
             outbound_tx: Some(outbound_tx),
             outbound_rx: Some(outbound_rx),
             identity_nonce: rand_u64(),
+            identity: Arc::new(identity),
             shutdown_tx,
             tasks: Vec::new(),
             local_addr: None,
@@ -462,6 +500,12 @@ impl Node {
         self.chain_state.clone()
     }
 
+    /// This node's Noise identity. Peers need it to dial us, since XK
+    /// authenticates the responder by a key known in advance.
+    pub fn node_id(&self) -> chroma_crypto::noise::NodeId {
+        self.identity.node_id()
+    }
+
     pub fn chain_height(&self) -> u32 {
         self.config.chain_height.load(Ordering::Relaxed)
     }
@@ -500,6 +544,7 @@ impl Node {
             chain_height: self.config.chain_height.clone(),
             listen_port,
             identity_nonce: self.identity_nonce,
+            identity: self.identity.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
         };
 
@@ -516,14 +561,14 @@ impl Node {
         // peer manager; without dialing what it returns, a peer learned from a
         // seed would sit in the table forever and never be connected to.
         // Repeats are harmless — begin_connection rejects a second dial.
-        for addr in self
+        for peer in self
             .config
             .connect_addrs
             .iter()
             .copied()
             .chain(discovered.into_iter())
         {
-            let _ = outbound_tx.send(OutboundCommand::Connect(addr));
+            let _ = outbound_tx.send(OutboundCommand::Connect(peer));
         }
 
         {
@@ -630,11 +675,13 @@ impl Node {
             };
 
             match cmd {
-                OutboundCommand::Connect(addr) => {
+                OutboundCommand::Connect(peer) => {
+                    let addr = peer.socket;
                     // Claim the slot before dialing so two concurrent Connect
                     // commands for the same peer cannot both open a socket.
                     let slot = {
                         let mut pm = ctx.peer_manager.write().await;
+                        pm.add_known_peer(peer);
                         pm.begin_connection(addr, false)
                     };
                     if slot != ConnectionSlot::Accepted {
@@ -661,7 +708,9 @@ impl Node {
                     let ctx = ctx.clone();
                     tokio::spawn(async move {
                         let event_tx = ctx.event_tx.clone();
-                        if let Err(e) = Self::handle_connection(stream, addr, ctx, false).await {
+                        if let Err(e) =
+                            Self::handle_connection(stream, addr, ctx, Some(peer.node_id)).await
+                        {
                             let _ = event_tx.send(NodeEvent::Error(format!("{}: {}", addr, e)));
                         }
                     });
@@ -732,7 +781,7 @@ impl Node {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let event_tx = ctx.event_tx.clone();
-                if let Err(e) = Self::handle_connection(stream, src, ctx, true).await {
+                if let Err(e) = Self::handle_connection(stream, src, ctx, None).await {
                     let _ = event_tx.send(NodeEvent::Error(format!("{}: {}", src, e)));
                 }
             });
@@ -749,10 +798,23 @@ impl Node {
         stream: TcpStream,
         src: SocketAddr,
         ctx: ConnectionContext,
-        inbound: bool,
+        expected: Option<chroma_crypto::noise::NodeId>,
     ) -> Result<(), P2pError> {
+        let inbound = expected.is_none();
         stream.set_nodelay(true).ok();
         let (mut reader, mut writer) = stream.into_split();
+
+        // Everything from here on is encrypted. The handshake runs on the raw
+        // socket first; a dialer authenticates the node it asked for, and a
+        // listener learns who dialled it.
+        let session = Self::noise_handshake(&mut reader, &mut writer, &ctx, expected).await?;
+        let remote_id = session.remote_node_id();
+        let session = Arc::new(tokio::sync::Mutex::new(session));
+        let origin = ConnectionOrigin {
+            src,
+            inbound,
+            remote_id,
+        };
 
         // `src` is the socket's remote address. For an inbound connection that
         // is an ephemeral port, so the peer is re-keyed to its advertised
@@ -761,9 +823,17 @@ impl Node {
         let mut keyed = !inbound;
 
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(PEER_SEND_QUEUE);
+        let writer_session = session.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(bytes) = out_rx.recv().await {
-                if writer.write_all(&bytes).await.is_err() {
+                let sealed = {
+                    let mut session = writer_session.lock().await;
+                    match session.encrypt(&bytes) {
+                        Ok(sealed) => sealed,
+                        Err(_) => break,
+                    }
+                };
+                if writer.write_all(&sealed).await.is_err() {
                     break;
                 }
             }
@@ -773,6 +843,12 @@ impl Node {
         if !inbound {
             let mut pm = ctx.peer_manager.write().await;
             pm.set_channel(peer_key, out_tx.clone());
+            // The handshake is the only proof of who the far end is, so the
+            // identity is recorded from it and never from anything the peer
+            // says about itself later.
+            if let Some(info) = pm.get_peer_mut(&peer_key) {
+                info.node_id = Some(remote_id);
+            }
         }
 
         // Outbound side speaks first.
@@ -785,6 +861,10 @@ impl Node {
         }
 
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
+        // Ciphertext arrives in Noise chunks, each behind a 4-byte length;
+        // whole chunks are decrypted into `acc`, where frame decoding happens
+        // exactly as it did on a plaintext socket.
+        let mut sealed: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut chunk = vec![0u8; READ_CHUNK];
         let handshake_deadline =
             tokio::time::Instant::now() + Duration::from_secs(VERSION_TIMEOUT_SECS);
@@ -828,7 +908,47 @@ impl Node {
                     break 'read;
                 }
             };
-            acc.extend_from_slice(&chunk[..n]);
+            sealed.extend_from_slice(&chunk[..n]);
+
+            // Peel off every complete Noise chunk and decrypt it. A chunk is
+            // a 4-byte big-endian length followed by that many ciphertext
+            // bytes; a partial one stays in `sealed` until the rest arrives.
+            let mut bad_chunk = None;
+            loop {
+                if sealed.len() < 4 {
+                    break;
+                }
+                let len = u32::from_be_bytes([sealed[0], sealed[1], sealed[2], sealed[3]]) as usize;
+                // A Noise transport message is at most 65535 bytes on the
+                // wire. Anything longer is not something we could decrypt, so
+                // it is a protocol violation rather than a short read to wait
+                // out — without this check a bogus length would make us
+                // buffer forever.
+                if len > u16::MAX as usize {
+                    bad_chunk = Some("noise chunk exceeds transport limit");
+                    break;
+                }
+                if sealed.len() < 4 + len {
+                    break;
+                }
+                // The length prefix goes to `decrypt` as well: it frames the
+                // chunk, and the session is what knows how long a chunk is
+                // allowed to be.
+                let ciphertext = sealed[..4 + len].to_vec();
+                sealed.drain(..4 + len);
+                match session.lock().await.decrypt(&ciphertext) {
+                    Ok(plain) => acc.extend_from_slice(&plain),
+                    Err(_) => {
+                        bad_chunk = Some("noise decryption failed");
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = bad_chunk {
+                Self::penalize(&ctx, &peer_key, 20).await;
+                result = Err(P2pError::Protocol(reason.into()));
+                break 'read;
+            }
 
             // The accumulator legitimately holds one incomplete maximum-size
             // frame plus whatever else arrived in the same read, so the cap
@@ -851,8 +971,7 @@ impl Node {
                             &out_tx,
                             &mut peer_key,
                             &mut keyed,
-                            src,
-                            inbound,
+                            origin,
                         )
                         .await
                         {
@@ -878,6 +997,66 @@ impl Node {
 
         Self::finish_connection(&ctx, &peer_key, keyed, out_tx, writer_task).await;
         result
+    }
+
+    /// Run the Noise handshake before any protocol message is exchanged.
+    ///
+    /// The dialer is the initiator and already knows which node it expects, so
+    /// XK authenticates the far end; the listener responds and learns the
+    /// dialer's identity from the handshake.
+    async fn noise_handshake(
+        reader: &mut tokio::net::tcp::OwnedReadHalf,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        ctx: &ConnectionContext,
+        expected: Option<chroma_crypto::noise::NodeId>,
+    ) -> Result<chroma_crypto::noise::Session, P2pError> {
+        use chroma_crypto::noise::Handshake;
+
+        let mut handshake = match expected {
+            Some(remote) => Handshake::initiator(&ctx.identity, &remote)
+                .map_err(|e| P2pError::Protocol(format!("noise setup: {}", e)))?,
+            None => Handshake::responder(&ctx.identity)
+                .map_err(|e| P2pError::Protocol(format!("noise setup: {}", e)))?,
+        };
+
+        // XK is three messages: the initiator speaks first and third.
+        let initiator = expected.is_some();
+        for step in 0..3 {
+            let ours = (step % 2 == 0) == initiator;
+            if ours {
+                let msg = handshake
+                    .write_message(&[])
+                    .map_err(|e| P2pError::Protocol(format!("noise write: {}", e)))?;
+                writer.write_all(&(msg.len() as u16).to_be_bytes()).await?;
+                writer.write_all(&msg).await?;
+            } else {
+                let mut len = [0u8; 2];
+                tokio::time::timeout(
+                    Duration::from_secs(VERSION_TIMEOUT_SECS),
+                    reader.read_exact(&mut len),
+                )
+                .await
+                .map_err(|_| P2pError::Protocol("noise handshake timed out".into()))??;
+                let len = u16::from_be_bytes(len) as usize;
+                if len > 1024 {
+                    return Err(P2pError::Protocol("oversized handshake message".into()));
+                }
+                let mut msg = vec![0u8; len];
+                tokio::time::timeout(
+                    Duration::from_secs(VERSION_TIMEOUT_SECS),
+                    reader.read_exact(&mut msg),
+                )
+                .await
+                .map_err(|_| P2pError::Protocol("noise handshake timed out".into()))??;
+                handshake
+                    .read_message(&msg)
+                    .map_err(|e| P2pError::Protocol(format!("noise read: {}", e)))?;
+            }
+        }
+
+        handshake
+            .into_session()
+            .map_err(|e| P2pError::Protocol(format!("noise transport: {}", e)))
     }
 
     /// Tear down bookkeeping for a connection that has ended.
@@ -932,8 +1111,7 @@ impl Node {
         out_tx: &mpsc::Sender<Vec<u8>>,
         peer_key: &mut SocketAddr,
         keyed: &mut bool,
-        src: SocketAddr,
-        inbound: bool,
+        origin: ConnectionOrigin,
     ) -> Result<bool, P2pError> {
         // Charge the message against the peer's allowance before doing any
         // work on it.
@@ -972,12 +1150,12 @@ impl Node {
                     return Ok(false);
                 }
 
-                if inbound {
+                if origin.inbound {
                     // Re-key from the ephemeral source port to the port the
                     // peer actually listens on, then claim the slot. Doing it
                     // here is what makes duplicate-connection detection work
                     // for inbound peers at all.
-                    let announced = SocketAddr::new(src.ip(), ver.listen_port);
+                    let announced = SocketAddr::new(origin.src.ip(), ver.listen_port);
                     let slot = {
                         let mut pm = ctx.peer_manager.write().await;
                         pm.begin_connection(announced, true)
@@ -994,6 +1172,10 @@ impl Node {
                 {
                     let mut pm = ctx.peer_manager.write().await;
                     if let Some(peer) = pm.get_peer_mut(peer_key) {
+                        // Recorded from the handshake, not from anything the
+                        // peer claims: an inbound peer only gets its final
+                        // key here, so this is where its identity lands.
+                        peer.node_id = Some(origin.remote_id);
                         // The version we actually speak is the lower of the two.
                         peer.version = std::cmp::min(ver.version, PROTOCOL_VERSION);
                         peer.height = ver.height;
@@ -1004,7 +1186,7 @@ impl Node {
                 }
 
                 // An inbound peer has not seen our version yet.
-                if inbound {
+                if origin.inbound {
                     let version = Message::new(MessageType::Version, ctx.version_message().encode());
                     Self::send(out_tx, version).await?;
                 }
@@ -1353,18 +1535,18 @@ impl Node {
                 // beyond the limit by sending a long list.
                 let to_dial = {
                     let mut pm = ctx.peer_manager.write().await;
-                    for addr in msg.addrs.iter().take(MAX_ADDRS_PER_MESSAGE) {
-                        if !Self::is_routable(addr) {
+                    for peer in msg.addrs.iter().take(MAX_ADDRS_PER_MESSAGE) {
+                        if !Self::is_routable(&peer.socket) {
                             continue;
                         }
-                        pm.add_peer(*addr);
+                        pm.add_known_peer(*peer);
                     }
                     let deficit = pm.outbound_deficit();
                     pm.dialable_addrs(deficit)
                 };
 
-                for addr in to_dial {
-                    let _ = ctx.outbound_tx.send(OutboundCommand::Connect(addr));
+                for peer in to_dial {
+                    let _ = ctx.outbound_tx.send(OutboundCommand::Connect(peer));
                 }
                 Ok(true)
             }
@@ -1825,9 +2007,9 @@ impl Node {
         }
     }
 
-    pub fn connect(&self, addr: SocketAddr) {
+    pub fn connect(&self, peer: crate::peer::PeerAddress) {
         if let Some(tx) = &self.outbound_tx {
-            let _ = tx.send(OutboundCommand::Connect(addr));
+            let _ = tx.send(OutboundCommand::Connect(peer));
         }
     }
 

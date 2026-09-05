@@ -14,8 +14,11 @@ enum Commands {
     Node {
         #[arg(short, long, default_value = "127.0.0.1:8333")]
         listen: SocketAddr,
+        /// Peer to dial, as `<node-id-hex>@host:port`. The identity is
+        /// required: Noise XK authenticates the far end against a key known
+        /// in advance, so there is nothing to verify without it.
         #[arg(short, long)]
-        connect: Vec<SocketAddr>,
+        connect: Vec<chroma_p2p::peer::PeerAddress>,
         #[arg(long, default_value = "chroma_data")]
         data_dir: PathBuf,
         /// Network to run on: devnet, testnet, mainnet, or regtest.
@@ -251,6 +254,37 @@ fn rand_nonce() -> u64 {
     h.finish()
 }
 
+/// Read this node's Noise secret from the data directory, creating one on
+/// first run.
+///
+/// Stored as hex in `node_key`, owner-readable only where the platform
+/// supports it: anyone holding it can impersonate the node to its peers.
+fn load_or_create_node_key(data_dir: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    let path = data_dir.join("node_key");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let raw = hex::decode(text.trim())
+            .map_err(|_| anyhow::anyhow!("{} is not 32 bytes of hex", path.display()))?;
+        if raw.len() == 32 {
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&raw);
+            return Ok(secret);
+        }
+        anyhow::bail!("{} is not 32 bytes of hex", path.display());
+    }
+
+    let keypair = chroma_crypto::noise::NodeKeypair::generate()
+        .map_err(|e| anyhow::anyhow!("failed to generate node identity: {}", e))?;
+    let secret = keypair.secret_bytes();
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(&path, hex::encode(secret))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(secret)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -259,8 +293,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Node { listen, connect, data_dir, network, no_mining, miner_address } => {
             println!("Starting Chroma node on {}", listen);
             println!("Data directory: {}", data_dir.display());
-            if !connect.is_empty() {
-                println!("Connecting to: {:?}", connect);
+            for peer in &connect {
+                println!("Connecting to: {}", peer);
             }
             let params = match chroma_consensus::ChainParams::parse(&network) {
                 Some(p) => p,
@@ -272,6 +306,11 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+            // The identity lives in the data directory so a restarted node
+            // keeps the id its peers know it by. A fresh key every run would
+            // make `--connect` entries go stale on every restart.
+            let node_secret = load_or_create_node_key(&data_dir)?;
+
             let genesis = chroma_consensus::build_genesis_block_with(&params);
             let genesis_hash = genesis.hash();
             println!("Network: {}", params.network.as_str());
@@ -279,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_params(params)
                 .with_data_dir(data_dir)
                 .with_connect_addrs(connect)
+                .with_node_secret(node_secret)
                 .with_mining(!no_mining);
             let config = match miner_address {
                 Some(text) => match bech32_to_address(&text) {
@@ -294,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Mining rewards to: {}", address_to_bech32(&config.miner_address));
             }
             let mut node = chroma_p2p::Node::new(config);
+            println!("Node identity: {}@{}", node.node_id().to_hex(), listen);
             let mut event_rx = node.event_rx().expect("event_rx already taken");
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {

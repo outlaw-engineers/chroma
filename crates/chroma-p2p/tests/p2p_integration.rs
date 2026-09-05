@@ -14,7 +14,8 @@ use chroma_core::serialize::CanonicalEncode;
 use chroma_core::types::{Address, Amount, Nonce};
 use chroma_crypto::hash::hash160;
 use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
-use chroma_p2p::peer::PeerState;
+use chroma_crypto::noise::{Handshake, NodeId, NodeKeypair, Session};
+use chroma_p2p::peer::{PeerAddress, PeerState};
 use chroma_p2p::wire::{
     decode_frame, FrameDecode, Message, MessageType, PingMessage, VersionMessage,
 };
@@ -54,12 +55,18 @@ async fn start_node(tag: &str) -> (Node, SocketAddr, std::path::PathBuf) {
     (node, addr, dir)
 }
 
+/// The dialable identity of a running node: everything a peer needs to reach
+/// it, including the Noise key the handshake authenticates it against.
+fn peer_of(node: &Node) -> PeerAddress {
+    PeerAddress::new(node.node_id(), node.local_addr().expect("listener not bound"))
+}
+
 /// Start a regtest node. Regtest mining is effectively free, so a node can
 /// actually produce blocks for propagation tests.
 async fn start_regtest_node(
     tag: &str,
     mining: bool,
-    connect: Vec<SocketAddr>,
+    connect: Vec<PeerAddress>,
 ) -> (Node, SocketAddr, std::path::PathBuf) {
     let dir = temp_dir(tag);
     let params = chroma_consensus::ChainParams::regtest();
@@ -78,25 +85,70 @@ async fn start_regtest_node(
 /// what goes on the wire and observe exactly what comes back.
 pub struct RawPeer {
     stream: TcpStream,
+    /// Ciphertext read off the socket but not yet a whole Noise chunk.
+    sealed: Vec<u8>,
+    /// Decrypted bytes not yet a whole protocol frame.
     buf: Vec<u8>,
+    session: Session,
     listen_port: u16,
 }
 
 impl RawPeer {
-    async fn connect(addr: SocketAddr, listen_port: u16) -> Self {
-        let stream = TcpStream::connect(addr).await.expect("dial failed");
+    /// Dial a node and complete the Noise handshake, leaving the connection
+    /// exactly where a real peer's would be: encrypted, with no protocol
+    /// message sent yet.
+    async fn connect(node: &Node, listen_port: u16) -> Self {
+        Self::connect_to(peer_of(node), listen_port).await
+    }
+
+    async fn connect_to(peer: PeerAddress, listen_port: u16) -> Self {
+        let mut stream = TcpStream::connect(peer.socket).await.expect("dial failed");
+        let session = Self::noise_handshake(&mut stream, peer.node_id).await;
         RawPeer {
             stream,
+            sealed: Vec::new(),
             buf: Vec::new(),
+            session,
             listen_port,
         }
     }
 
+    /// The initiator half of `Noise_XK`, framed the way the node frames it:
+    /// three messages, each behind a 2-byte big-endian length.
+    async fn noise_handshake(stream: &mut TcpStream, remote: NodeId) -> Session {
+        let identity = NodeKeypair::generate().expect("keygen failed");
+        let mut handshake = Handshake::initiator(&identity, &remote).expect("handshake setup");
+
+        for step in 0..3 {
+            if step % 2 == 0 {
+                let msg = handshake.write_message(&[]).expect("handshake write");
+                stream
+                    .write_all(&(msg.len() as u16).to_be_bytes())
+                    .await
+                    .expect("write failed");
+                stream.write_all(&msg).await.expect("write failed");
+            } else {
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len).await.expect("handshake read");
+                let mut msg = vec![0u8; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut msg).await.expect("handshake read");
+                handshake.read_message(&msg).expect("handshake read");
+            }
+        }
+
+        handshake.into_session().expect("transport")
+    }
+
     async fn send(&mut self, msg: Message) {
-        self.stream
-            .write_all(&msg.encode())
-            .await
-            .expect("write failed");
+        let sealed = self.session.encrypt(&msg.encode()).expect("encrypt failed");
+        self.stream.write_all(&sealed).await.expect("write failed");
+    }
+
+    /// Write raw plaintext bytes, sealed as one Noise chunk. Used by the tests
+    /// that deliberately put something malformed on the wire.
+    async fn send_bytes(&mut self, bytes: &[u8]) {
+        let sealed = self.session.encrypt(bytes).expect("encrypt failed");
+        self.stream.write_all(&sealed).await.expect("write failed");
     }
 
     /// Read until one full frame is decoded, or the deadline expires.
@@ -116,7 +168,27 @@ impl RawPeer {
                 Ok(Ok(n)) => n,
                 _ => return None,
             };
-            self.buf.extend_from_slice(&chunk[..n]);
+            self.sealed.extend_from_slice(&chunk[..n]);
+
+            // Decrypt whole Noise chunks; a partial one waits for more bytes.
+            loop {
+                if self.sealed.len() < 4 {
+                    break;
+                }
+                let len = u32::from_be_bytes([
+                    self.sealed[0],
+                    self.sealed[1],
+                    self.sealed[2],
+                    self.sealed[3],
+                ]) as usize;
+                if self.sealed.len() < 4 + len {
+                    break;
+                }
+                let ciphertext = self.sealed[..4 + len].to_vec();
+                self.sealed.drain(..4 + len);
+                let plain = self.session.decrypt(&ciphertext).expect("decrypt failed");
+                self.buf.extend_from_slice(&plain);
+            }
         }
     }
 
@@ -215,7 +287,7 @@ async fn two_nodes_complete_handshake() {
     let config_b = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
         .with_data_dir(dir_b.clone())
         .with_mining(false)
-        .with_connect_addrs(vec![addr_a]);
+        .with_connect_addrs(vec![peer_of(&node_a)]);
     let mut node_b = Node::new(config_b);
     node_b.run().await.expect("node b failed to start");
     let addr_b = node_b.local_addr().unwrap();
@@ -257,9 +329,9 @@ async fn two_nodes_complete_handshake() {
 /// fatal decode error, so anything over 8 KiB silently killed the peer.
 #[tokio::test]
 async fn large_frame_does_not_drop_the_connection() {
-    let (mut node, addr, dir) = start_node("bigframe").await;
+    let (mut node, _addr, dir) = start_node("bigframe").await;
 
-    let mut peer = RawPeer::connect(addr, 40_001).await;
+    let mut peer = RawPeer::connect(&node, 40_001).await;
     peer.handshake().await;
 
     // 900 KiB of payload: ~56 socket reads on the node's side, and far past
@@ -292,9 +364,9 @@ async fn large_frame_does_not_drop_the_connection() {
 /// than one message per socket.
 #[tokio::test]
 async fn many_messages_share_one_connection() {
-    let (mut node, addr, dir) = start_node("persist").await;
+    let (mut node, _addr, dir) = start_node("persist").await;
 
-    let mut peer = RawPeer::connect(addr, 40_002).await;
+    let mut peer = RawPeer::connect(&node, 40_002).await;
     peer.handshake().await;
 
     for i in 0..50u64 {
@@ -319,10 +391,10 @@ async fn many_messages_share_one_connection() {
 /// A transaction received from a peer must be verified and stored.
 #[tokio::test]
 async fn received_transaction_enters_mempool() {
-    let (mut node, addr, dir) = start_node("mempool").await;
+    let (mut node, _addr, dir) = start_node("mempool").await;
     let mut events = node.event_rx().expect("event receiver already taken");
 
-    let mut peer = RawPeer::connect(addr, 40_003).await;
+    let mut peer = RawPeer::connect(&node, 40_003).await;
     peer.handshake().await;
 
     let tx = signed_transaction(0);
@@ -364,9 +436,9 @@ async fn received_transaction_enters_mempool() {
 /// A transaction whose signature does not verify must be rejected, not stored.
 #[tokio::test]
 async fn invalid_transaction_is_rejected() {
-    let (mut node, addr, dir) = start_node("badtx").await;
+    let (mut node, _addr, dir) = start_node("badtx").await;
 
-    let mut peer = RawPeer::connect(addr, 40_004).await;
+    let mut peer = RawPeer::connect(&node, 40_004).await;
     peer.handshake().await;
 
     // Corrupt the signature while keeping the encoding structurally valid.
@@ -397,14 +469,14 @@ async fn invalid_transaction_is_rejected() {
 /// dropped, leaving exactly one live connection.
 #[tokio::test]
 async fn duplicate_connection_is_refused() {
-    let (mut node, addr, dir) = start_node("dupe").await;
+    let (mut node, _addr, dir) = start_node("dupe").await;
 
     // Both raw peers claim the same listening port, so the node must treat
     // them as the same peer.
-    let mut first = RawPeer::connect(addr, 40_005).await;
+    let mut first = RawPeer::connect(&node, 40_005).await;
     first.handshake().await;
 
-    let mut second = RawPeer::connect(addr, 40_005).await;
+    let mut second = RawPeer::connect(&node, 40_005).await;
     let version = VersionMessage {
         version: PROTOCOL_VERSION,
         services: 0,
@@ -440,9 +512,9 @@ async fn duplicate_connection_is_refused() {
 /// A node that dials itself must notice via the identity nonce and hang up.
 #[tokio::test]
 async fn self_connection_is_dropped() {
-    let (mut node, addr, dir) = start_node("selfconn").await;
+    let (mut node, _addr, dir) = start_node("selfconn").await;
 
-    node.connect(addr);
+    node.connect(peer_of(&node));
 
     // Give the dial time to complete and be rejected.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -465,7 +537,7 @@ async fn self_connection_is_dropped() {
 /// mined header chain, and then reports that it has nothing more.
 #[tokio::test]
 async fn node_syncs_headers_from_a_longer_peer() {
-    let (mut node, addr, dir) = start_node("hdrsync").await;
+    let (mut node, _addr, dir) = start_node("hdrsync").await;
     let mut events = node.event_rx().expect("event receiver already taken");
 
     // The node's genesis is the real one, at difficulty 1, which cannot be
@@ -484,7 +556,7 @@ async fn node_syncs_headers_from_a_longer_peer() {
         nonce: 12345,
     };
 
-    let mut peer = RawPeer::connect(addr, 40_007).await;
+    let mut peer = RawPeer::connect(&node, 40_007).await;
     peer.handshake_claiming_height(50).await;
 
     // The node should ask us for headers because we claimed height 50.
@@ -533,7 +605,7 @@ async fn node_syncs_headers_from_a_longer_peer() {
 async fn shutdown_is_graceful_and_releases_the_port() {
     let (mut node, addr, dir) = start_node("shutdown").await;
 
-    let mut peer = RawPeer::connect(addr, 40_006).await;
+    let mut peer = RawPeer::connect(&node, 40_006).await;
     peer.handshake().await;
 
     let started = std::time::Instant::now();
@@ -586,7 +658,7 @@ async fn mined_block_propagates_to_a_peer() {
     // The listener mines; the dialer only follows.
     let (miner, miner_addr, dir_a) = start_regtest_node("prop_miner", true, vec![]).await;
     let (follower, _addr_b, dir_b) =
-        start_regtest_node("prop_follower", false, vec![miner_addr]).await;
+        start_regtest_node("prop_follower", false, vec![peer_of(&miner)]).await;
 
     let storage_height = follower.peer_manager();
     wait_for("the follower to connect", || {
@@ -637,9 +709,9 @@ async fn mined_block_propagates_to_a_peer() {
 /// An announcement for a block we already have must not trigger a download.
 #[tokio::test]
 async fn duplicate_announcement_is_not_re_requested() {
-    let (mut node, addr, dir) = start_regtest_node("dup_block", false, vec![]).await;
+    let (mut node, _addr, dir) = start_regtest_node("dup_block", false, vec![]).await;
 
-    let mut peer = RawPeer::connect(addr, 40_010).await;
+    let mut peer = RawPeer::connect(&node, 40_010).await;
     peer.handshake().await;
 
     // Genesis is the one block the node is guaranteed to hold.
@@ -686,9 +758,9 @@ async fn duplicate_announcement_is_not_re_requested() {
 /// not, with NotFound.
 #[tokio::test]
 async fn getdata_serves_blocks_and_reports_misses() {
-    let (mut node, addr, dir) = start_regtest_node("serve", false, vec![]).await;
+    let (mut node, _addr, dir) = start_regtest_node("serve", false, vec![]).await;
 
-    let mut peer = RawPeer::connect(addr, 40_011).await;
+    let mut peer = RawPeer::connect(&node, 40_011).await;
     peer.handshake().await;
 
     let genesis = chroma_consensus::build_genesis_block_with(
@@ -755,7 +827,7 @@ async fn transaction_reaches_a_peer_and_gets_mined() {
     let miner_addr = miner.local_addr().unwrap();
 
     let (relay, _relay_addr, dir_b) =
-        start_regtest_node("txnet_relay", false, vec![miner_addr]).await;
+        start_regtest_node("txnet_relay", false, vec![peer_of(&miner)]).await;
 
     wait_for("the relay to connect", || async {
         let pm = relay.peer_manager();
@@ -849,7 +921,7 @@ async fn late_joining_node_downloads_history_in_order() {
         .with_miner_address(miner_payout);
     let mut miner = Node::new(config_a);
     miner.run().await.expect("miner failed to start");
-    let miner_addr = miner.local_addr().unwrap();
+    let _miner_addr = miner.local_addr().unwrap();
 
     // Build some history before the second node exists.
     wait_for("the miner to build a chain", || async {
@@ -863,7 +935,7 @@ async fn late_joining_node_downloads_history_in_order() {
         .with_params(params)
         .with_data_dir(dir_b.clone())
         .with_mining(false)
-        .with_connect_addrs(vec![miner_addr]);
+        .with_connect_addrs(vec![peer_of(&miner)]);
     let mut joiner = Node::new(config_b);
     let mut events = joiner.event_rx().expect("event receiver already taken");
     joiner.run().await.expect("joiner failed to start");
@@ -975,9 +1047,9 @@ async fn node_restart_restores_chain_and_balances() {
 /// during the handshake, with a reason.
 #[tokio::test]
 async fn obsolete_protocol_version_is_rejected() {
-    let (mut node, addr, dir) = start_regtest_node("oldver", false, vec![]).await;
+    let (mut node, _addr, dir) = start_regtest_node("oldver", false, vec![]).await;
 
-    let mut peer = RawPeer::connect(addr, 40_020).await;
+    let mut peer = RawPeer::connect(&node, 40_020).await;
     let version = VersionMessage {
         version: 0, // below MIN_PROTOCOL_VERSION
         services: 0,
@@ -1008,9 +1080,9 @@ async fn obsolete_protocol_version_is_rejected() {
 /// spend unbounded work.
 #[tokio::test]
 async fn message_flood_disconnects_the_peer() {
-    let (mut node, addr, dir) = start_regtest_node("flood", false, vec![]).await;
+    let (mut node, _addr, dir) = start_regtest_node("flood", false, vec![]).await;
 
-    let mut peer = RawPeer::connect(addr, 40_021).await;
+    let mut peer = RawPeer::connect(&node, 40_021).await;
     peer.handshake().await;
 
     // Well past the per-second allowance, sent as fast as possible.
@@ -1021,7 +1093,7 @@ async fn message_flood_disconnects_the_peer() {
     }
     // A closed connection makes the write fail, which is itself the outcome we
     // are looking for.
-    let _ = peer.stream.write_all(&blast).await;
+    peer.send_bytes(&blast).await;
 
     // The node should hang up.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1046,7 +1118,8 @@ async fn message_flood_disconnects_the_peer() {
 #[tokio::test]
 async fn peers_are_discovered_through_gossip() {
     let (node_a, addr_a, dir_a) = start_regtest_node("gossip_a", false, vec![]).await;
-    let (node_b, addr_b, dir_b) = start_regtest_node("gossip_b", false, vec![addr_a]).await;
+    let (node_b, _addr_b, dir_b) =
+        start_regtest_node("gossip_b", false, vec![peer_of(&node_a)]).await;
 
     // Let B finish handshaking with A, so A is worth passing on.
     wait_for("B to connect to A", || async {
@@ -1057,7 +1130,8 @@ async fn peers_are_discovered_through_gossip() {
     .await;
 
     // C only knows about B.
-    let (node_c, _addr_c, dir_c) = start_regtest_node("gossip_c", false, vec![addr_b]).await;
+    let (node_c, _addr_c, dir_c) =
+        start_regtest_node("gossip_c", false, vec![peer_of(&node_b)]).await;
 
     wait_for("C to learn about A and connect", || async {
         let pm = node_c.peer_manager();
@@ -1091,9 +1165,9 @@ async fn peers_are_discovered_through_gossip() {
 /// peers it actually completed a handshake with.
 #[tokio::test]
 async fn getaddr_shares_only_verified_peers() {
-    let (mut node, addr, dir) = start_regtest_node("getaddr", false, vec![]).await;
+    let (mut node, _addr, dir) = start_regtest_node("getaddr", false, vec![]).await;
 
-    let mut peer = RawPeer::connect(addr, 40_030).await;
+    let mut peer = RawPeer::connect(&node, 40_030).await;
     peer.handshake().await;
 
     peer.send(Message::new(MessageType::GetAddr, vec![])).await;
@@ -1102,7 +1176,7 @@ async fn getaddr_shares_only_verified_peers() {
 
     let own: SocketAddr = format!("127.0.0.1:{}", 40_030).parse().unwrap();
     assert!(
-        !addrs.addrs.contains(&own),
+        !addrs.addrs.iter().any(|p| p.socket == own),
         "a peer must not be told about itself, got {:?}",
         addrs.addrs
     );
@@ -1114,5 +1188,181 @@ async fn getaddr_shares_only_verified_peers() {
     );
 
     node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Noise transport (spec §10)
+// ---------------------------------------------------------------------------
+
+/// The link is encrypted from the first byte, so a dialer that opens with a
+/// plaintext protocol frame gets nowhere: those bytes are read as a Noise
+/// handshake message, fail to decrypt, and the connection is dropped without
+/// the peer ever reaching Ready.
+#[tokio::test]
+async fn plaintext_dialer_is_refused() {
+    let (mut node, addr, dir) = start_node("plaintext").await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("dial failed");
+    let version = VersionMessage {
+        version: PROTOCOL_VERSION,
+        services: 0,
+        timestamp: 1_700_000_000,
+        height: 0,
+        nonce: 0x0102_0304_0506_0708,
+        listen_port: 40_040,
+    };
+    stream
+        .write_all(&Message::new(MessageType::Version, version.encode()).encode())
+        .await
+        .expect("write failed");
+
+    // Nothing usable comes back: either the node hangs up, or whatever it
+    // sends is ciphertext rather than a frame we could decode.
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map(|r| r.expect("read failed"))
+        .unwrap_or(0);
+    assert!(
+        n == 0 || buf[..n.min(4)] != chroma_p2p::wire::MAGIC,
+        "a plaintext dialer must not get a plaintext protocol frame back"
+    );
+
+    let pm = node.peer_manager();
+    let ready = pm.read().await.ready_peers().len();
+    assert_eq!(ready, 0, "a plaintext dialer must never reach Ready");
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// XK authenticates the responder against the key the dialer already holds.
+/// Dialing the right address with the wrong identity must fail rather than
+/// silently connect: otherwise the pinned key would be decoration.
+#[tokio::test]
+async fn handshake_fails_against_the_wrong_identity() {
+    let (mut node, addr, dir) = start_node("wrongid").await;
+
+    let impostor = NodeKeypair::generate().unwrap().node_id();
+    assert_ne!(impostor, node.node_id());
+
+    let mut stream = TcpStream::connect(addr).await.expect("dial failed");
+    let identity = NodeKeypair::generate().unwrap();
+    let mut handshake = Handshake::initiator(&identity, &impostor).unwrap();
+    let msg = handshake.write_message(&[]).unwrap();
+    stream
+        .write_all(&(msg.len() as u16).to_be_bytes())
+        .await
+        .expect("write failed");
+    stream.write_all(&msg).await.expect("write failed");
+
+    // The node cannot decrypt a first message addressed to a key it does not
+    // hold, so it drops the connection instead of replying.
+    let mut len = [0u8; 2];
+    let reply = tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut len)).await;
+    assert!(
+        matches!(reply, Ok(Err(_))) || reply.is_err(),
+        "a handshake to the wrong identity must not complete"
+    );
+
+    let pm = node.peer_manager();
+    let ready = pm.read().await.ready_peers().len();
+    assert_eq!(ready, 0);
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer's identity comes from the handshake, and is what makes it gossipable:
+/// `PeerAddress` needs the key, so a peer recorded without one could never be
+/// passed on to anyone else.
+#[tokio::test]
+async fn handshaked_peer_records_its_node_id() {
+    let (node_a, addr_a, dir_a) = start_node("nodeid_a").await;
+
+    let dir_b = temp_dir("nodeid_b");
+    let genesis = chroma_consensus::build_genesis_block().hash();
+    let config_b = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir_b.clone())
+        .with_mining(false)
+        .with_connect_addrs(vec![peer_of(&node_a)]);
+    let mut node_b = Node::new(config_b);
+    node_b.run().await.expect("node b failed to start");
+    let addr_b = node_b.local_addr().unwrap();
+
+    let pm_b = node_b.peer_manager();
+    wait_for("node B to mark node A ready", || {
+        let pm = pm_b.clone();
+        async move {
+            pm.read()
+                .await
+                .get_peer(&addr_a)
+                .map(|p| p.state == PeerState::Ready)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    assert_eq!(
+        pm_b.read().await.get_peer(&addr_a).unwrap().node_id,
+        Some(node_a.node_id()),
+        "the dialer must record the identity it authenticated"
+    );
+
+    let pm_a = node_a.peer_manager();
+    wait_for("node A to mark node B ready", || {
+        let pm = pm_a.clone();
+        async move {
+            pm.read()
+                .await
+                .get_peer(&addr_b)
+                .map(|p| p.state == PeerState::Ready)
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    assert_eq!(
+        pm_a.read().await.get_peer(&addr_b).unwrap().node_id,
+        Some(node_b.node_id()),
+        "the listener must record the identity the handshake proved"
+    );
+
+    let mut node_a = node_a;
+    node_a.shutdown().await;
+    node_b.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A node that keeps its key keeps its identity: peers pin it, so a restart
+/// that generated a fresh one would make every `--connect` entry stale.
+#[tokio::test]
+async fn node_identity_is_stable_across_restarts() {
+    let dir = temp_dir("stable_id");
+    let genesis = chroma_consensus::build_genesis_block().hash();
+    let secret = NodeKeypair::generate().unwrap().secret_bytes();
+
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir.clone())
+        .with_node_secret(secret)
+        .with_mining(false);
+    let first = Node::new(config).node_id();
+
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir.clone())
+        .with_node_secret(secret)
+        .with_mining(false);
+    let second = Node::new(config).node_id();
+
+    assert_eq!(first, second);
+
+    // Without a configured secret the node is deliberately ephemeral.
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), genesis)
+        .with_data_dir(dir.clone())
+        .with_mining(false);
+    assert_ne!(Node::new(config).node_id(), first);
+
     let _ = std::fs::remove_dir_all(&dir);
 }

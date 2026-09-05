@@ -413,15 +413,18 @@ impl GetDataMessage {
     }
 }
 
-/// A list of peer addresses, exchanged so nodes can find each other without
-/// every one of them having to be configured by hand.
+/// A list of peers, exchanged so nodes can find each other without every one
+/// of them having to be configured by hand.
 ///
-/// Each entry is a one-byte address family (4 or 6), the address bytes, then a
-/// little-endian port. Only addresses a peer completed a handshake on are
-/// worth sharing, so what travels here is dialable rather than merely seen.
+/// Each entry carries the peer's node identity as well as its address: Noise
+/// XK authenticates the responder, so a dialer that only learned an address
+/// would have nothing to check the far end against.
+///
+/// Encoded per entry as the 32-byte node id, a one-byte address family (4 or
+/// 6), the address bytes, then a little-endian port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddrMessage {
-    pub addrs: Vec<std::net::SocketAddr>,
+    pub addrs: Vec<crate::peer::PeerAddress>,
 }
 
 impl AddrMessage {
@@ -429,8 +432,9 @@ impl AddrMessage {
         use std::net::IpAddr;
         let count = std::cmp::min(self.addrs.len(), MAX_ADDRS_PER_MESSAGE);
         let mut buf = chroma_core::serialize::encode_leb128(count as u64);
-        for addr in self.addrs.iter().take(count) {
-            match addr.ip() {
+        for peer in self.addrs.iter().take(count) {
+            buf.extend_from_slice(&peer.node_id.0);
+            match peer.socket.ip() {
                 IpAddr::V4(v4) => {
                     buf.push(4);
                     buf.extend_from_slice(&v4.octets());
@@ -440,7 +444,7 @@ impl AddrMessage {
                     buf.extend_from_slice(&v6.octets());
                 }
             }
-            buf.extend_from_slice(&addr.port().to_le_bytes());
+            buf.extend_from_slice(&peer.socket.port().to_le_bytes());
         }
         buf
     }
@@ -459,6 +463,13 @@ impl AddrMessage {
 
         let mut addrs = Vec::with_capacity(count);
         for _ in 0..count {
+            if pos + 32 > data.len() {
+                return Err(CoreError::Serialization("addr: truncated node id".to_string()));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&data[pos..pos + 32]);
+            pos += 32;
+
             if pos >= data.len() {
                 return Err(CoreError::Serialization("addr: truncated".to_string()));
             }
@@ -497,7 +508,11 @@ impl AddrMessage {
             }
             let port = u16::from_le_bytes([data[pos], data[pos + 1]]);
             pos += 2;
-            addrs.push(SocketAddr::new(ip, port));
+
+            addrs.push(crate::peer::PeerAddress::new(
+                chroma_crypto::noise::NodeId(key),
+                SocketAddr::new(ip, port),
+            ));
         }
 
         if pos != data.len() {
@@ -866,11 +881,14 @@ mod tests {
     #[test]
     fn test_addr_roundtrip() {
         use std::net::SocketAddr;
-        let addrs: Vec<SocketAddr> = vec![
-            "127.0.0.1:8333".parse().unwrap(),
-            "192.0.2.42:19000".parse().unwrap(),
-            "[2001:db8::1]:8333".parse().unwrap(),
-        ];
+        let addrs: Vec<crate::peer::PeerAddress> = vec![
+            "127.0.0.1:8333".parse::<SocketAddr>().unwrap(),
+            "192.0.2.42:19000".parse::<SocketAddr>().unwrap(),
+            "[2001:db8::1]:8333".parse::<SocketAddr>().unwrap(),
+        ]
+        .into_iter()
+        .map(|s| crate::peer::PeerAddress::new(chroma_crypto::noise::NodeId::generate(), s))
+        .collect();
         let msg = AddrMessage {
             addrs: addrs.clone(),
         };
@@ -889,6 +907,7 @@ mod tests {
         // A declared count beyond the cap must be refused before anything is
         // allocated for it.
         let mut payload = chroma_core::serialize::encode_leb128((MAX_ADDRS_PER_MESSAGE + 1) as u64);
+        payload.extend_from_slice(&[0u8; 32]);
         payload.push(4);
         payload.extend_from_slice(&[127, 0, 0, 1]);
         payload.extend_from_slice(&8333u16.to_le_bytes());
@@ -898,7 +917,10 @@ mod tests {
     #[test]
     fn test_addr_rejects_truncated_and_trailing() {
         let msg = AddrMessage {
-            addrs: vec!["127.0.0.1:8333".parse().unwrap()],
+            addrs: vec![crate::peer::PeerAddress::new(
+                chroma_crypto::noise::NodeId::generate(),
+                "127.0.0.1:8333".parse().unwrap(),
+            )],
         };
         let encoded = msg.encode();
         assert!(AddrMessage::decode(&encoded[..encoded.len() - 1]).is_err());
@@ -911,6 +933,7 @@ mod tests {
     #[test]
     fn test_addr_rejects_unknown_family() {
         let mut payload = chroma_core::serialize::encode_leb128(1);
+        payload.extend_from_slice(&[0u8; 32]);
         payload.push(9); // neither 4 nor 6
         payload.extend_from_slice(&[0; 4]);
         payload.extend_from_slice(&8333u16.to_le_bytes());
@@ -920,8 +943,13 @@ mod tests {
     #[test]
     fn test_addr_encode_caps_the_list() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        let addrs: Vec<SocketAddr> = (0..(MAX_ADDRS_PER_MESSAGE + 50))
-            .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 8333))
+        let addrs: Vec<crate::peer::PeerAddress> = (0..(MAX_ADDRS_PER_MESSAGE + 50))
+            .map(|i| {
+                crate::peer::PeerAddress::new(
+                    chroma_crypto::noise::NodeId::generate(),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8)), 8333),
+                )
+            })
             .collect();
         let decoded = AddrMessage::decode(&AddrMessage { addrs }.encode()).unwrap();
         assert_eq!(decoded.addrs.len(), MAX_ADDRS_PER_MESSAGE);

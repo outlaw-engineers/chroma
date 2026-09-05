@@ -1,9 +1,8 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::peer::PeerManager;
+use crate::peer::{PeerAddress, PeerManager};
 
 /// Hard-coded bootstrap nodes (devnet). Empty until devnet addresses are
 /// assigned; peers are supplied with `--connect` in the meantime.
@@ -45,30 +44,34 @@ impl Discovery {
     pub async fn discover_peers(
         &mut self,
         peer_manager: Arc<RwLock<PeerManager>>,
-        connect_addrs: &[SocketAddr],
-    ) -> Vec<SocketAddr> {
+        connect_addrs: &[PeerAddress],
+    ) -> Vec<PeerAddress> {
         let mut found = Vec::new();
 
-        for &addr in connect_addrs {
+        for peer in connect_addrs {
             let mut pm = peer_manager.write().await;
-            if pm.get_peer(&addr).is_none() {
-                pm.add_peer(addr);
-                found.push(addr);
+            if pm.get_peer(&peer.socket).is_none() {
+                pm.add_known_peer(*peer);
+                found.push(*peer);
             }
         }
 
+        // Seeds publish `<node-id>@host:port` entries, since Noise XK needs
+        // the identity as well as the address. Resolving them is handled by
+        // `resolve_seed`, which currently only understands literal entries;
+        // the TXT lookup lands with the seed record itself.
         for seed in SEED_NODES.iter().chain(DNS_SEEDS.iter()) {
             if self.seed_failures >= MAX_SEED_FAILURES {
                 break;
             }
-            match Self::resolve(seed).await {
-                Some(addrs) => {
+            match Self::resolve_seed(seed).await {
+                Some(peers) => {
                     self.seed_failures = 0;
-                    for a in addrs {
+                    for peer in peers {
                         let mut pm = peer_manager.write().await;
-                        if pm.get_peer(&a).is_none() {
-                            pm.add_peer(a);
-                            found.push(a);
+                        if pm.get_peer(&peer.socket).is_none() {
+                            pm.add_known_peer(peer);
+                            found.push(peer);
                         }
                     }
                 }
@@ -79,14 +82,25 @@ impl Discovery {
         found
     }
 
-    /// Resolve one seed entry.
+    /// Resolve one seed entry into peers.
     ///
-    /// Uses tokio's resolver rather than `ToSocketAddrs`, which blocks the
-    /// worker thread it runs on — a DNS seed that is slow or unreachable would
-    /// otherwise stall unrelated tasks on that thread for the whole lookup.
-    async fn resolve(seed: &str) -> Option<Vec<SocketAddr>> {
-        match tokio::net::lookup_host(seed).await {
-            Ok(addrs) => Some(addrs.collect()),
+    /// A seed entry is `<node-id>@host:port`. Plain host:port entries are
+    /// rejected rather than dialed: without the node identity there is nothing
+    /// for the Noise handshake to authenticate the far end against, so
+    /// connecting would defeat the point.
+    async fn resolve_seed(seed: &str) -> Option<Vec<PeerAddress>> {
+        let (key, hostport) = seed.split_once('@')?;
+        let node_id = chroma_crypto::noise::NodeId::from_hex(key).ok()?;
+
+        // tokio's resolver, not `ToSocketAddrs`: the latter blocks the worker
+        // thread it runs on, so a slow or unreachable seed would stall
+        // unrelated tasks for the whole lookup.
+        match tokio::net::lookup_host(hostport).await {
+            Ok(addrs) => Some(
+                addrs
+                    .map(|socket| PeerAddress::new(node_id, socket))
+                    .collect(),
+            ),
             Err(_) => None,
         }
     }
@@ -95,6 +109,16 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_crypto::noise::NodeId;
+    use std::net::SocketAddr;
+
+    fn peer(port: u16) -> PeerAddress {
+        let mut raw = [0u8; 32];
+        raw[0] = port as u8;
+        raw[1] = (port >> 8) as u8;
+        let socket: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        PeerAddress::new(NodeId::from_bytes(raw), socket)
+    }
 
     #[test]
     fn test_new_discovery() {
@@ -110,8 +134,8 @@ mod tests {
     #[tokio::test]
     async fn test_discover_peers_reports_what_it_registers() {
         let pm = Arc::new(RwLock::new(PeerManager::new()));
-        let a: SocketAddr = "127.0.0.1:8333".parse().unwrap();
-        let b: SocketAddr = "127.0.0.1:8334".parse().unwrap();
+        let a = peer(8333);
+        let b = peer(8334);
 
         let mut d = Discovery::new();
         let found = d.discover_peers(pm.clone(), &[a, b]).await;
@@ -122,8 +146,8 @@ mod tests {
         );
 
         let guard = pm.read().await;
-        assert!(guard.get_peer(&a).is_some());
-        assert!(guard.get_peer(&b).is_some());
+        assert_eq!(guard.get_peer(&a.socket).unwrap().node_id, Some(a.node_id));
+        assert_eq!(guard.get_peer(&b.socket).unwrap().node_id, Some(b.node_id));
         drop(guard);
 
         // Already-known peers are not reported a second time.
@@ -136,10 +160,9 @@ mod tests {
     /// being retried once the failure budget is spent.
     #[tokio::test]
     async fn test_unresolvable_seed_is_counted() {
-        assert_eq!(
-            Discovery::resolve("this-host-does-not-exist.invalid:8333").await,
-            None
-        );
+        let id = NodeId::from_bytes([7u8; 32]).to_hex();
+        let seed = format!("{}@this-host-does-not-exist.invalid:8333", id);
+        assert!(Discovery::resolve_seed(&seed).await.is_none());
 
         let pm = Arc::new(RwLock::new(PeerManager::new()));
         let mut d = Discovery::new();
@@ -147,5 +170,13 @@ mod tests {
             let _ = d.discover_peers(pm.clone(), &[]).await;
         }
         assert!(d.seed_failures() <= MAX_SEED_FAILURES);
+    }
+
+    /// A seed entry without an identity is useless: Noise XK authenticates the
+    /// responder against a key the dialer already holds, so a bare `host:port`
+    /// would have to be dialed unauthenticated. Reject it instead.
+    #[tokio::test]
+    async fn test_seed_without_node_id_is_rejected() {
+        assert!(Discovery::resolve_seed("127.0.0.1:8333").await.is_none());
     }
 }

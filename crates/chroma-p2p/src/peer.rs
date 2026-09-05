@@ -1,8 +1,50 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+
+/// A peer's address together with the identity it must present.
+///
+/// Noise XK authenticates the responder, which means the dialer has to know
+/// which node it expects before it connects — an address alone would let
+/// anyone who can answer that address impersonate the peer. Written as
+/// `<64 hex chars>@host:port`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PeerAddress {
+    pub node_id: chroma_crypto::noise::NodeId,
+    pub socket: SocketAddr,
+}
+
+impl PeerAddress {
+    pub fn new(node_id: chroma_crypto::noise::NodeId, socket: SocketAddr) -> Self {
+        PeerAddress { node_id, socket }
+    }
+}
+
+impl fmt::Display for PeerAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.node_id.to_hex(), self.socket)
+    }
+}
+
+impl FromStr for PeerAddress {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (key, socket) = s
+            .split_once('@')
+            .ok_or_else(|| format!("expected <node-id>@<host:port>, got {:?}", s))?;
+        let node_id = chroma_crypto::noise::NodeId::from_hex(key)
+            .map_err(|e| format!("bad node id: {}", e))?;
+        let socket: SocketAddr = socket
+            .parse()
+            .map_err(|e| format!("bad socket address: {}", e))?;
+        Ok(PeerAddress { node_id, socket })
+    }
+}
 
 pub const PEER_SCORE_GOOD: i32 = 10;
 pub const PEER_SCORE_BAD: i32 = -100;
@@ -82,6 +124,8 @@ pub struct PeerInfo {
     pub ban_until: Option<Instant>,
     /// True if the remote opened the connection to us.
     pub inbound: bool,
+    /// The node identity this peer presented, once known.
+    pub node_id: Option<chroma_crypto::noise::NodeId>,
     /// True once a handshake completed on this address at least once.
     ///
     /// Only these are worth passing to other nodes: an address we merely heard
@@ -106,6 +150,7 @@ impl PeerInfo {
             services: 0,
             ban_until: None,
             inbound: false,
+            node_id: None,
             handshaked: false,
             rate: RateWindow::new(),
         }
@@ -201,6 +246,15 @@ impl PeerManager {
         }
     }
 
+    /// Record a peer whose identity we already know, so it can be dialed.
+    pub fn add_known_peer(&mut self, peer: PeerAddress) {
+        let entry = self
+            .peers
+            .entry(peer.socket)
+            .or_insert_with(|| PeerInfo::new(peer.socket));
+        entry.node_id = Some(peer.node_id);
+    }
+
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
         self.peers.remove(addr);
         self.channels.remove(addr);
@@ -271,23 +325,26 @@ impl PeerManager {
     /// Restricted to peers we have actually completed a handshake with and
     /// that are not banned, so gossip spreads reachable nodes rather than
     /// whatever a peer chose to claim.
-    pub fn shareable_addrs(&self, limit: usize, except: Option<SocketAddr>) -> Vec<SocketAddr> {
+    pub fn shareable_addrs(&self, limit: usize, except: Option<SocketAddr>) -> Vec<PeerAddress> {
         self.peers
             .values()
             .filter(|p| p.handshaked && !p.is_banned())
-            .map(|p| p.addr)
-            .filter(|addr| Some(*addr) != except)
+            .filter(|p| Some(p.addr) != except)
+            .filter_map(|p| p.node_id.map(|id| PeerAddress::new(id, p.addr)))
             .take(limit)
             .collect()
     }
 
-    /// Addresses we know of but are not connected to, for filling out our
+    /// Peers we know of but are not connected to, for filling out our
     /// outbound slots.
-    pub fn dialable_addrs(&self, limit: usize) -> Vec<SocketAddr> {
+    ///
+    /// Only those whose identity we know: Noise XK cannot dial an address
+    /// without knowing which node should answer it.
+    pub fn dialable_addrs(&self, limit: usize) -> Vec<PeerAddress> {
         self.peers
             .values()
             .filter(|p| !p.is_active() && !p.is_banned())
-            .map(|p| p.addr)
+            .filter_map(|p| p.node_id.map(|id| PeerAddress::new(id, p.addr)))
             .take(limit)
             .collect()
     }
