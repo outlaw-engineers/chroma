@@ -159,6 +159,82 @@ new_target = old_target × actual_time / target_time
 | Inbound Connections  | 128（default）                         |
 | Peer Scoring         | Score > 100 → Ban                    |
 
+### 10.1 Node Identity
+
+ノードは用途の異なる2つの鍵を持つ。
+
+| 鍵            | アルゴリズム | 用途                                     |
+| ------------ | ------ | -------------------------------------- |
+| Identity Key | ed25519 | Node ID = 公開鍵32バイト。ノードの同一性             |
+| Static Key   | X25519 | Noiseハンドシェイクの静的鍵。Diffie-Hellmanを行う     |
+
+`Noise_XK_25519` の静的鍵はX25519であり、ed25519鍵をそのまま用いることはできない。
+したがって両者は別の鍵とし、Identity KeyがStatic Keyを署名することで結びつける。
+
+Static Keyの秘密鍵の所持はハンドシェイク自身が証明するため、署名は
+2つの鍵の結びつけのみを担う。
+
+```text
+message   = "chroma-noise-static-key-v1" || static_pubkey   (26 + 32 bytes)
+signature = ed25519_sign(identity_secret, message)          (64 bytes)
+proof     = node_id || signature                            (96 bytes)
+```
+
+* 信頼の起点はIdentity Keyである。Static Keyが差し替えられた場合、
+  差し替えた側はその鍵を当該Identity Keyで署名できないため、
+  ハンドシェイクは成立しない
+* したがってStatic Keyは、Gossip・DNS Seedのいずれから得たものであっても
+  検証なしに信頼してよい情報ではなく、接続に必要な値にすぎない
+* Static KeyはNode IDを変えずに更新しうる
+* Static KeyをIdentity Keyの種から導出することを認める。
+  両鍵が独立に生成されることは要求も禁止もしない
+
+### 10.2 Handshake
+
+Noise_XKは3メッセージからなる。Static Key Binding（10.1）は、
+その鍵を開示するメッセージのpayloadに載せる。
+
+```text
+-> e, es          payload: 空
+<- e, ee          payload: responderのproof（96 bytes）
+-> s, se          payload: initiatorのproof（96 bytes）
+```
+
+* Initiatorは接続前に、相手のNode IDとStatic Keyの双方を知っている必要がある
+* Initiatorは受け取ったproofのNode IDが、自分が接続しようとしたNode IDと
+  一致することを確認する。一致しない場合は接続を中止する
+* ResponderはproofからInitiatorのNode IDを得る。事前に知っている必要はない
+* proofの検証に失敗した場合、セッションを確立してはならない
+* 上記以外のハンドシェイクpayloadは空とし、空でないものは拒否する
+
+ハンドシェイク完了後は、各フレームをNoise transport messageとして送る。
+Noiseの1メッセージは65535バイトが上限であるため、それを超えるペイロードは
+分割し、各チャンクの先頭に4バイトのbig-endian長を置く。
+
+### 10.3 Peer Address
+
+ノードへの接続に必要な情報は、Node ID・Static Key・アドレスの3つである。
+テキスト表現は次のとおり。
+
+```text
+<node-id>.<static-key>@<host>:<port>
+```
+
+* `<node-id>`、`<static-key>` はいずれも64文字の16進数
+* `addr` メッセージにおけるバイナリ表現は
+  `node_id(32) || static_key(32) || family(1) || ip(4 or 16) || port(2 LE)`
+* 鍵を欠く表現は不正とする。Static Keyがなければ接続できず、
+  Node IDがなければ接続先を検証できない
+
+### 10.4 Discovery
+
+DNS SeedはTXTレコードで公開する。レコードの形式および運用手順は
+[`SEED_RECORD.md`](../SEED_RECORD.md) に定める。
+
+DNSの応答は認証されない。DNSSECは要求しない。
+Seedから得た情報は接続先の候補を示すヒントとして扱い、
+同一性の保証は10.1のStatic Key Bindingの検証によって得る。
+
 ## 11. 不変条件
 
 以下の条件は、いかなる場合も破ってはならない。
@@ -218,5 +294,6 @@ chroma/
 * DNS Seed Operatorのgovernance
 * Light Client Protocol
 * RPC/API仕様
-* Wallet Seed Phrase（Protocolでは規定しない。UX上の方式は別途検討する）
+* Wallet Seed Phrase（Protocolでは規定しない。UX上の方式は別途検討する。
+  リファレンス実装はBIP-39を用いる）
 * Testnet parameters（Mainnetとは異なる可能性がある）
