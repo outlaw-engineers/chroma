@@ -75,9 +75,15 @@ enum TxCommands {
         /// Recipient address (bech32m chr1... or 0x hex).
         #[arg(long)]
         to: String,
-        /// Amount in units (1 CHR = 1,000,000 units).
+        /// Amount in CHR, written as a decimal: `1.5`, `0.00001`.
+        ///
+        /// Exactly one of this and --amount-units is required.
+        #[arg(long, conflicts_with = "amount_units", required_unless_present = "amount_units")]
+        amount: Option<String>,
+        /// Amount in units, for scripts that already count that way.
+        /// 1 CHR = 1,000,000 units.
         #[arg(long)]
-        amount: u64,
+        amount_units: Option<u64>,
         /// Node to submit to, as `<node-id>.<noise-key>@host:port`. Omit it
         /// to use whatever the network's DNS seed publishes.
         #[arg(long)]
@@ -205,6 +211,98 @@ fn bech32_to_address(s: &str) -> Option<chroma_core::types::Address> {
             chroma_core::hash::Hash160(h),
         ))
     }
+}
+
+/// Parse an amount written in CHR into units.
+///
+/// The protocol counts in units and only in units: `RPC.md` §7.3 puts the
+/// conversion in the display layer, and this program is the display layer.
+/// Asking someone to type 10 when they mean a hundred-thousandth of a coin is
+/// the wire format leaking out through the front door.
+///
+/// Parsed by splitting on the point and doing integer arithmetic, never
+/// through `f64`. A binary float cannot hold 0.1, and money that is off by an
+/// unpredictable unit is worse than money that is awkward to type.
+fn parse_chr(s: &str) -> anyhow::Result<u64> {
+    use chroma_core::constants::UNITS_PER_CHR;
+
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty amount");
+    }
+    if s.starts_with('+') || s.starts_with('-') {
+        anyhow::bail!("amounts carry no sign: {}", s);
+    }
+    if s.contains(['e', 'E']) {
+        anyhow::bail!("exponent notation is not accepted: {}", s);
+    }
+
+    let (whole_str, frac_str) = match s.split_once('.') {
+        Some((_, _)) if s.matches('.').count() > 1 => {
+            anyhow::bail!("more than one decimal point: {}", s)
+        }
+        Some((whole, frac)) => {
+            if frac.is_empty() {
+                anyhow::bail!("nothing after the decimal point: {}", s);
+            }
+            (whole, frac)
+        }
+        None => (s, ""),
+    };
+
+    if whole_str.is_empty() {
+        anyhow::bail!("no digits before the decimal point: {} (write 0{})", s, s);
+    }
+    for part in [whole_str, frac_str] {
+        if !part.chars().all(|c| c.is_ascii_digit()) {
+            anyhow::bail!("not a decimal number: {}", s);
+        }
+    }
+
+    // Six, because a unit is 10^-6 CHR. A seventh digit is a value the chain
+    // cannot represent, and rounding it away silently would send an amount
+    // nobody asked for.
+    let places = UNITS_PER_CHR.to_string().len() - 1;
+    if frac_str.len() > places {
+        anyhow::bail!(
+            "{} has more than {} decimal places; the smallest unit is {} CHR",
+            s,
+            places,
+            1.0 / UNITS_PER_CHR as f64
+        );
+    }
+
+    let whole: u64 = whole_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("amount out of range: {}", s))?;
+    let mut padded = frac_str.to_string();
+    while padded.len() < places {
+        padded.push('0');
+    }
+    let frac: u64 = if padded.is_empty() { 0 } else { padded.parse()? };
+
+    whole
+        .checked_mul(UNITS_PER_CHR)
+        .and_then(|units| units.checked_add(frac))
+        .ok_or_else(|| anyhow::anyhow!("amount out of range: {}", s))
+}
+
+/// Render units as CHR, exactly.
+///
+/// Integer arithmetic for the same reason as [`parse_chr`]: this used to
+/// divide by a million in `f64`, which prints whatever the nearest binary
+/// double happens to be.
+fn format_chr(units: u64) -> String {
+    use chroma_core::constants::UNITS_PER_CHR;
+
+    let whole = units / UNITS_PER_CHR;
+    let frac = units % UNITS_PER_CHR;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let places = UNITS_PER_CHR.to_string().len() - 1;
+    let frac = format!("{:0width$}", frac, width = places);
+    format!("{}.{}", whole, frac.trim_end_matches('0'))
 }
 
 /// Open a node's database for reading.
@@ -808,8 +906,11 @@ async fn main() -> anyhow::Result<()> {
                     .await?;
                 let account = AccountMessage::decode(&reply.payload)?;
 
-                let chr = account.balance as f64 / 1_000_000.0;
-                println!("Balance: {} CHR ({} units)", chr, account.balance);
+                println!(
+                    "Balance: {} CHR ({} units)",
+                    format_chr(account.balance),
+                    account.balance
+                );
                 println!("Nonce: {}", account.nonce);
                 if !account.exists {
                     println!("(this chain has no record of that address)");
@@ -832,8 +933,11 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("Block height: {}", info.height);
                 println!("Chain tip: {}", info.tip.to_hex());
-                let supply_chr = info.supply as f64 / 1_000_000.0;
-                println!("Supply: {} CHR ({} units)", supply_chr, info.supply);
+                println!(
+                    "Supply: {} CHR ({} units)",
+                    format_chr(info.supply),
+                    info.supply
+                );
                 println!(
                     "Difficulty: about 2^{} hashes per block (bits {:#010x})",
                     CompactTarget(info.bits).expected_hashes_log2(),
@@ -846,11 +950,29 @@ async fn main() -> anyhow::Result<()> {
                 wallet: wallet_name,
                 to,
                 amount,
+                amount_units,
                 node,
                 network,
                 nonce,
                 data_dir,
             } => {
+                // clap guarantees exactly one of the two is present.
+                let amount = match (amount, amount_units) {
+                    (Some(chr), None) => match parse_chr(&chr) {
+                        Ok(units) => units,
+                        Err(e) => {
+                            eprintln!("Invalid --amount: {}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    (None, Some(units)) => units,
+                    _ => unreachable!("clap enforces exactly one amount"),
+                };
+                if amount == 0 {
+                    eprintln!("Nothing to send: an amount must be greater than zero.");
+                    std::process::exit(1);
+                }
+
                 // Without an explicit node, ask the seed. A wallet that can
                 // only be used by someone already running a node is not much
                 // of a wallet, and the seed record exists precisely so that
@@ -935,7 +1057,7 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("From:   {}", address_to_bech32(&sender));
                 println!("To:     {}", address_to_bech32(&recipient));
-                println!("Amount: {} units", amount);
+                println!("Amount: {} CHR ({} units)", format_chr(amount), amount);
                 println!("Nonce:  {}", next_nonce);
 
                 // Try each candidate: a seed can name a node that is not
@@ -999,4 +1121,72 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_chr, parse_chr};
+
+    #[test]
+    fn whole_coins_parse() {
+        assert_eq!(parse_chr("1").unwrap(), 1_000_000);
+        assert_eq!(parse_chr("0").unwrap(), 0);
+        assert_eq!(parse_chr("1354").unwrap(), 1_354_000_000);
+    }
+
+    #[test]
+    fn fractions_parse_to_the_unit() {
+        assert_eq!(parse_chr("1.5").unwrap(), 1_500_000);
+        assert_eq!(parse_chr("0.00001").unwrap(), 10);
+        assert_eq!(parse_chr("0.000001").unwrap(), 1, "one unit");
+        assert_eq!(parse_chr("1353.99999").unwrap(), 1_353_999_990);
+    }
+
+    #[test]
+    fn a_seventh_decimal_place_is_refused_not_rounded() {
+        // The chain cannot represent it. Rounding it away would send an
+        // amount the caller did not ask for, which is the one outcome a
+        // money command must never have.
+        let err = parse_chr("0.0000001").unwrap_err().to_string();
+        assert!(err.contains("decimal places"), "{}", err);
+    }
+
+    #[test]
+    fn malformed_amounts_are_refused() {
+        for bad in [
+            "", " ", "-1", "+1", "1.", ".5", "1.2.3", "abc", "1e6", "1 000", "1,5",
+        ] {
+            assert!(parse_chr(bad).is_err(), "{:?} should not parse", bad);
+        }
+    }
+
+    #[test]
+    fn an_amount_past_the_supply_is_out_of_range() {
+        // 18_446_744_073_710 CHR overflows u64 units.
+        assert!(parse_chr("18446744073710").is_err());
+    }
+
+    #[test]
+    fn formatting_is_exact() {
+        assert_eq!(format_chr(0), "0");
+        assert_eq!(format_chr(1), "0.000001");
+        assert_eq!(format_chr(10), "0.00001");
+        assert_eq!(format_chr(1_000_000), "1");
+        assert_eq!(format_chr(1_500_000), "1.5");
+        assert_eq!(format_chr(1_353_999_990), "1353.99999");
+    }
+
+    #[test]
+    fn formatting_and_parsing_agree() {
+        for units in [0u64, 1, 10, 999_999, 1_000_000, 1_353_999_990, u64::MAX] {
+            let rendered = format_chr(units);
+            assert_eq!(
+                parse_chr(&rendered).unwrap(),
+                units,
+                "{} rendered as {}",
+                units,
+                rendered
+            );
+        }
+    }
 }
