@@ -111,6 +111,23 @@ impl ChainParams {
     }
 
     /// Parse a network name as accepted on the command line.
+    /// The name `parse` accepts for this network.
+    ///
+    /// `NetworkId::as_str` gives the protocol name (`chroma-regtest`), which
+    /// is not what `--network` takes; printing that in a message telling
+    /// someone what to pass sends them somewhere that does not parse.
+    pub fn cli_name(&self) -> &'static str {
+        match self.network {
+            NetworkId::Mainnet => "mainnet",
+            NetworkId::Testnet => "testnet",
+            NetworkId::Devnet => "devnet",
+            NetworkId::Regtest => "regtest",
+            // Not a network anything here builds params for; named so the
+            // match cannot silently go stale if one is added.
+            NetworkId::Unknown => "unknown",
+        }
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "mainnet" => Some(Self::mainnet()),

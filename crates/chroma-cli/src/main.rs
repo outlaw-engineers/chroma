@@ -447,6 +447,14 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+            // The data directory carries one network's chain, and opening it
+            // as another silently adopts those blocks as this network's
+            // history.
+            if let Err(e) = chroma_p2p::check_data_dir_network(&data_dir, params) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+
             // A build without the `randomx` feature cannot hash a header for
             // any network that uses RandomX, so it can neither mine nor
             // validate there. Refuse at startup: the alternative is a node
@@ -477,7 +485,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Network: {}", params.network.as_str());
             let config = chroma_p2p::NodeConfig::new(listen, genesis_hash)
                 .with_params(params)
-                .with_data_dir(data_dir)
+                .with_data_dir(data_dir.clone())
                 .with_connect_addrs(connect)
                 .with_node_secret(node_secret)
                 .with_mining(!no_mining);
@@ -489,10 +497,41 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 },
-                None => config,
+                None => {
+                    // The default is a fresh address whose key is generated
+                    // and thrown away, so every block mined to it pays into
+                    // an address nobody can ever spend from. Fine as a way of
+                    // keeping two test nodes from mining identical blocks;
+                    // not something to do to someone's actual rewards.
+                    if !no_mining {
+                        eprintln!("Mining needs --miner-address: without one the rewards are paid");
+                        eprintln!("to a fresh address whose key is discarded, and are unspendable.");
+                        eprintln!();
+                        eprintln!("  chroma wallet create --name miner --data-dir {}", data_dir.display());
+                        eprintln!("  chroma node --miner-address <the chr1... it prints> ...");
+                        eprintln!();
+                        eprintln!("Or pass --no-mining to follow the chain without mining.");
+                        std::process::exit(1);
+                    }
+                    config
+                }
             };
             if !no_mining {
                 println!("Mining rewards to: {}", address_to_bech32(&config.miner_address));
+
+                // Solo mining is only realistic where the target is trivial.
+                // Every other network expects difficulty 1 or harder, which is
+                // around 2^32 hashes a block: with RandomX at tens of
+                // milliseconds each, a single node is looking at years per
+                // block. Better said out loud than discovered by watching a
+                // silent miner.
+                if params.network != chroma_core::types::NetworkId::Regtest {
+                    println!(
+                        "Note: {} expects roughly 2^32 hashes per block. A single node will not",
+                        params.network.as_str()
+                    );
+                    println!("find one in any useful time — use --network regtest to try things out.");
+                }
             }
             let mut node = chroma_p2p::Node::new(config);
             // Printed in the form a peer would pass to --connect, since that
