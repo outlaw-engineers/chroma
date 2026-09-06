@@ -48,12 +48,39 @@ chroma/
 cargo build --workspace
 ```
 
+### cmakeが無い環境
+
+デフォルトのビルドにはRandomX（C++実装、cmakeでビルドされる）が含まれる。
+cmakeとC++ツールチェーンが無い環境では、この依存を外してビルドできる。
+
+```bash
+cargo build --workspace --no-default-features
+```
+
+このビルドはRandomXでハッシュを計算できないため、**regtest以外のネットワークでは
+マイニングも検証もできない**。該当するネットワークを指定して起動した場合は、
+起動時にその旨を表示して終了する。
+
+Windowsでcmakeを入れる場合：
+
+```powershell
+winget install Kitware.CMake
+```
+
+インストール後、PATHを読み直すためにシェルを開き直すこと。
+
 ## テスト
 
 ワークスペース全体のテストを実行：
 
 ```bash
 cargo test --workspace
+```
+
+RandomXを外した構成でも通ることを確認する場合：
+
+```bash
+cargo test --workspace --no-default-features
 ```
 
 ## 開発状況

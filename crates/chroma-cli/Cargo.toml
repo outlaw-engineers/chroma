@@ -10,16 +10,29 @@ default-run = "chroma"
 name = "chroma"
 path = "src/main.rs"
 
+[features]
+# RandomX is the proof of work every real network uses, and it is a C++
+# library built with cmake. Turning it off drops that build dependency, at the
+# cost of a node that can only take part in regtest: on any other network it
+# cannot hash a header, so it can neither mine nor validate.
+#
+# The feature is forwarded through every crate between here and chroma-crypto.
+# Cargo unifies features across the graph, so one crate depending on
+# chroma-crypto with its defaults would switch RandomX back on for everyone —
+# which is what used to happen, leaving no way to build the node without cmake.
+default = ["randomx"]
+randomx = ["chroma-block/randomx", "chroma-consensus/randomx", "chroma-crypto/randomx", "chroma-p2p/randomx", "chroma-storage/randomx", "chroma-tx/randomx", "chroma-wallet/randomx"]
+
 [dependencies]
 chroma-core = { path = "../chroma-core" }
-chroma-crypto = { path = "../chroma-crypto" }
+chroma-crypto = { path = "../chroma-crypto", default-features = false }
 chroma-state = { path = "../chroma-state" }
-chroma-tx = { path = "../chroma-tx" }
-chroma-block = { path = "../chroma-block" }
-chroma-consensus = { path = "../chroma-consensus" }
-chroma-storage = { path = "../chroma-storage" }
-chroma-p2p = { path = "../chroma-p2p" }
-chroma-wallet = { path = "../chroma-wallet" }
+chroma-tx = { path = "../chroma-tx", default-features = false }
+chroma-block = { path = "../chroma-block", default-features = false }
+chroma-consensus = { path = "../chroma-consensus", default-features = false }
+chroma-storage = { path = "../chroma-storage", default-features = false }
+chroma-p2p = { path = "../chroma-p2p", default-features = false }
+chroma-wallet = { path = "../chroma-wallet", default-features = false }
 blake3 = "1.5"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

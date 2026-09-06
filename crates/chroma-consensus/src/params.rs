@@ -19,12 +19,13 @@ pub const DEFAULT_MIN_TARGET: [u8; 32] = {
 
 /// Easiest target the retarget algorithm may produce (largest value).
 /// About 4× the genesis target, which is one full downward adjustment.
+///
+/// It has to be at least the genesis target, or the first retarget clamps the
+/// chain to something harder than it started at and the genesis difficulty
+/// means nothing.
 pub const DEFAULT_MAX_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
-    t[3] = 0x03;
-    t[4] = 0xFF;
-    t[5] = 0xFF;
-    t[6] = 0xC0;
+    t[1] = 0x40;
     t
 };
 
@@ -111,6 +112,23 @@ impl ChainParams {
     }
 
     /// Parse a network name as accepted on the command line.
+    /// The name `parse` accepts for this network.
+    ///
+    /// `NetworkId::as_str` gives the protocol name (`chroma-regtest`), which
+    /// is not what `--network` takes; printing that in a message telling
+    /// someone what to pass sends them somewhere that does not parse.
+    pub fn cli_name(&self) -> &'static str {
+        match self.network {
+            NetworkId::Mainnet => "mainnet",
+            NetworkId::Testnet => "testnet",
+            NetworkId::Devnet => "devnet",
+            NetworkId::Regtest => "regtest",
+            // Not a network anything here builds params for; named so the
+            // match cannot silently go stale if one is added.
+            NetworkId::Unknown => "unknown",
+        }
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "mainnet" => Some(Self::mainnet()),
@@ -130,6 +148,57 @@ impl Default for ChainParams {
 
 #[cfg(test)]
 mod tests {
+
+    /// The genesis target has to sit inside the bounds the retarget may
+    /// produce. A max target below it would have the first retarget clamp the
+    /// chain to something harder than it started at, quietly undoing whatever
+    /// the genesis difficulty was set to.
+    #[test]
+    fn test_genesis_target_is_within_the_retarget_bounds() {
+        use chroma_core::u256::U256;
+
+        for params in [
+            ChainParams::mainnet(),
+            ChainParams::testnet(),
+            ChainParams::devnet(),
+            ChainParams::regtest(),
+        ] {
+            let genesis = U256::from_be_bytes(&params.genesis_bits.to_full_target());
+            let min = U256::from_be_bytes(&params.min_target);
+            let max = U256::from_be_bytes(&params.max_target);
+            assert!(
+                genesis >= min && genesis <= max,
+                "{}: genesis target is outside [min, max]",
+                params.network.as_str()
+            );
+        }
+    }
+
+    /// A block should cost about 2^12 hashes at genesis. Difficulty 1 (2^32)
+    /// is what this used to be, and against a ten-second target with RandomX
+    /// it put the first block days to years away — with no way back, since the
+    /// retarget needs blocks before it can loosen.
+    #[test]
+    fn test_genesis_difficulty_is_reachable() {
+        let target = ChainParams::mainnet().genesis_bits.to_full_target();
+        let leading_zero_bits: u32 = {
+            let mut n = 0;
+            for byte in target.iter() {
+                if *byte == 0 {
+                    n += 8;
+                } else {
+                    n += byte.leading_zeros();
+                    break;
+                }
+            }
+            n
+        };
+        assert_eq!(
+            leading_zero_bits, 11,
+            "expected about 2^12 hashes per block, got 2^{}",
+            leading_zero_bits
+        );
+    }
     use super::*;
     use chroma_core::hash::Hash;
 

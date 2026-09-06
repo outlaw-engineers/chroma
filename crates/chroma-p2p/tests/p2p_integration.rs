@@ -245,12 +245,20 @@ impl RawPeer {
 }
 
 /// Poll a condition until it holds or the timeout expires.
+///
+/// The deadline is generous on purpose. These tests assert that something
+/// eventually happens, and the timeout only exists so a broken build fails
+/// instead of hanging — so it has to cover the slowest machine the suite runs
+/// on, not the fastest. Several of them are timing-sensitive and share a
+/// machine with a test that mines for ten seconds; at a tight deadline they
+/// failed on load rather than on behaviour, which is a worse failure than
+/// waiting a little longer for a real one.
 async fn wait_for<F, Fut>(what: &str, f: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    wait_for_within(what, Duration::from_secs(10), f).await
+    wait_for_within(what, Duration::from_secs(30), f).await
 }
 
 /// `wait_for` with a deadline of its own, for the tests that have to watch a
@@ -601,7 +609,13 @@ async fn node_syncs_headers_from_a_longer_peer() {
     while std::time::Instant::now() < deadline && !refused {
         while let Ok(event) = events.try_recv() {
             if let NodeEvent::Error(msg) = &event {
-                if msg.contains("does not meet its target") {
+                // Either reason is a refusal. A build without the `randomx`
+                // feature cannot compute the hash for this network at all, so
+                // it turns the header away a step earlier — which is the
+                // behaviour that build is asking for.
+                if msg.contains("does not meet its target")
+                    || msg.contains("cannot compute proof of work")
+                {
                     refused = true;
                 }
             }
@@ -1621,5 +1635,50 @@ async fn a_losing_branch_does_not_move_the_syncer() {
     );
 
     node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A data directory holds one network's chain, and nothing in the files says
+/// which. Opening a regtest directory as devnet used to load those blocks as
+/// devnet history — mined under a target no real network would accept, and
+/// then offered to peers as fact — because the genesis hash was written when
+/// the directory was created and never read back.
+#[tokio::test]
+async fn a_data_directory_belongs_to_one_network() {
+    let dir = temp_dir("network_guard");
+    let regtest = chroma_consensus::ChainParams::regtest();
+    let devnet = chroma_consensus::ChainParams::devnet();
+
+    // An empty directory belongs to nobody yet.
+    assert!(chroma_p2p::check_data_dir_network(&dir, devnet).is_ok());
+
+    // Create a regtest chain there.
+    {
+        let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+            .with_params(regtest)
+            .with_data_dir(dir.clone())
+            .with_mining(false);
+        let mut node = Node::new(config);
+        node.run().await.expect("node failed to start");
+        node.shutdown().await;
+    }
+
+    // Reopening it as regtest is fine; as devnet it is not.
+    assert!(chroma_p2p::check_data_dir_network(&dir, regtest).is_ok());
+    let err = chroma_p2p::check_data_dir_network(&dir, devnet)
+        .expect_err("a regtest directory must not open as devnet");
+    assert!(
+        err.contains("chroma-regtest") && err.contains("chroma-devnet"),
+        "the message must name both networks: {}",
+        err
+    );
+    // And it must name the network the way --network takes it, or it sends
+    // the reader somewhere that does not parse.
+    assert!(
+        err.contains("--network regtest"),
+        "the message must give a usable --network value: {}",
+        err
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

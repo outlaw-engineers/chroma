@@ -142,6 +142,23 @@ new_target = old_target × actual_time / target_time
 
 **変化幅:** 0.25×〜4× / adjustment
 
+**Genesis Target:** `0x1f100000`（compact表現）。1ブロックあたり約 2¹² ハッシュ。
+
+Bitcoinのdifficulty 1（`0x1d00ffff`、約 2³² ハッシュ）は使わない。あれは
+SHA-256を10分間隔で回すチェーンの値であり、RandomXは意図的に低速で、
+本チェーンの目標間隔は10秒である。同じ値を使うと最初の1ブロックに数日から
+数年かかり、しかも難易度調整は10ブロックごとに最大4倍しか緩まないため、
+**掘れないチェーンは緩くもならない**。
+
+したがって、この値は低め（易しい側）に外すこと。易しすぎた場合は最初の
+数十ブロックが速く出るだけで、10ブロックごとの調整が自動的に締める。
+難しすぎた場合は回復手段がない。
+
+**Target Bounds:** 調整が生成しうる範囲は `[min_target, max_target]`。
+`max_target` はGenesis Targetの4倍（1回ぶんの緩和幅）とし、Genesis Targetが
+この範囲の内側にあること。範囲外にすると最初の調整でGenesis Targetの設定が
+無効化される。
+
 **最初の調整:** height 10。GenesisからBlock 10までのtimestampを使用する。
 
 **演算:** overflow防止のため、intermediate calculationにはu256を使用する。

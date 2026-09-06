@@ -86,6 +86,159 @@ impl From<chroma_core::error::CoreError> for P2pError {
 
 /// A fresh random payout address, so two nodes started the same way do not
 /// mine to the same account.
+/// A request to the mining thread: search `max_nonces` for a solution.
+struct MineRequest {
+    block: chroma_block::Block,
+    max_nonces: u64,
+    pow: chroma_consensus::miner::PowContext,
+    reply: tokio::sync::oneshot::Sender<Option<chroma_block::Block>>,
+}
+
+/// The fast-mode hasher, wrapped so consensus can drive it.
+#[allow(dead_code)]
+struct DatasetHasher(chroma_crypto::randomx::Miner);
+
+impl chroma_consensus::miner::HeaderHasher for DatasetHasher {
+    fn hash_header(&self, header: &chroma_block::BlockHeader) -> chroma_core::error::Result<Hash> {
+        use chroma_core::serialize::CanonicalEncode;
+        self.0
+            .hash(&header.encode())
+            .map_err(|e| chroma_core::error::CoreError::InvalidProofOfWork(e.to_string()))
+    }
+}
+
+/// Hash on a thread of its own, holding RandomX's full dataset.
+///
+/// Two reasons this is not a task. RandomX's VM and dataset are neither `Send`
+/// nor `Sync`, so they cannot be held across an await in a spawned task at
+/// all. And the search is flat-out CPU work: run on a runtime worker it starves
+/// everything else the node is doing, which for a node whose job is answering
+/// peers is the more expensive of the two problems.
+///
+/// The dataset is about 2 GiB and takes a minute or more to build, so it is
+/// built once per epoch seed and kept. Verification does not use it — see
+/// `chroma_crypto::randomx::Miner`.
+fn run_mining_thread(rx: std::sync::mpsc::Receiver<MineRequest>) {
+    use chroma_consensus::miner::mine_block_with;
+    use chroma_crypto::randomx::PowAlgorithm;
+
+    let mut fast: Option<DatasetHasher> = None;
+
+    while let Ok(request) = rx.recv() {
+        let MineRequest {
+            mut block,
+            max_nonces,
+            pow,
+            reply,
+        } = request;
+
+        // Blake3 needs nothing kept; RandomX wants the dataset for this
+        // epoch's seed, rebuilt when the epoch turns.
+        if pow.algorithm == PowAlgorithm::RandomX
+            && fast.as_ref().map(|f| f.0.seed()) != Some(pow.seed)
+        {
+            // Say so: a minute of silence at an epoch boundary is otherwise
+            // indistinguishable from the miner having died.
+            println!(
+                "Building the RandomX dataset for epoch seed {} (a minute or so, ~2 GiB)...",
+                &pow.seed.to_hex()[..16]
+            );
+            fast = match chroma_crypto::randomx::Miner::new(&pow.seed) {
+                Ok(miner) => {
+                    println!("RandomX dataset ready.");
+                    Some(DatasetHasher(miner))
+                }
+                Err(e) => {
+                    // Fall back to hashing from the cache. Slower by roughly
+                    // five times, but mining that is slow beats mining that
+                    // has stopped.
+                    eprintln!("RandomX dataset unavailable ({}); mining from the cache.", e);
+                    None
+                }
+            };
+        }
+
+        let found = match &fast {
+            Some(hasher) if pow.algorithm == PowAlgorithm::RandomX => {
+                mine_block_with(&mut block, max_nonces, hasher)
+            }
+            _ => mine_block_with(&mut block, max_nonces, &pow),
+        };
+
+        // A closed reply channel means the node is shutting down.
+        if reply.send(found.ok().map(|()| block)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Check that a data directory belongs to the network we are about to run.
+///
+/// A data directory holds one network's chain, and nothing about the files
+/// says which. Opening a regtest directory as devnet used to load those blocks
+/// as devnet history — blocks mined under a target no real network would
+/// accept, now presented to peers as fact — because the genesis hash was
+/// written at creation and never read back.
+///
+/// Called before the node opens its storage for real. The database is closed
+/// again on return, so the node's own exclusive lock is unaffected.
+pub fn check_data_dir_network(
+    data_dir: &std::path::Path,
+    params: chroma_consensus::ChainParams,
+) -> std::result::Result<(), String> {
+    if !data_dir.exists() {
+        return Ok(());
+    }
+
+    let storage = match chroma_storage::Storage::open(data_dir) {
+        Ok(storage) => storage,
+        // Not our problem to report: the node will open it next and fail with
+        // a better message than we could give here.
+        Err(_) => return Ok(()),
+    };
+
+    let stored = match storage.get_genesis_hash() {
+        Ok(Some(hash)) => hash,
+        // A directory with no genesis recorded is either empty or predates
+        // this check; either way there is nothing to contradict.
+        _ => return Ok(()),
+    };
+
+    let expected = chroma_consensus::build_genesis_block_with(&params).hash();
+    if stored == expected {
+        return Ok(());
+    }
+
+    // Name the network the directory actually holds where we can, since
+    // "wrong network" is only useful with the right one attached.
+    let found = [
+        chroma_consensus::ChainParams::mainnet(),
+        chroma_consensus::ChainParams::testnet(),
+        chroma_consensus::ChainParams::devnet(),
+        chroma_consensus::ChainParams::regtest(),
+    ]
+    .into_iter()
+    .find(|candidate| chroma_consensus::build_genesis_block_with(candidate).hash() == stored);
+
+    match found {
+        // Named the way `--network` takes it: the message tells the reader
+        // what to pass, and the protocol name (`chroma-regtest`) is not it.
+        Some(candidate) => Err(format!(
+            "{} holds a chain for {}, but this node was started as {}.\nUse --network {} for this directory, or a different --data-dir.",
+            data_dir.display(),
+            candidate.network.as_str(),
+            params.network.as_str(),
+            candidate.cli_name(),
+        )),
+        None => Err(format!(
+            "{} holds a chain for an unknown network (genesis {}), but this node was started as {}.\nUse a different --data-dir.",
+            data_dir.display(),
+            stored.to_hex(),
+            params.network.as_str(),
+        )),
+    }
+}
+
 pub fn random_address() -> chroma_core::types::Address {
     let secret = chroma_crypto::schnorr::SecretKey32::generate();
     let pubkey = chroma_crypto::schnorr::PublicKey32::from_secret(&secret)
@@ -1912,11 +2065,28 @@ impl Node {
         mut shutdown: broadcast::Receiver<()>,
     ) {
         use chroma_consensus::miner::{
-            assemble_block, mine_block_with_limit, next_block_timestamp, timestamp_is_valid,
-            BlockAssemblyContext, PowContext,
+            assemble_block, next_block_timestamp, timestamp_is_valid, BlockAssemblyContext,
+            PowContext,
         };
         use chroma_core::types::BlockHeight;
 
+        // The search runs on a thread of its own: it is pure CPU work, and
+        // the fast-mode hasher it uses cannot cross threads. Dropping this
+        // sender when the loop ends is what stops that thread.
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<MineRequest>();
+        let hashing_thread = std::thread::Builder::new()
+            .name("chroma-miner".to_string())
+            .spawn(move || run_mining_thread(work_rx));
+        let hashing_thread = match hashing_thread {
+            Ok(handle) => handle,
+            Err(e) => {
+                let _ = event_tx.send(NodeEvent::Error(format!(
+                    "cannot start the mining thread: {}",
+                    e
+                )));
+                return;
+            }
+        };
 
         loop {
             // Checked between rounds; a round in progress finishes first.
@@ -1980,9 +2150,28 @@ impl Node {
             };
 
             match assemble_block(&ctx, &candidates, &parent_state) {
-                Ok(mut block) => {
-                    match mine_block_with_limit(&mut block, 10_000_000, &pow) {
-                        Ok(()) => {
+                Ok(block) => {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if work_tx
+                        .send(MineRequest {
+                            block,
+                            max_nonces: 10_000_000,
+                            pow,
+                            reply: reply_tx,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    // Await the result rather than blocking: the runtime is
+                    // free to answer peers while the round runs.
+                    let solved = tokio::select! {
+                        _ = shutdown.recv() => break,
+                        solved = reply_rx => solved,
+                    };
+                    match solved {
+                        Ok(Some(block)) => {
                             // Mining can take a while; if the stamp has gone
                             // stale meanwhile, rebuild rather than submit a
                             // block our own validation would reject.
@@ -2061,28 +2250,38 @@ impl Node {
                                 }
                             }
                         }
-                        Err(_) => {
+                        // The nonce budget ran out without a solution.
+                        // Rebuild the block: the tip or the mempool may have
+                        // moved while we searched.
+                        Ok(None) => {
                             tokio::select! {
-                                _ = shutdown.recv() => return,
+                                _ = shutdown.recv() => break,
                                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                             }
                         }
+                        // The thread is gone, so nothing can be mined.
+                        Err(_) => break,
                     }
                 }
                 Err(e) => {
                     eprintln!("Block assembly failed: {}", e);
                     tokio::select! {
-                        _ = shutdown.recv() => return,
+                        _ = shutdown.recv() => break,
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                     }
                 }
             }
 
             tokio::select! {
-                _ = shutdown.recv() => return,
+                _ = shutdown.recv() => break,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
+
+        // Closing the queue ends the thread; joining it means the dataset is
+        // released before the node reports itself stopped.
+        drop(work_tx);
+        let _ = hashing_thread.join();
     }
 
     pub fn connect(&self, peer: crate::peer::PeerAddress) {
