@@ -447,6 +447,26 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
+            // A build without the `randomx` feature cannot hash a header for
+            // any network that uses RandomX, so it can neither mine nor
+            // validate there. Refuse at startup: the alternative is a node
+            // that runs, connects, and silently rejects every block it is
+            // sent, which looks like a network problem rather than a build
+            // that is missing a feature.
+            if params.pow == chroma_crypto::randomx::PowAlgorithm::RandomX
+                && !chroma_crypto::randomx::randomx_available()
+            {
+                eprintln!(
+                    "This build has no RandomX support, so it cannot validate or mine on {}.",
+                    params.network.as_str()
+                );
+                eprintln!(
+                    "Rebuild with the 'randomx' feature (the default; it needs cmake and a"
+                );
+                eprintln!("C++ toolchain), or run with --network regtest.");
+                std::process::exit(1);
+            }
+
             // The identity lives in the data directory so a restarted node
             // keeps the id its peers know it by. A fresh key every run would
             // make `--connect` entries go stale on every restart.

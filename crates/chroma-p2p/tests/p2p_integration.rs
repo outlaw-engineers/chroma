@@ -601,7 +601,13 @@ async fn node_syncs_headers_from_a_longer_peer() {
     while std::time::Instant::now() < deadline && !refused {
         while let Ok(event) = events.try_recv() {
             if let NodeEvent::Error(msg) = &event {
-                if msg.contains("does not meet its target") {
+                // Either reason is a refusal. A build without the `randomx`
+                // feature cannot compute the hash for this network at all, so
+                // it turns the header away a step earlier — which is the
+                // behaviour that build is asking for.
+                if msg.contains("does not meet its target")
+                    || msg.contains("cannot compute proof of work")
+                {
                     refused = true;
                 }
             }

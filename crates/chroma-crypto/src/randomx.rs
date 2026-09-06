@@ -57,6 +57,7 @@ pub fn pow_hash(algorithm: PowAlgorithm, seed: &Hash, header_bytes: &[u8]) -> Re
 
 /// How many epoch caches to keep. Two covers the boundary, where blocks from
 /// the previous epoch are still being validated while the new one starts.
+#[cfg(feature = "randomx")]
 const CACHE_SLOTS: usize = 2;
 
 #[cfg(feature = "randomx")]

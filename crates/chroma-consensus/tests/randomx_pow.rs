@@ -3,6 +3,11 @@
 //! Uses the regtest *target* with the RandomX *function*, so the real hash is
 //! exercised without needing difficulty-1 work: a solution is a couple of
 //! hashes away, and each costs tens of milliseconds.
+//!
+//! Skipped without the `randomx` feature, where there is no RandomX to test:
+//! that build cannot hash a header for any network but regtest, which is the
+//! point of it.
+#![cfg(feature = "randomx")]
 
 use chroma_block::{validate_block, BlockValidationContext};
 use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext, PowContext};
