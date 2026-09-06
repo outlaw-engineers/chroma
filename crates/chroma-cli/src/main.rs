@@ -709,6 +709,14 @@ async fn main() -> anyhow::Result<()> {
                                 println!("Chain tip: {}", tip.hash.to_hex());
                                 let supply_chr = tip.supply as f64 / 1_000_000.0;
                                 println!("Supply: {} CHR ({} units)", supply_chr, tip.supply);
+                                match storage.get_header(tip.height) {
+                                    Ok(Some(header)) => println!(
+                                        "Difficulty: about 2^{} hashes per block (bits {:#010x})",
+                                        header.bits.expected_hashes_log2(),
+                                        header.bits.0
+                                    ),
+                                    _ => println!("Difficulty: unknown (no header stored)"),
+                                }
                             }
                             Ok(None) => {
                                 println!("No chain found. Start the node to initialize.");

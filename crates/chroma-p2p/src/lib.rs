@@ -2074,6 +2074,10 @@ impl Node {
         };
         use chroma_core::types::BlockHeight;
 
+        // Remembered so a retarget is reported as a change rather than
+        // repeated on every block.
+        let mut last_bits: Option<chroma_core::types::CompactTarget> = None;
+
         // The search runs on a thread of its own: it is pure CPU work, and
         // the fast-mode hasher it uses cannot cross threads. Dropping this
         // sender when the loop ends is what stops that thread.
@@ -2227,6 +2231,28 @@ impl Node {
                                     }
                                     let _ = event_tx.send(NodeEvent::BlockMined(block_hash, height));
                                     println!("Mined block #{}: {}", height, block_hash.to_hex());
+
+                                    // Only when it moves. Every block would be
+                                    // noise, but a retarget is what an operator
+                                    // wants to see, and there is no other way
+                                    // to watch it: the database cannot be read
+                                    // while the node holds it.
+                                    if Some(block.header.bits) != last_bits {
+                                        match last_bits {
+                                            Some(previous) => println!(
+                                                "Difficulty: 2^{} -> 2^{} hashes per block (bits {:#010x})",
+                                                previous.expected_hashes_log2(),
+                                                block.header.bits.expected_hashes_log2(),
+                                                block.header.bits.0
+                                            ),
+                                            None => println!(
+                                                "Difficulty: about 2^{} hashes per block (bits {:#010x})",
+                                                block.header.bits.expected_hashes_log2(),
+                                                block.header.bits.0
+                                            ),
+                                        }
+                                        last_bits = Some(block.header.bits);
+                                    }
 
                                     // Announce it, or the block never leaves
                                     // this node and the network forks.

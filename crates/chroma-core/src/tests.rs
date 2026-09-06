@@ -2,6 +2,38 @@
 
 #[cfg(test)]
 mod tests {
+
+    /// The number an operator reads off the screen, so it should be the real
+    /// expected work and not the leading-zero shorthand — those differ by one
+    /// exactly where the genesis target sits.
+    #[test]
+    fn test_expected_hashes_log2() {
+        use crate::types::CompactTarget;
+
+        // Bitcoin's difficulty 1 is the textbook 2^32.
+        assert_eq!(CompactTarget::DIFFICULTY_1.expected_hashes_log2(), 32);
+
+        // Chroma's genesis target, which the spec defines as about 2^12.
+        assert_eq!(
+            CompactTarget(crate::constants::GENESIS_TARGET_BITS).expected_hashes_log2(),
+            12
+        );
+
+        // Four times easier is two powers of two cheaper.
+        let genesis = CompactTarget(crate::constants::GENESIS_TARGET_BITS);
+        let easier = CompactTarget::from_full_target(&{
+            let mut t = genesis.to_full_target();
+            // Shift the whole target left by two bits: 4x larger, 4x easier.
+            let mut carry = 0u8;
+            for byte in t.iter_mut().rev() {
+                let next = *byte >> 6;
+                *byte = (*byte << 2) | carry;
+                carry = next;
+            }
+            t
+        });
+        assert_eq!(easier.expected_hashes_log2(), 10);
+    }
     use crate::constants::*;
     use crate::hash::{Hash, Hash160};
     use crate::serialize::*;
