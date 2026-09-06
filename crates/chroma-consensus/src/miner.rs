@@ -4,7 +4,7 @@
 //! and performs proof of work using the network's algorithm.
 
 use chroma_core::constants::{
-    BLOCK_REWARD_UNITS, MAX_FUTURE_TIMESTAMP_OFFSET, MAX_TXS_PER_SENDER_PER_BLOCK,
+    BLOCK_REWARD_UNITS, MAX_FUTURE_TIMESTAMP_OFFSET,
 };
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
@@ -75,37 +75,20 @@ pub fn assemble_block(
     let mut transactions = Vec::with_capacity(1 + mempool_txs.len());
     transactions.push(coinbase);
 
-    // Mirrors the consensus rule validation applies: at most
-    // MAX_TXS_PER_SENDER_PER_BLOCK from any one account. Without this the
-    // miner happily builds a block its own validation then rejects.
-    let mut per_sender: std::collections::HashMap<chroma_core::types::Address, usize> =
-        std::collections::HashMap::new();
-
     let budget = MAX_BLOCK_TXS.saturating_sub(1);
-    for tx in mempool_txs.iter() {
-        if transactions.len() > budget {
-            break;
-        }
+    for tx in mempool_txs.iter().take(budget) {
         if tx.is_coinbase() || !tx.verify_signature() {
-            continue;
-        }
-        let sender = tx.sender_address();
-        // Skipped, not stopped: the mempool holds other senders' transactions
-        // behind this one, and taking `budget` off the front would have hidden
-        // them behind whoever sent the most.
-        if per_sender.get(&sender).copied().unwrap_or(0) >= MAX_TXS_PER_SENDER_PER_BLOCK {
             continue;
         }
         // A transaction that does not apply here (stale nonce, spent balance)
         // would make the whole block invalid, so it is left out rather than
         // included and hoped for.
         if working
-            .apply_transaction(&sender, &tx.recipient, tx.amount.0, tx.nonce.0)
+            .apply_transaction(&tx.sender_address(), &tx.recipient, tx.amount.0, tx.nonce.0)
             .is_err()
         {
             continue;
         }
-        *per_sender.entry(sender).or_insert(0) += 1;
         transactions.push(tx.clone());
     }
 
