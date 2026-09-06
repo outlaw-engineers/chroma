@@ -8,10 +8,30 @@ use crate::peer::{PeerAddress, PeerManager};
 /// assigned; peers are supplied with `--connect` in the meantime.
 pub const SEED_NODES: &[&str] = &[];
 
-/// DNS seeds. Each name carries TXT records naming bootstrap nodes; see
-/// `SEED_RECORD.md` in the repository root for the exact format and the
+/// DNS seeds for mainnet. Each name carries TXT records naming bootstrap
+/// nodes; see `SEED_RECORD.md` in the repository root for the format and the
 /// current contents of the record.
 pub const DNS_SEEDS: &[&str] = &["seed.chroma.org.uk"];
+
+/// The seeds a network bootstraps from.
+///
+/// Seeds are network-specific: the entries under `seed.chroma.org.uk` name
+/// mainnet nodes, and a node on another network reaching one would spend a
+/// dial on a peer it can never agree with. regtest is local by definition and
+/// has none; testnet and devnet have no published records yet, and inheriting
+/// mainnet's would be worse than having none.
+///
+/// This mattered the moment the record went live: every regtest node — the
+/// whole test suite — started dialing a mainnet node on the public internet
+/// and waiting out the timeout.
+pub fn dns_seeds_for(network: chroma_core::types::NetworkId) -> &'static [&'static str] {
+    use chroma_core::types::NetworkId;
+
+    match network {
+        NetworkId::Mainnet => DNS_SEEDS,
+        NetworkId::Testnet | NetworkId::Devnet | NetworkId::Regtest | NetworkId::Unknown => &[],
+    }
+}
 
 /// Prefix every seed TXT string carries.
 ///
@@ -58,6 +78,7 @@ impl Discovery {
         &mut self,
         peer_manager: Arc<RwLock<PeerManager>>,
         connect_addrs: &[PeerAddress],
+        network: chroma_core::types::NetworkId,
     ) -> Vec<PeerAddress> {
         let mut found = Vec::new();
 
@@ -72,7 +93,7 @@ impl Discovery {
         // Seeds publish `<node-id>.<noise-key>@host:port` entries: XK needs
         // the static key to connect, and the identity to know it reached the
         // node it meant to.
-        for seed in SEED_NODES.iter().chain(DNS_SEEDS.iter()) {
+        for seed in SEED_NODES.iter().chain(dns_seeds_for(network).iter()) {
             if self.seed_failures >= MAX_SEED_FAILURES {
                 break;
             }
@@ -92,6 +113,27 @@ impl Discovery {
         }
 
         found
+    }
+
+    /// Peers from the DNS seeds for a network, for a client that has no node
+    /// of its own.
+    ///
+    /// `tx send` needs somewhere to hand a transaction to. Making the caller
+    /// name a node by its full address means you cannot use the wallet
+    /// without already running one — which is what the seed record exists to
+    /// avoid.
+    pub async fn seed_peers(network: chroma_core::types::NetworkId) -> Vec<PeerAddress> {
+        let mut peers = Vec::new();
+        for seed in SEED_NODES.iter().chain(dns_seeds_for(network).iter()) {
+            if let Some(found) = Self::resolve_seed(seed).await {
+                for peer in found {
+                    if !peers.contains(&peer) {
+                        peers.push(peer);
+                    }
+                }
+            }
+        }
+        peers
     }
 
     /// Resolve one seed entry into peers.
@@ -213,6 +255,7 @@ impl Discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_core::types::NetworkId;
     use chroma_crypto::noise::{NodeId, NoiseKey};
     use std::net::SocketAddr;
 
@@ -244,7 +287,7 @@ mod tests {
         let b = peer(8334);
 
         let mut d = Discovery::new();
-        let found = d.discover_peers(pm.clone(), &[a, b]).await;
+        let found = d.discover_peers(pm.clone(), &[a, b], NetworkId::Regtest).await;
         assert!(
             found.starts_with(&[a, b]),
             "configured peers must be reported back, got {:?}",
@@ -257,7 +300,7 @@ mod tests {
         drop(guard);
 
         // Already-known peers are not reported a second time.
-        let again = d.discover_peers(pm.clone(), &[a, b]).await;
+        let again = d.discover_peers(pm.clone(), &[a, b], NetworkId::Regtest).await;
         assert!(!again.contains(&a));
         assert!(!again.contains(&b));
     }
@@ -284,7 +327,7 @@ mod tests {
         let pm = Arc::new(RwLock::new(PeerManager::new()));
         let mut d = Discovery::new();
         for _ in 0..MAX_SEED_FAILURES + 2 {
-            let _ = d.discover_peers(pm.clone(), &[]).await;
+            let _ = d.discover_peers(pm.clone(), &[], NetworkId::Regtest).await;
         }
         assert!(d.seed_failures() <= MAX_SEED_FAILURES);
     }
@@ -363,6 +406,22 @@ mod tests {
         }
     }
 
+    /// Seeds belong to a network. The published record names mainnet nodes,
+    /// so a regtest node reaching for it would dial a peer on the public
+    /// internet that it can never agree with — which is exactly what the
+    /// whole test suite started doing the day the record went live.
+    #[test]
+    fn test_only_mainnet_has_dns_seeds() {
+        assert_eq!(dns_seeds_for(NetworkId::Mainnet), DNS_SEEDS);
+        for network in [NetworkId::Testnet, NetworkId::Devnet, NetworkId::Regtest] {
+            assert!(
+                dns_seeds_for(network).is_empty(),
+                "{:?} has no published seed record to use",
+                network
+            );
+        }
+    }
+
     /// Live check against the published record, for whoever is editing the
     /// zone. Ignored by default: it needs working DNS and the record to exist,
     /// neither of which a test run should depend on.
@@ -371,7 +430,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires DNS and a published seed record"]
     async fn live_seed_record_resolves() {
-        for seed in DNS_SEEDS {
+        for seed in dns_seeds_for(NetworkId::Mainnet) {
             let peers = Discovery::resolve_seed(seed)
                 .await
                 .unwrap_or_else(|| panic!("{} published no usable seed entries", seed));

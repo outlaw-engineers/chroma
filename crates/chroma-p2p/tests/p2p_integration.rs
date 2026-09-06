@@ -1663,6 +1663,16 @@ async fn a_data_directory_belongs_to_one_network() {
         node.shutdown().await;
     }
 
+    // `shutdown` stops the node's tasks, but detached connection handlers can
+    // hold a clone of the storage for a moment longer, and sled's lock goes
+    // with the last one. The check treats a database it cannot open as
+    // nothing to contradict — correct in production, where the node is about
+    // to fail on the same lock — so wait for the lock rather than race it.
+    wait_for("the storage lock to be released", || async {
+        chroma_p2p::check_data_dir_network(&dir, devnet).is_err()
+    })
+    .await;
+
     // Reopening it as regtest is fine; as devnet it is not.
     assert!(chroma_p2p::check_data_dir_network(&dir, regtest).is_ok());
     let err = chroma_p2p::check_data_dir_network(&dir, devnet)

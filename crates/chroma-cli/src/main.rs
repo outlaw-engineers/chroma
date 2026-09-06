@@ -46,6 +46,17 @@ enum Commands {
         #[arg(short, long, default_value = "default")]
         name: String,
     },
+    /// Print this node's identity without starting it.
+    ///
+    /// Creates the key if the data directory does not have one yet, so a
+    /// seed record can be written before the node is first run.
+    NodeId {
+        #[arg(long, default_value = "chroma_data")]
+        data_dir: PathBuf,
+        /// Address to show the identity with, as it would be dialed.
+        #[arg(long, default_value = "127.0.0.1:8333")]
+        listen: SocketAddr,
+    },
     /// Build, sign and submit a transaction.
     Tx {
         #[command(subcommand)]
@@ -67,11 +78,13 @@ enum TxCommands {
         /// Amount in units (1 CHR = 1,000,000 units).
         #[arg(long)]
         amount: u64,
-        /// Node to submit to, as `<node-id>.<noise-key>@host:port`. The
-        /// connection is encrypted, so the node's keys are needed to open it
-        /// — take them from the node's startup log.
+        /// Node to submit to, as `<node-id>.<noise-key>@host:port`. Omit it
+        /// to use whatever the network's DNS seed publishes.
         #[arg(long)]
-        node: chroma_p2p::peer::PeerAddress,
+        node: Option<chroma_p2p::peer::PeerAddress>,
+        /// Network whose seed to ask when --node is omitted.
+        #[arg(long, default_value = "mainnet")]
+        network: String,
         /// Sender's next nonce. Read from --data-dir when omitted.
         #[arg(long)]
         nonce: Option<u64>,
@@ -218,7 +231,14 @@ impl NodeClient {
         use chroma_crypto::noise::{Handshake, NodeKeypair};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = tokio::net::TcpStream::connect(node.socket).await?;
+        // Bounded: a seed can name a node that is firewalled or gone, and
+        // the caller should move on to the next rather than wait forever.
+        let mut stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(node.socket),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("connection to {} timed out", node.socket))??;
 
         // A throwaway identity: this connection exists to hand over one
         // transaction, and a stable key would only let nodes correlate the
@@ -521,9 +541,12 @@ async fn main() -> anyhow::Result<()> {
             }
             let mut node = chroma_p2p::Node::new(config);
             // Printed in the form a peer would pass to --connect, since that
-            // is what an operator needs to hand out.
+            // is what an operator needs to hand out — and with the file it
+            // came from, because the identity follows the data directory and
+            // "why did it change?" is otherwise unanswerable from the log.
             println!(
-                "Node identity: {}.{}@{}",
+                "Node identity (from {}): {}.{}@{}",
+                data_dir.join("node_key").display(),
                 node.node_id().to_hex(),
                 node.noise_key().to_hex(),
                 listen
@@ -709,9 +732,45 @@ async fn main() -> anyhow::Result<()> {
                 to,
                 amount,
                 node,
+                network,
                 nonce,
                 data_dir,
             } => {
+                // Without an explicit node, ask the seed. A wallet that can
+                // only be used by someone already running a node is not much
+                // of a wallet, and the seed record exists precisely so that
+                // one address is enough to find the network.
+                let candidates = match node {
+                    Some(node) => vec![node],
+                    None => {
+                        let params = match chroma_consensus::ChainParams::parse(&network) {
+                            Some(p) => p,
+                            None => {
+                                eprintln!(
+                                    "Unknown network '{}'. Expected devnet, testnet, mainnet or regtest.",
+                                    network
+                                );
+                                std::process::exit(1);
+                            }
+                        };
+                        let found = chroma_p2p::discovery::Discovery::seed_peers(
+                            params.network,
+                        )
+                        .await;
+                        if found.is_empty() {
+                            eprintln!(
+                                "No node given and the {} seed published none.",
+                                params.network.as_str()
+                            );
+                            eprintln!("Pass --node <node-id>.<noise-key>@host:port.");
+                            std::process::exit(1);
+                        }
+                        for peer in &found {
+                            println!("From the seed: {}", peer);
+                        }
+                        found
+                    }
+                };
                 let passphrase = ask_passphrase("Wallet passphrase: ", false)?;
                 let wallet =
                     match chroma_wallet::keystore::load(&data_dir, &wallet_name, &passphrase) {
@@ -764,15 +823,57 @@ async fn main() -> anyhow::Result<()> {
                 println!("Amount: {} units", amount);
                 println!("Nonce:  {}", next_nonce);
 
-                match submit_transaction(&node, &tx).await {
-                    Ok(()) => println!("Submitted to {}: {}", node.socket, tx_hash.to_hex()),
-                    Err(e) => {
-                        eprintln!("Submission failed: {}", e);
-                        std::process::exit(1);
+                // Try each candidate: a seed can name a node that is not
+                // answering just now, and that should cost a retry rather
+                // than the whole submission.
+                let mut last_error = None;
+                let mut submitted = false;
+                for peer in &candidates {
+                    match submit_transaction(peer, &tx).await {
+                        Ok(()) => {
+                            println!("Submitted to {}: {}", peer.socket, tx_hash.to_hex());
+                            submitted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("{}: {}", peer.socket, e);
+                            last_error = Some(e);
+                        }
                     }
+                }
+                if !submitted {
+                    eprintln!(
+                        "Submission failed: {}",
+                        last_error.map(|e| e.to_string()).unwrap_or_default()
+                    );
+                    std::process::exit(1);
                 }
             }
         },
+        Commands::NodeId { data_dir, listen } => {
+            let secret = load_or_create_node_key(&data_dir)?;
+            let identity = chroma_crypto::noise::NodeKeypair::from_secret(secret)
+                .map_err(|e| anyhow::anyhow!("invalid node secret: {}", e))?;
+            println!("Key file: {}", data_dir.join("node_key").display());
+            println!("Node ID:  {}", identity.node_id().to_hex());
+            println!("Noise key:{}", identity.noise_key().to_hex());
+            println!();
+            println!("As a peer would dial it:");
+            println!(
+                "  {}.{}@{}",
+                identity.node_id().to_hex(),
+                identity.noise_key().to_hex(),
+                listen
+            );
+            println!();
+            println!("As a DNS seed TXT record (substitute the public address):");
+            println!(
+                "  chroma-seed={}.{}@{}",
+                identity.node_id().to_hex(),
+                identity.noise_key().to_hex(),
+                listen
+            );
+        }
         Commands::Mnemonic { name } => {
             let phrase = chroma_wallet::generate_seed_phrase();
             let wallet = chroma_wallet::wallet_from_seed_phrase(&name, &phrase)?;

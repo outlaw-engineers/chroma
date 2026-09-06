@@ -699,7 +699,11 @@ impl Node {
 
         let discovered = self
             .discovery
-            .discover_peers(self.peer_manager.clone(), &self.config.connect_addrs)
+            .discover_peers(
+                self.peer_manager.clone(),
+                &self.config.connect_addrs,
+                self.config.params.network,
+            )
             .await;
 
         let outbound_rx = self.outbound_rx.take().expect("run() called twice");
