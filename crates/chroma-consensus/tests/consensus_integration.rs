@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use chroma_block::{Block, BlockHeader};
 use chroma_core::constants::{
     BLOCK_REWARD_UNITS, DIFFICULTY_ADJUSTMENT_WINDOW,
-    GENESIS_TARGET_BITS, GENESIS_TIMESTAMP, MAX_BLOCK_SIZE, MAX_MEMPOOL_TXS,
+    GENESIS_TARGET_BITS, GENESIS_TIMESTAMP, MAX_BLOCK_SIZE,
     MAX_TRANSACTION_SIZE, MTP_WINDOW, TARGET_BLOCK_TIME_SECS,
 };
 use chroma_core::error::CoreError;
@@ -633,47 +633,64 @@ fn test_state_root_deterministic() {
 
 #[test]
 fn test_mempool_add_and_remove() {
-    let mut mempool = chroma_p2p::mempool::Mempool::new();
+    use chroma_p2p::mempool::{Admission, Mempool};
+    use chroma_p2p::peer::AddressGroup;
 
-    let tx = Transaction {
-        sender_pubkey: PublicKey32([0u8; 32]),
-        recipient: bob_addr(),
-        amount: Amount(100_000),
-        nonce: Nonce(0),
-        signature: chroma_crypto::schnorr::Signature64([0u8; 64]),
-    };
+    let secret = SecretKey32::from_bytes([0x31; 32]).unwrap();
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let sender = Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)));
 
+    let mut state = State::new();
+    state.restore_account(&sender, chroma_state::Account::new(1_000_000, 0));
+
+    let tx =
+        chroma_tx::create_transaction(&secret, sender, bob_addr(), Amount(100_000), Nonce(0))
+            .unwrap();
     let tx_hash = Hash::blake3(&tx.encode());
-    mempool.add_transaction(tx.clone()).unwrap();
+
+    let mut mempool = Mempool::new();
+    let source = AddressGroup::V4([203, 0, 113]);
+    assert_eq!(
+        mempool.add_transaction(tx, source, &state, 0),
+        Ok(Admission::Accepted)
+    );
     assert!(mempool.has_transaction(&tx_hash));
 
     mempool.remove_transaction(&tx_hash);
     assert!(!mempool.has_transaction(&tx_hash));
+    assert_eq!(mempool.held_by(source), 0);
 }
 
 #[test]
-fn test_mempool_capacity_limit() {
-    let mut mempool = chroma_p2p::mempool::Mempool::new();
+fn test_mempool_refuses_transactions_nothing_backs() {
+    // This used to be a capacity test, and it passed by filling the pool with
+    // a hundred thousand unsigned transactions from an account that did not
+    // exist. That was the hole: a keypair and 132 bytes bought a slot, so
+    // flooding the pool cost nothing at all. None of them are taken now, and
+    // none reach the signature check either -- the empty account is caught
+    // first, which is what keeps a flood cheap to refuse.
+    use chroma_p2p::mempool::{Mempool, Rejection};
+    use chroma_p2p::peer::AddressGroup;
 
-    for i in 0..=MAX_MEMPOOL_TXS {
+    let state = State::new();
+    let mut mempool = Mempool::new();
+    let source = AddressGroup::V4([203, 0, 113]);
+
+    for i in 0..1_000u64 {
         let tx = Transaction {
-            sender_pubkey: PublicKey32([0u8; 32]),
+            sender_pubkey: PublicKey32([7u8; 32]),
             recipient: bob_addr(),
             amount: Amount(100_000),
-            nonce: Nonce(i as u64),
+            nonce: Nonce(i),
             signature: chroma_crypto::schnorr::Signature64([0u8; 64]),
         };
-        let _ = mempool.add_transaction(tx);
+        assert_eq!(
+            mempool.add_transaction(tx, source, &state, 0),
+            Err(Rejection::UnfundedSender)
+        );
     }
 
-    let overflow_tx = Transaction {
-        sender_pubkey: PublicKey32([0u8; 32]),
-        recipient: bob_addr(),
-        amount: Amount(100_000),
-        nonce: Nonce(MAX_MEMPOOL_TXS as u64),
-        signature: chroma_crypto::schnorr::Signature64([0u8; 64]),
-    };
-    assert!(mempool.add_transaction(overflow_tx).is_err());
+    assert!(mempool.is_empty());
 }
 
 // ============================================================================

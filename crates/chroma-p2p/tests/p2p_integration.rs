@@ -283,6 +283,37 @@ where
     }
 }
 
+/// A signed transaction from an account with a balance the node knows about.
+///
+/// The pool judges against effective state, so a transaction from an account
+/// holding nothing is refused before its signature is even looked at — which
+/// is the point of the check order, and means a test that wants one accepted
+/// has to fund the sender first.
+async fn funded_transaction(
+    node: &chroma_p2p::Node,
+    seed: u8,
+    nonce: u64,
+) -> chroma_tx::Transaction {
+    let secret = SecretKey32::from_bytes([seed; 32]).expect("valid secret");
+    let pubkey = PublicKey32::from_secret(&secret).unwrap();
+    let sender = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+    {
+        let cs = node.chain_state();
+        let mut cs = cs.write().await;
+        cs.state
+            .restore_account(&sender, chroma_state::Account::new(1_000_000, 0));
+    }
+    chroma_tx::create_transaction(
+        &secret,
+        sender,
+        Address::from_hash160(Hash160([0x77u8; 20])),
+        Amount(1_000),
+        Nonce(nonce),
+    )
+    .expect("failed to build transaction")
+}
+
+/// A structurally valid transaction from an account that does not exist.
 fn signed_transaction(nonce: u64) -> chroma_tx::Transaction {
     let secret = SecretKey32::generate();
     let pubkey = PublicKey32::from_secret(&secret).unwrap();
@@ -423,7 +454,7 @@ async fn received_transaction_enters_mempool() {
     let mut peer = RawPeer::connect(&node, 40_003).await;
     peer.handshake().await;
 
-    let tx = signed_transaction(0);
+    let tx = funded_transaction(&node, 0x51, 0).await;
     let tx_hash = chroma_core::hash::Hash::blake3(&tx.encode());
     peer.send(Message::new(MessageType::Tx, tx.encode())).await;
 
@@ -886,9 +917,19 @@ async fn transaction_reaches_a_peer_and_gets_mined() {
     .unwrap();
     let tx_hash = chroma_core::hash::Hash::blake3(&tx.encode());
     {
+        let cs = relay.chain_state();
+        let cs = cs.read().await;
         let pool = relay.mempool();
         let mut pool = pool.write().await;
-        pool.add_transaction(tx).unwrap();
+        // Submitted here rather than over a peer connection, so it is charged
+        // to the operator's own quota.
+        pool.add_transaction(
+            tx,
+            chroma_p2p::peer::AddressGroup::Local,
+            &cs.state,
+            chroma_consensus::now_secs(),
+        )
+        .unwrap();
     }
     // Announce it the way a peer would.
     relay.broadcast_transaction(tx_hash);
