@@ -322,7 +322,7 @@ chroma/
 * DNS Seed Operatorのgovernance
 * Light Client Protocol
 * RPC/API仕様（草案は [`protocol/RPC.md`](RPC.md)。プロトコルの一部ではない）
-* Mempoolポリシー（草案は [`protocol/MEMPOOL.md`](MEMPOOL.md)。合意規則ではない）
+* 資源制限ポリシー（草案は [`protocol/MEMPOOL.md`](MEMPOOL.md)。合意規則ではない）
 * Wallet Seed Phrase（Protocolでは規定しない。UX上の方式は別途検討する。
   リファレンス実装はBIP-39を用いる）
 * Testnet parameters（Mainnetとは異なる可能性がある）
