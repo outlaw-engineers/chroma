@@ -31,6 +31,25 @@ pub const MAX_DIFFICULTY_DECREASE_FACTOR: u64 = 4; // 4x max decrease per window
 pub const MAX_BLOCK_SIZE: usize = 1_048_576; // 1 MiB per spec
 pub const MAX_TRANSACTION_SIZE: usize = 65536; // 64 KiB per spec
 
+/// How many transactions one account may have in a single block.
+///
+/// A consensus rule, not a relay policy: a block carrying more than this from
+/// one sender is invalid, so it holds even against a miner who would rather
+/// ignore it. Every other lever against a flooded mempool is advisory, and a
+/// chain with no fees has no price to raise instead.
+///
+/// It does not stop an attacker who splits a balance across many accounts —
+/// nothing that counts per account can. What it does is put a floor under
+/// everyone else: no single account takes more than this share of a block.
+///
+/// Two, because blocks are ten seconds apart. One account sending more often
+/// than that is a service, and a service can hold more than one account.
+/// Erring low costs a determined attacker only more accounts, while erring
+/// high cannot be corrected without a hard fork.
+///
+/// The coinbase is exempt: it has no sender.
+pub const MAX_TXS_PER_SENDER_PER_BLOCK: usize = 2;
+
 /// Mempool limits
 pub const MAX_MEMPOOL_SIZE: usize = 50_000_000; // 50 MB
 pub const MAX_MEMPOOL_TXS: usize = 100_000;

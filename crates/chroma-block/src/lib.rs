@@ -16,7 +16,9 @@
 //!
 //! Block = header + transactions (LEB128 count + concatenated txs).
 
-use chroma_core::constants::{BLOCK_REWARD_UNITS, MAX_BLOCK_SIZE, MAX_SUPPLY_UNITS};
+use chroma_core::constants::{
+    BLOCK_REWARD_UNITS, MAX_BLOCK_SIZE, MAX_SUPPLY_UNITS, MAX_TXS_PER_SENDER_PER_BLOCK,
+};
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
 use chroma_core::serialize::{CanonicalDecode, CanonicalEncode};
@@ -344,6 +346,14 @@ pub fn validate_block(
         )));
     }
 
+    // How many transactions each sender has in this block. A block carrying
+    // more than MAX_TXS_PER_SENDER_PER_BLOCK from one account is invalid, so
+    // no account takes more than that share of a block no matter what the
+    // miner assembling it would prefer. The coinbase is not counted: it has
+    // no sender, and its "sender address" is whatever the zero key hashes to.
+    let mut per_sender: std::collections::HashMap<chroma_core::types::Address, usize> =
+        std::collections::HashMap::new();
+
     // Apply remaining transactions
     for tx in block.transactions.iter().skip(1) {
         // Transaction size check
@@ -362,13 +372,18 @@ pub fn validate_block(
             ));
         }
 
+        let sender = tx.sender_address();
+        let count = per_sender.entry(sender).or_insert(0);
+        *count += 1;
+        if *count > MAX_TXS_PER_SENDER_PER_BLOCK {
+            return Err(CoreError::InvalidBlock(format!(
+                "sender {} has {} transactions in this block, more than the {} allowed",
+                sender, count, MAX_TXS_PER_SENDER_PER_BLOCK
+            )));
+        }
+
         // Apply to state
-        working.apply_transaction(
-            &tx.sender_address(),
-            &tx.recipient,
-            tx.amount.0,
-            tx.nonce.0,
-        )?;
+        working.apply_transaction(&sender, &tx.recipient, tx.amount.0, tx.nonce.0)?;
     }
 
     // --- State root check ---
