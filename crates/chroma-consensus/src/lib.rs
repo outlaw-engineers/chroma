@@ -957,9 +957,14 @@ mod tests {
         }
 
         let target = calculate_target_for_height(10, &headers).unwrap();
-        let d_before = chroma_core::types::Difficulty::from_bits(CompactTarget(GENESIS_TARGET_BITS));
-        let d_after = chroma_core::types::Difficulty::from_bits(target);
-        assert!(d_after > d_before, "blocks too fast → difficulty increases");
+        // Compared as targets, not through `Difficulty`: that type is
+        // `difficulty_1_target / target` in integer arithmetic, so everything
+        // easier than Bitcoin's difficulty 1 — which is the whole early life
+        // of this chain — reports 0, and 0 > 0 proves nothing.
+        assert!(
+            harder_than(target, CompactTarget(GENESIS_TARGET_BITS)),
+            "blocks too fast → difficulty increases"
+        );
     }
 
     #[test]
@@ -984,9 +989,10 @@ mod tests {
         }
 
         let target = calculate_target_for_height(10, &headers).unwrap();
-        let d_before = chroma_core::types::Difficulty::from_bits(CompactTarget(GENESIS_TARGET_BITS));
-        let d_after = chroma_core::types::Difficulty::from_bits(target);
-        assert!(d_after < d_before, "blocks too slow → difficulty decreases");
+        assert!(
+            harder_than(CompactTarget(GENESIS_TARGET_BITS), target),
+            "blocks too slow → difficulty decreases"
+        );
     }
 
     #[test]
@@ -1012,12 +1018,15 @@ mod tests {
         }
 
         let target = calculate_target_for_height(10, &headers).unwrap();
-        let d_before = chroma_core::types::Difficulty::from_bits(CompactTarget(GENESIS_TARGET_BITS));
-        let d_after = chroma_core::types::Difficulty::from_bits(target);
+        let before = U256::from_be_bytes(&CompactTarget(GENESIS_TARGET_BITS).to_full_target());
+        let after = U256::from_be_bytes(&target.to_full_target());
 
-        assert!(d_after > d_before);
+        assert!(after < before, "blocks too fast → difficulty increases");
+        // The clamp is on the target, so the hardest it may become is a
+        // quarter of what it was.
+        let (floor, _) = before.div_rem(&U256::from_u64(MAX_DIFFICULTY_INCREASE_FACTOR));
         assert!(
-            d_after.0 <= d_before.0 * MAX_DIFFICULTY_INCREASE_FACTOR,
+            after >= floor,
             "increase clamped to {}x",
             MAX_DIFFICULTY_INCREASE_FACTOR
         );
@@ -1243,9 +1252,10 @@ mod tests {
         assert!(actual_time > 90, "actual_time should be > target_time for slower blocks");
 
         let target = calculate_target_for_height(10, &headers).unwrap();
-        let d_before = chroma_core::types::Difficulty::from_bits(CompactTarget(GENESIS_TARGET_BITS));
-        let d_after = chroma_core::types::Difficulty::from_bits(target);
-        assert!(d_after < d_before, "blocks slower than target → difficulty decreases");
+        assert!(
+            harder_than(CompactTarget(GENESIS_TARGET_BITS), target),
+            "blocks slower than target → difficulty decreases"
+        );
     }
 
     #[test]
@@ -1372,9 +1382,20 @@ mod tests {
         assert!(result.is_err(), "should fail with missing header");
     }
 
+    /// True when `a` is the harder target of the two: a smaller target is
+    /// harder, which is what consensus compares. `Difficulty` cannot be used
+    /// for this — it divides Bitcoin's difficulty-1 target by ours in integer
+    /// arithmetic, so every target easier than that reports 0.
+    fn harder_than(a: CompactTarget, b: CompactTarget) -> bool {
+        U256::from_be_bytes(&a.to_full_target()) < U256::from_be_bytes(&b.to_full_target())
+    }
+
+    /// Pinned deliberately: the genesis target is part of the genesis block,
+    /// so changing it changes the genesis hash and with it the identity of
+    /// every network. A test that has to be updated on purpose is the point.
     #[test]
     fn test_genesis_target_bits_value() {
-        assert_eq!(GENESIS_TARGET_BITS, 0x1d00ffff);
+        assert_eq!(GENESIS_TARGET_BITS, 0x1f100000);
     }
 
     #[test]

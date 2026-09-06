@@ -41,7 +41,17 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Genesis
 pub const GENESIS_TIMESTAMP: u64 = 1767225600; // 2026-01-01 00:00:00 UTC
-pub const GENESIS_TARGET_BITS: u32 = 0x1d00ffff; // Difficulty 1
+/// Genesis target: about 2^12 hashes per block.
+///
+/// Not Bitcoin's difficulty 1 (2^32). That number worked for a chain hashing
+/// SHA-256 on 2009 CPUs against a ten-minute target; RandomX is deliberately
+/// slow and the target here is ten seconds, so difficulty 1 would put the
+/// first block days to years away — and the retarget only moves 4x per ten
+/// blocks, so a chain that cannot mine cannot get easier either.
+///
+/// Erring low is the safe direction: too easy costs a few fast blocks before
+/// the retarget tightens, while too hard cannot be recovered from.
+pub const GENESIS_TARGET_BITS: u32 = 0x1f100000;
 
 /// Timestamp validation
 pub const MTP_WINDOW: usize = 7; // Median Time Past window
