@@ -771,9 +771,10 @@ impl Node {
         {
             let peer_mgr = self.peer_manager.clone();
             let tick_tx = outbound_tx.clone();
+            let pool = self.mempool.clone();
             let shutdown = self.shutdown_tx.subscribe();
             self.tasks.push(tokio::spawn(async move {
-                Self::run_peer_tick(peer_mgr, tick_tx, shutdown).await;
+                Self::run_peer_tick(peer_mgr, tick_tx, pool, shutdown).await;
             }));
         }
 
@@ -961,14 +962,18 @@ impl Node {
             };
 
             // The peer's real identity is not known until its version message
-            // arrives, so the slot is claimed inside handle_connection once
-            // the announced listen port is known. Only the crude inbound cap
-            // is applied here.
-            let over_capacity = {
-                let pm = ctx.peer_manager.read().await;
-                pm.inbound_count() >= crate::peer::MAX_INBOUND_PEERS
+            // arrives, so its slot in the peer table is claimed inside
+            // handle_connection. What is claimed here is a place in the
+            // inbound capacity, counted by address group.
+            //
+            // This used to test `inbound_count()`, which counts peers past
+            // their handshake — so sockets sitting mid-handshake were counted
+            // nowhere, and opening them was a way around the cap entirely.
+            let admission = {
+                let mut pm = ctx.peer_manager.write().await;
+                pm.admit_inbound(src)
             };
-            if over_capacity {
+            if admission != crate::peer::InboundAdmission::Accepted {
                 drop(stream);
                 continue;
             }
@@ -976,7 +981,14 @@ impl Node {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let event_tx = ctx.event_tx.clone();
-                if let Err(e) = Self::handle_connection(stream, src, ctx, None).await {
+                let result = Self::handle_connection(stream, src, ctx.clone(), None).await;
+                // Every path out of the connection, error or not. Leaking one
+                // of these shrinks the node's inbound capacity for good.
+                {
+                    let mut pm = ctx.peer_manager.write().await;
+                    pm.release_inbound(src);
+                }
+                if let Err(e) = result {
                     let _ = event_tx.send(NodeEvent::Error(format!("{}: {}", src, e)));
                 }
             });
@@ -1311,14 +1323,20 @@ impl Node {
         keyed: &mut bool,
         origin: ConnectionOrigin,
     ) -> Result<bool, P2pError> {
-        // Charge the message against the peer's allowance before doing any
-        // work on it.
+        // Charge the message against the peer's allowances before doing any
+        // work on it. Two allowances, because a count of messages does not
+        // bound bytes: MAX_MESSAGE_SIZE is 4 MiB and MSG_RATE_LIMIT is 100 a
+        // second, so counting messages alone permits 400 MiB/s from one peer.
         {
             let mut pm = ctx.peer_manager.write().await;
             if let Some(peer) = pm.get_peer_mut(peer_key) {
                 if !peer.allow_message() {
                     peer.score_bad(20);
                     return Err(P2pError::Protocol("peer exceeded its message rate".into()));
+                }
+                if !peer.allow_bytes(msg.payload.len() + crate::wire::HEADER_SIZE) {
+                    peer.score_bad(20);
+                    return Err(P2pError::Protocol("peer exceeded its byte rate".into()));
                 }
             }
         }
@@ -1507,24 +1525,22 @@ impl Node {
                     &msg.payload,
                 )?;
 
-                if !tx.verify_signature() {
-                    Self::penalize(ctx, peer_key, 10).await;
-                    let reject = RejectMessage {
-                        message: "tx".to_string(),
-                        code: 0x01,
-                        reason: "invalid signature".to_string(),
-                    };
-                    Self::send(out_tx, Message::new(MessageType::Reject, reject.encode())).await?;
-                    return Ok(true);
-                }
-
+                // The signature is no longer checked here. It is the most
+                // expensive check by three orders of magnitude, and the pool
+                // runs it last, after the cheap ones have thrown out anything
+                // from an account with no balance behind it.
                 let hash = Hash::blake3(&chroma_core::serialize::CanonicalEncode::encode(&tx));
-                let added = {
+                let source = crate::peer::AddressGroup::of(peer_key.ip());
+                let now = chroma_consensus::now_secs();
+                // Chain state first, then the pool: the mining loop takes them
+                // in that order too, and taking them in both orders deadlocks.
+                let outcome = {
+                    let cs = ctx.chain_state.read().await;
                     let mut pool = ctx.mempool.write().await;
-                    pool.add_transaction(tx)
+                    pool.add_transaction(tx, source, &cs.state, now)
                 };
-                match added {
-                    Ok(true) => {
+                match outcome {
+                    Ok(crate::mempool::Admission::Accepted) => {
                         let mut pm = ctx.peer_manager.write().await;
                         if let Some(peer) = pm.get_peer_mut(peer_key) {
                             peer.last_seen = Some(std::time::Instant::now());
@@ -1537,11 +1553,21 @@ impl Node {
                         Self::announce(ctx, InvType::Tx, hash, Some(*peer_key)).await;
                     }
                     // Already held: not an error, and not worth re-announcing.
-                    Ok(false) => {}
-                    Err(e) => {
-                        let _ = ctx
-                            .event_tx
-                            .send(NodeEvent::Error(format!("mempool rejected tx: {}", e)));
+                    Ok(crate::mempool::Admission::Duplicate) => {}
+                    Err(reason) => {
+                        // Losing a race for a nonce is what an honest peer
+                        // relaying in good faith looks like. Only the things
+                        // an honest peer would not have sent are charged.
+                        if reason.is_misbehaviour() {
+                            Self::penalize(ctx, peer_key, 10).await;
+                        }
+                        let reject = RejectMessage {
+                            message: "tx".to_string(),
+                            code: 0x01,
+                            reason: reason.to_string(),
+                        };
+                        Self::send(out_tx, Message::new(MessageType::Reject, reject.encode()))
+                            .await?;
                     }
                 }
                 Ok(true)
@@ -1654,6 +1680,23 @@ impl Node {
 
             MessageType::GetData => {
                 let req = GetDataMessage::decode(&msg.payload)?;
+
+                // A budget of its own, because this is the only request that
+                // reads the database. Charged to the ordinary message budget
+                // it would allow MAX_INVENTORY * MSG_RATE_LIMIT block reads a
+                // second, which is 50,000.
+                {
+                    let mut pm = ctx.peer_manager.write().await;
+                    if let Some(peer) = pm.get_peer_mut(peer_key) {
+                        if !peer.allow_getdata(req.inventory.len()) {
+                            peer.score_bad(10);
+                            return Err(P2pError::Protocol(
+                                "peer exceeded its getdata rate".into(),
+                            ));
+                        }
+                    }
+                }
+
                 let mut not_found = Vec::new();
 
                 for entry in req.inventory.into_iter().take(MAX_INVENTORY) {
@@ -2054,6 +2097,7 @@ impl Node {
     async fn run_peer_tick(
         peer_manager: Arc<RwLock<PeerManager>>,
         outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
+        mempool: Arc<RwLock<Mempool>>,
         mut shutdown: broadcast::Receiver<()>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
@@ -2094,6 +2138,15 @@ impl Node {
                 }
                 let msg = Message::new(MessageType::Ping, PingMessage { nonce }.encode());
                 let _ = outbound_tx.send(OutboundCommand::Send(addr, msg));
+            }
+
+            // Nothing is stuck for being too cheap when there are no fees,
+            // but a transaction whose sender advanced their nonce elsewhere
+            // will never be mined, and holding it costs a slot someone else
+            // could use.
+            {
+                let mut pool = mempool.write().await;
+                pool.expire(chroma_consensus::now_secs());
             }
 
             let mut pm = peer_manager.write().await;

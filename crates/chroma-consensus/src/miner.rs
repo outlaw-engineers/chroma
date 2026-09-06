@@ -13,8 +13,21 @@ use chroma_block::{Block, BlockHeader};
 use chroma_core::serialize::CanonicalEncode;
 use chroma_tx::Transaction;
 
-/// Maximum number of transactions to include in a block.
-const MAX_BLOCK_TXS: usize = 10_000;
+/// How many transactions fit in a block, coinbase included.
+///
+/// Derived rather than chosen. Transactions are a fixed 132 bytes and blocks
+/// are capped at 1 MiB, so the count follows from those two and a second
+/// number would only be a second source of truth. The previous constant here
+/// was 10,000, which is 1.32 MB of transactions — a full mempool would have
+/// produced a block over the size limit, which the miner's own validation
+/// then rejects.
+///
+/// The eight bytes are for the LEB128 transaction count, with room to spare.
+fn block_tx_capacity() -> usize {
+    use chroma_core::constants::MAX_BLOCK_SIZE;
+    let overhead = chroma_block::BlockHeader::SERIALIZED_SIZE + 8;
+    MAX_BLOCK_SIZE.saturating_sub(overhead) / Transaction::SERIALIZED_SIZE
+}
 
 /// Choose a timestamp for the next block.
 ///
@@ -75,7 +88,7 @@ pub fn assemble_block(
     let mut transactions = Vec::with_capacity(1 + mempool_txs.len());
     transactions.push(coinbase);
 
-    let budget = MAX_BLOCK_TXS.saturating_sub(1);
+    let budget = block_tx_capacity().saturating_sub(1);
     for tx in mempool_txs.iter().take(budget) {
         if tx.is_coinbase() || !tx.verify_signature() {
             continue;

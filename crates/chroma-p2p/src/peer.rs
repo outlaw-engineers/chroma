@@ -94,12 +94,110 @@ pub const VERSION_TIMEOUT_SECS: u64 = 10;
 pub const MSG_RATE_LIMIT: u32 = 100;
 pub const TX_RATE_LIMIT: u32 = 10;
 
+/// Bytes a peer may send us per second.
+///
+/// Message count alone does not bound bandwidth: `MAX_MESSAGE_SIZE` is 4 MiB
+/// and a hundred messages a second are allowed, so without this a single peer
+/// may legitimately push 400 MiB/s at us.
+pub const BYTE_RATE_LIMIT: usize = 1024 * 1024;
+
+/// Inventory entries a peer may ask for per second.
+///
+/// `GetData` gets a limit of its own because it is the only request that
+/// reads the database. One message carries up to `MAX_INVENTORY` entries and
+/// a hundred messages a second are allowed, so charging it to the ordinary
+/// message budget permits 50,000 block reads a second.
+pub const GETDATA_RATE_LIMIT: u32 = 50;
+
+/// Connections allowed from one address group (see [`AddressGroup`]).
+pub const MAX_CONNECTIONS_PER_GROUP: usize = 2;
+
+/// Connections allowed from one IPv6 site (/48), across all its /64s.
+pub const MAX_CONNECTIONS_PER_SITE: usize = 4;
+
+/// Inbound slots held back for address groups we have no connection from.
+///
+/// Without this an attacker who is inside every other limit can still take
+/// every inbound slot and leave the node unable to hear from anyone else.
+/// Outbound slots are not at risk: we choose those ourselves.
+pub const RESERVED_INBOUND_SLOTS: usize = 4;
+
+/// The unit a peer's resource use is counted under.
+///
+/// Not an address. A single IPv6 subscriber line is handed a /64, so counting
+/// by address would give one household 2^64 accounts, which is the same as no
+/// limit at all. /64 is roughly one line and /48 roughly one site, and both
+/// are counted so that a site cannot spread across its own /64s.
+///
+/// IPv4 is counted by /24: smaller than that is not routed separately, so it
+/// is the smallest block someone has to actually obtain.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AddressGroup {
+    /// An IPv4 /24.
+    V4([u8; 3]),
+    /// An IPv6 /64.
+    V6([u8; 8]),
+    /// Loopback and private ranges, which are exempt from the connection
+    /// limits: several nodes on one machine, or on one LAN, is a normal way
+    /// to run this and not something to defend against.
+    Local,
+}
+
+impl AddressGroup {
+    pub fn of(ip: std::net::IpAddr) -> Self {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_private() || v4.is_link_local() {
+                    return AddressGroup::Local;
+                }
+                let o = v4.octets();
+                AddressGroup::V4([o[0], o[1], o[2]])
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    return AddressGroup::Local;
+                }
+                let o = v6.octets();
+                // fc00::/7, the unique-local range.
+                if o[0] & 0xFE == 0xFC {
+                    return AddressGroup::Local;
+                }
+                // fe80::/10, link-local.
+                if o[0] == 0xFE && o[1] & 0xC0 == 0x80 {
+                    return AddressGroup::Local;
+                }
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&o[..8]);
+                AddressGroup::V6(prefix)
+            }
+        }
+    }
+
+    /// The wider IPv6 grouping (/48) this belongs to, if any.
+    pub fn site(&self) -> Option<[u8; 6]> {
+        match self {
+            AddressGroup::V6(prefix) => {
+                let mut site = [0u8; 6];
+                site.copy_from_slice(&prefix[..6]);
+                Some(site)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, AddressGroup::Local)
+    }
+}
+
 /// Counters for one peer's rolling rate-limit window.
 #[derive(Clone, Debug)]
 pub struct RateWindow {
     started: Instant,
     messages: u32,
     transactions: u32,
+    getdata: u32,
+    bytes: usize,
 }
 
 impl RateWindow {
@@ -108,6 +206,8 @@ impl RateWindow {
             started: Instant::now(),
             messages: 0,
             transactions: 0,
+            getdata: 0,
+            bytes: 0,
         }
     }
 
@@ -116,6 +216,8 @@ impl RateWindow {
             self.started = now;
             self.messages = 0;
             self.transactions = 0;
+            self.getdata = 0;
+            self.bytes = 0;
         }
     }
 }
@@ -236,6 +338,36 @@ impl PeerInfo {
         self.rate.transactions <= TX_RATE_LIMIT
     }
 
+    /// Charge `count` inventory entries against this peer's `GetData` budget.
+    pub fn allow_getdata(&mut self, count: usize) -> bool {
+        self.allow_getdata_at(count, Instant::now())
+    }
+
+    pub fn allow_getdata_at(&mut self, count: usize, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.getdata = self
+            .rate
+            .getdata
+            .saturating_add(count.min(u32::MAX as usize) as u32);
+        self.rate.getdata <= GETDATA_RATE_LIMIT
+    }
+
+    /// Charge `bytes` received against this peer's bandwidth budget.
+    pub fn allow_bytes(&mut self, bytes: usize) -> bool {
+        self.allow_bytes_at(bytes, Instant::now())
+    }
+
+    pub fn allow_bytes_at(&mut self, bytes: usize, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.bytes = self.rate.bytes.saturating_add(bytes);
+        self.rate.bytes <= BYTE_RATE_LIMIT
+    }
+
+    /// The address group this peer is counted under.
+    pub fn group(&self) -> AddressGroup {
+        AddressGroup::of(self.addr.ip())
+    }
+
     /// True while a connection to this peer is live or being established.
     pub fn is_active(&self) -> bool {
         matches!(
@@ -277,6 +409,29 @@ impl PeerInfo {
 pub struct PeerManager {
     peers: HashMap<SocketAddr, PeerInfo>,
     channels: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
+    /// Inbound sockets accepted but not yet through the handshake, counted by
+    /// address group.
+    ///
+    /// Without this the inbound cap only bounds *completed* handshakes: an
+    /// attacker opens sockets, leaves them mid-handshake, and none of them are
+    /// counted anywhere. The count is by group rather than by socket so the
+    /// same table answers both the total and the per-group limit.
+    pending_inbound: HashMap<AddressGroup, usize>,
+}
+
+/// The answer to "may this inbound socket proceed?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundAdmission {
+    /// Accepted; the caller must call `release_inbound` when the connection
+    /// ends, however it ends.
+    Accepted,
+    /// No inbound slot left at all.
+    Full,
+    /// This address group already holds as many connections as it may.
+    GroupFull,
+    /// Slots remain, but the ones left are reserved for groups we have no
+    /// connection from, and this is not one of those.
+    Reserved,
 }
 
 impl Default for PeerManager {
@@ -290,6 +445,95 @@ impl PeerManager {
         PeerManager {
             peers: HashMap::new(),
             channels: HashMap::new(),
+            pending_inbound: HashMap::new(),
+        }
+    }
+
+    /// Connections currently held by `group`, counting both the sockets still
+    /// in their handshake and the peers past it.
+    pub fn connections_from(&self, group: AddressGroup) -> usize {
+        let pending = self.pending_inbound.get(&group).copied().unwrap_or(0);
+        let established = self
+            .peers
+            .values()
+            .filter(|p| p.is_active() && p.group() == group)
+            .count();
+        pending + established
+    }
+
+    /// Connections currently held by an IPv6 site (/48), across its /64s.
+    fn connections_from_site(&self, site: [u8; 6]) -> usize {
+        let pending: usize = self
+            .pending_inbound
+            .iter()
+            .filter(|(g, _)| g.site() == Some(site))
+            .map(|(_, n)| *n)
+            .sum();
+        let established = self
+            .peers
+            .values()
+            .filter(|p| p.is_active() && p.group().site() == Some(site))
+            .count();
+        pending + established
+    }
+
+    /// Inbound sockets in flight, handshaking or connected.
+    pub fn inbound_in_flight(&self) -> usize {
+        let pending: usize = self.pending_inbound.values().sum();
+        pending + self.inbound_count()
+    }
+
+    /// Decide whether a freshly accepted socket may proceed, and if so claim
+    /// its place.
+    ///
+    /// Called with the socket's source address, which for an inbound
+    /// connection has an ephemeral port and so cannot identify the peer. The
+    /// address group can still be read from it, and that is what the limits
+    /// are counted under.
+    pub fn admit_inbound(&mut self, src: SocketAddr) -> InboundAdmission {
+        let group = AddressGroup::of(src.ip());
+
+        // A node sharing a machine or a LAN with us is a normal setup, not an
+        // attack, and is exempt from the group limits. The total still holds.
+        if !group.is_local() {
+            if self.connections_from(group) >= MAX_CONNECTIONS_PER_GROUP {
+                return InboundAdmission::GroupFull;
+            }
+            if let Some(site) = group.site() {
+                if self.connections_from_site(site) >= MAX_CONNECTIONS_PER_SITE {
+                    return InboundAdmission::GroupFull;
+                }
+            }
+        }
+
+        let in_flight = self.inbound_in_flight();
+        if in_flight >= MAX_INBOUND_PEERS {
+            return InboundAdmission::Full;
+        }
+
+        // The last few slots are kept for groups we are not already talking
+        // to, so that filling the table is not the same as silencing the node.
+        let known_group = self.connections_from(group) > 0;
+        if known_group && in_flight >= MAX_INBOUND_PEERS - RESERVED_INBOUND_SLOTS {
+            return InboundAdmission::Reserved;
+        }
+
+        *self.pending_inbound.entry(group).or_insert(0) += 1;
+        InboundAdmission::Accepted
+    }
+
+    /// Give back the place claimed by `admit_inbound`.
+    ///
+    /// Must be called once per accepted socket, on every path out of the
+    /// connection — a leak here silently shrinks the inbound capacity until
+    /// the node stops accepting anything.
+    pub fn release_inbound(&mut self, src: SocketAddr) {
+        let group = AddressGroup::of(src.ip());
+        if let Some(count) = self.pending_inbound.get_mut(&group) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.pending_inbound.remove(&group);
+            }
         }
     }
 
@@ -763,5 +1007,159 @@ mod tests {
         let ready = pm.ready_peers();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].addr, a1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Address groups and inbound admission
+    // -----------------------------------------------------------------------
+
+    fn v6(s: &str) -> SocketAddr {
+        SocketAddr::new(s.parse::<std::net::Ipv6Addr>().unwrap().into(), 8333)
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4([a, b, c, d].into()), 8333)
+    }
+
+    #[test]
+    fn ipv4_is_grouped_by_prefix_not_by_address() {
+        assert_eq!(
+            AddressGroup::of(v4(203, 0, 113, 1).ip()),
+            AddressGroup::of(v4(203, 0, 113, 254).ip()),
+            "one /24 is one group"
+        );
+        assert_ne!(
+            AddressGroup::of(v4(203, 0, 113, 1).ip()),
+            AddressGroup::of(v4(203, 0, 114, 1).ip())
+        );
+    }
+
+    #[test]
+    fn ipv6_is_grouped_by_prefix_not_by_address() {
+        // The one that matters. A subscriber line is handed a /64, so counting
+        // IPv6 by address would give one household 2^64 separate accounts --
+        // which is the same as having no limit.
+        assert_eq!(
+            AddressGroup::of(v6("2001:db8:1:2::1").ip()),
+            AddressGroup::of(v6("2001:db8:1:2:ffff:ffff:ffff:ffff").ip()),
+            "one /64 is one group"
+        );
+        assert_ne!(
+            AddressGroup::of(v6("2001:db8:1:2::1").ip()),
+            AddressGroup::of(v6("2001:db8:1:3::1").ip()),
+            "a different /64 is a different group"
+        );
+        assert_eq!(
+            AddressGroup::of(v6("2001:db8:1:2::1").ip()).site(),
+            AddressGroup::of(v6("2001:db8:1:3::1").ip()).site(),
+            "but both are the same /48 site"
+        );
+    }
+
+    #[test]
+    fn local_addresses_are_exempt() {
+        for addr in [
+            v4(127, 0, 0, 1),
+            v4(192, 168, 1, 5),
+            v4(10, 0, 0, 7),
+            v6("::1"),
+            v6("fd00::1"),
+        ] {
+            assert!(
+                AddressGroup::of(addr.ip()).is_local(),
+                "{} should be exempt",
+                addr
+            );
+        }
+    }
+
+    #[test]
+    fn one_group_gets_only_its_share_of_inbound() {
+        let mut pm = PeerManager::new();
+        for i in 0..MAX_CONNECTIONS_PER_GROUP {
+            assert_eq!(
+                pm.admit_inbound(v4(203, 0, 113, i as u8)),
+                InboundAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            pm.admit_inbound(v4(203, 0, 113, 200)),
+            InboundAdmission::GroupFull,
+            "a different address in the same /24 is the same group"
+        );
+        assert_eq!(
+            pm.admit_inbound(v4(203, 0, 114, 1)),
+            InboundAdmission::Accepted
+        );
+    }
+
+    #[test]
+    fn an_ipv6_site_cannot_spread_across_its_own_subnets() {
+        let mut pm = PeerManager::new();
+        // Four connections, each from a different /64 of one /48.
+        for n in 0..MAX_CONNECTIONS_PER_SITE {
+            let addr = v6(&format!("2001:db8:1:{}::1", n));
+            assert_eq!(pm.admit_inbound(addr), InboundAdmission::Accepted);
+        }
+        assert_eq!(
+            pm.admit_inbound(v6("2001:db8:1:99::1")),
+            InboundAdmission::GroupFull,
+            "a fresh /64 inside a site that has used its share"
+        );
+        assert_eq!(
+            pm.admit_inbound(v6("2001:db8:2:1::1")),
+            InboundAdmission::Accepted,
+            "a different /48 is a different site"
+        );
+    }
+
+    #[test]
+    fn the_last_slots_are_kept_for_groups_we_do_not_know() {
+        let mut pm = PeerManager::new();
+        let open = MAX_INBOUND_PEERS - RESERVED_INBOUND_SLOTS;
+        for n in 0..open {
+            let addr = v4(203, 0, n as u8, 1);
+            assert_eq!(pm.admit_inbound(addr), InboundAdmission::Accepted);
+        }
+        // A group already at the table cannot have the reserved slots.
+        assert_eq!(
+            pm.admit_inbound(v4(203, 0, 0, 2)),
+            InboundAdmission::Reserved
+        );
+        // One we have never heard from can.
+        assert_eq!(
+            pm.admit_inbound(v4(198, 51, 100, 1)),
+            InboundAdmission::Accepted
+        );
+    }
+
+    #[test]
+    fn a_socket_that_never_finishes_its_handshake_still_occupies_a_slot() {
+        // The gap this closes: inbound_count() only counts peers past the
+        // handshake, so opening sockets and leaving them there used to cost
+        // an attacker nothing and count against nothing.
+        let mut pm = PeerManager::new();
+        assert_eq!(pm.inbound_in_flight(), 0);
+        pm.admit_inbound(v4(203, 0, 113, 1));
+        assert_eq!(pm.inbound_in_flight(), 1);
+        assert_eq!(pm.inbound_count(), 0, "no handshake has completed");
+
+        pm.release_inbound(v4(203, 0, 113, 1));
+        assert_eq!(pm.inbound_in_flight(), 0);
+    }
+
+    #[test]
+    fn inbound_fills_up() {
+        let mut pm = PeerManager::new();
+        let mut accepted = 0;
+        for n in 0..MAX_INBOUND_PEERS * 2 {
+            // A fresh group each time, so only the total can be what stops it.
+            let addr = v4(198, 51, n as u8, 1);
+            if pm.admit_inbound(addr) == InboundAdmission::Accepted {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, MAX_INBOUND_PEERS);
+        assert_eq!(pm.admit_inbound(v4(198, 51, 200, 1)), InboundAdmission::Full);
     }
 }
