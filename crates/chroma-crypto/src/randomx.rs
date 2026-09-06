@@ -63,7 +63,7 @@ const CACHE_SLOTS: usize = 2;
 #[cfg(feature = "randomx")]
 mod vm {
     use super::*;
-    use randomx_rs::{RandomXCache, RandomXFlag, RandomXVM};
+    use randomx_rs::{RandomXCache, RandomXDataset, RandomXFlag, RandomXVM};
     use std::cell::RefCell;
 
     // RandomXCache is neither Send nor Sync, so the caches cannot be shared
@@ -129,11 +129,82 @@ mod vm {
     pub(super) fn available() -> bool {
         true
     }
+
+    /// A hasher that keeps RandomX's full dataset in memory.
+    ///
+    /// Verification uses the cache (`hash` above): ~256 MiB, built in
+    /// milliseconds, and every node pays it. Mining uses this instead: ~2 GiB
+    /// and over a minute to build, for about five times the hash rate. The
+    /// split is deliberate — the epoch seed changes every
+    /// `RANDOMX_EPOCH_LENGTH` blocks, so making verifiers rebuild a dataset
+    /// on that schedule would cost every node minutes of work every few
+    /// hours, to no benefit.
+    pub struct Miner {
+        seed: Hash,
+        // Dropped in declaration order: the VM borrows nothing, but keeping
+        // the dataset alive alongside it makes the lifetime obvious.
+        vm: RandomXVM,
+        _dataset: RandomXDataset,
+    }
+
+    impl Miner {
+        /// Build the dataset for `seed`. Slow — a minute or more — and worth
+        /// it only for a thread that will hash many times against this seed.
+        pub fn new(seed: &Hash) -> Result<Self> {
+            let flags = flags() | RandomXFlag::FLAG_FULL_MEM;
+            let cache = RandomXCache::new(flags, seed.as_bytes())
+                .map_err(|e| CryptoError::RandomX(format!("cache init failed: {}", e)))?;
+            let dataset = RandomXDataset::new(flags, cache.clone(), 0)
+                .map_err(|e| CryptoError::RandomX(format!("dataset init failed: {}", e)))?;
+            let vm = RandomXVM::new(flags, Some(cache), Some(dataset.clone()))
+                .map_err(|e| CryptoError::RandomX(format!("vm init failed: {}", e)))?;
+            Ok(Miner {
+                seed: *seed,
+                vm,
+                _dataset: dataset,
+            })
+        }
+
+        pub fn seed(&self) -> Hash {
+            self.seed
+        }
+
+        pub fn hash(&self, input: &[u8]) -> Result<Hash> {
+            let out = self
+                .vm
+                .calculate_hash(input)
+                .map_err(|e| CryptoError::RandomX(format!("hash failed: {}", e)))?;
+            Hash::from_slice(&out)
+                .map_err(|e| CryptoError::RandomX(format!("unexpected hash length: {}", e)))
+        }
+    }
 }
 
 #[cfg(not(feature = "randomx"))]
 mod vm {
     use super::*;
+
+    /// Stands in for the fast-mode hasher so callers compile either way.
+    /// Constructing one fails, for the same reason hashing does.
+    pub struct Miner(());
+
+    impl Miner {
+        pub fn new(_seed: &Hash) -> Result<Self> {
+            Err(CryptoError::RandomX(
+                "this build was compiled without the randomx feature".to_string(),
+            ))
+        }
+
+        pub fn seed(&self) -> Hash {
+            Hash::ZERO
+        }
+
+        pub fn hash(&self, _input: &[u8]) -> Result<Hash> {
+            Err(CryptoError::RandomX(
+                "this build was compiled without the randomx feature".to_string(),
+            ))
+        }
+    }
 
     pub(super) fn hash(_seed: &Hash, _input: &[u8]) -> Result<Hash> {
         Err(CryptoError::RandomX(
@@ -161,6 +232,13 @@ pub fn randomx_hash(seed: &Hash, input: &[u8]) -> Result<Hash> {
 ///
 /// Worth calling when the epoch is about to turn: otherwise the first block of
 /// the new epoch pays the cache build inside validation.
+/// Fast-mode hasher for a mining thread: the RandomX dataset in memory.
+///
+/// Neither `Send` nor `Sync` — RandomX's VM and dataset belong to the thread
+/// that made them — so this has to be built and used on one dedicated thread,
+/// not on an async task that can move between threads.
+pub use vm::Miner;
+
 pub fn warm_seed(seed: &Hash) -> Result<()> {
     vm::warm(seed)
 }

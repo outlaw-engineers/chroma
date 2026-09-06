@@ -149,11 +149,36 @@ pub fn mine_block(block: &mut Block, pow: &PowContext) -> Result<()> {
 
 /// Mine a block, searching at most `max_nonces` values.
 pub fn mine_block_with_limit(block: &mut Block, max_nonces: u64, pow: &PowContext) -> Result<()> {
+    mine_block_with(block, max_nonces, pow)
+}
+
+/// Anything that can compute a header's proof-of-work hash.
+///
+/// [`PowContext`] builds a RandomX VM from a cache for each call, which is
+/// what verification wants. A miner holding the full dataset hashes several
+/// times faster but cannot leave the thread that built it, so it lives behind
+/// this trait rather than inside `PowContext`.
+pub trait HeaderHasher {
+    fn hash_header(&self, header: &BlockHeader) -> Result<Hash>;
+}
+
+impl HeaderHasher for PowContext {
+    fn hash_header(&self, header: &BlockHeader) -> Result<Hash> {
+        PowContext::hash_header(self, header)
+    }
+}
+
+/// Search nonces until one satisfies the header's target.
+pub fn mine_block_with<H: HeaderHasher + ?Sized>(
+    block: &mut Block,
+    max_nonces: u64,
+    hasher: &H,
+) -> Result<()> {
     let target = block.header.bits.to_full_target();
 
     for nonce in 0..max_nonces {
         block.header.nonce = nonce;
-        let candidate = pow.hash_header(&block.header)?;
+        let candidate = hasher.hash_header(&block.header)?;
         if chroma_crypto::randomx::hash_meets_target(&candidate, &target) {
             return Ok(());
         }

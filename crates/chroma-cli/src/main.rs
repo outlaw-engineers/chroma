@@ -518,20 +518,6 @@ async fn main() -> anyhow::Result<()> {
             };
             if !no_mining {
                 println!("Mining rewards to: {}", address_to_bech32(&config.miner_address));
-
-                // Solo mining is only realistic where the target is trivial.
-                // Every other network expects difficulty 1 or harder, which is
-                // around 2^32 hashes a block: with RandomX at tens of
-                // milliseconds each, a single node is looking at years per
-                // block. Better said out loud than discovered by watching a
-                // silent miner.
-                if params.network != chroma_core::types::NetworkId::Regtest {
-                    println!(
-                        "Note: {} expects roughly 2^32 hashes per block. A single node will not",
-                        params.network.as_str()
-                    );
-                    println!("find one in any useful time — use --network regtest to try things out.");
-                }
             }
             let mut node = chroma_p2p::Node::new(config);
             // Printed in the form a peer would pass to --connect, since that
