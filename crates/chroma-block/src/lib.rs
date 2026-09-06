@@ -214,6 +214,10 @@ pub struct BlockValidationContext {
     pub previous_state_root: Hash,
     /// Network-adjusted time (for future timestamp check)
     pub network_time: u64,
+    /// Proof-of-work function this network uses.
+    pub pow_algorithm: chroma_crypto::randomx::PowAlgorithm,
+    /// RandomX epoch seed for this height (ignored by BLAKE3).
+    pub pow_seed: Hash,
 }
 
 /// Validate a complete block against the chain context.
@@ -278,12 +282,20 @@ pub fn validate_block(
     }
 
     // --- PoW ---
-    let header_hash = header.hash();
+    // The proof-of-work hash is not the block's identity. RandomX is keyed by
+    // the epoch seed and is deliberately expensive; the block is still
+    // identified by the BLAKE3 hash of its header.
+    let pow = chroma_crypto::randomx::pow_hash(
+        ctx.pow_algorithm,
+        &ctx.pow_seed,
+        &header.encode(),
+    )
+    .map_err(|e| CoreError::InvalidProofOfWork(format!("cannot compute proof of work: {}", e)))?;
     let target = header.bits.to_full_target();
-    if !chroma_crypto::randomx::hash_meets_target(&header_hash, &target) {
-        return Err(CoreError::InvalidProofOfWork(format!(
-            "block hash does not meet target"
-        )));
+    if !chroma_crypto::randomx::hash_meets_target(&pow, &target) {
+        return Err(CoreError::InvalidProofOfWork(
+            "proof of work does not meet target".to_string(),
+        ));
     }
 
     // --- Transaction count ---
@@ -314,15 +326,20 @@ pub fn validate_block(
     // We accept any signature for coinbase — it's a protocol-level mint
 
     // --- Apply state transitions ---
-    // Reset state to previous state root (caller should provide clean state)
+    // Everything below runs on a scratch copy, which replaces the caller's
+    // state only once the block has fully validated. Applying in place would
+    // leave a rejected block's partial effects behind, corrupting the state
+    // for every block after it.
+    let mut working = state.clone();
+
     // Apply coinbase subsidy
-    let _subsidy = state.apply_subsidy(&coinbase.recipient, header.height.0)?;
+    let _subsidy = working.apply_subsidy(&coinbase.recipient, header.height.0)?;
 
     // Check supply cap
-    if state.total_supply() > MAX_SUPPLY_UNITS as u64 {
+    if working.total_supply() > MAX_SUPPLY_UNITS as u64 {
         return Err(CoreError::SupplyInvariant(format!(
             "total supply {} exceeds max {}",
-            state.total_supply(),
+            working.total_supply(),
             MAX_SUPPLY_UNITS
         )));
     }
@@ -337,7 +354,8 @@ pub fn validate_block(
             ));
         }
 
-        // Verify signature
+        // Verify signature. A coinbase-marked transaction never verifies, so
+        // this is also what stops a second mint hiding among the transfers.
         if !tx.verify_signature() {
             return Err(CoreError::InvalidSignature(
                 "transaction signature verification failed".to_string(),
@@ -345,7 +363,7 @@ pub fn validate_block(
         }
 
         // Apply to state
-        state.apply_transaction(
+        working.apply_transaction(
             &tx.sender_address(),
             &tx.recipient,
             tx.amount.0,
@@ -354,7 +372,7 @@ pub fn validate_block(
     }
 
     // --- State root check ---
-    let new_state_root = state.compute_state_root();
+    let new_state_root = working.compute_state_root();
     if new_state_root != header.state_root {
         return Err(CoreError::InvalidStateRoot(format!(
             "expected {}, got {}",
@@ -373,6 +391,8 @@ pub fn validate_block(
         )));
     }
 
+    // The block is fully valid: commit the scratch state.
+    *state = working;
     Ok(new_state_root)
 }
 

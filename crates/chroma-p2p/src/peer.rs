@@ -1,8 +1,85 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+
+/// Everything needed to dial a peer: where it is, who it is, and the static
+/// key its handshake will use.
+///
+/// Both keys are here because they do different jobs. Noise XK does its
+/// Diffie-Hellman against the X25519 static key, so the dialer must hold that
+/// key before it connects. The node id is the ed25519 identity that signed
+/// that static key, and it is the part that has to be right: a substituted
+/// static key fails the handshake, because whoever substituted it cannot sign
+/// it as this identity.
+///
+/// Written as `<node-id>.<noise-key>@host:port`, both keys in hex.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PeerAddress {
+    pub node_id: chroma_crypto::noise::NodeId,
+    pub noise_key: chroma_crypto::noise::NoiseKey,
+    pub socket: SocketAddr,
+}
+
+impl PeerAddress {
+    pub fn new(
+        node_id: chroma_crypto::noise::NodeId,
+        noise_key: chroma_crypto::noise::NoiseKey,
+        socket: SocketAddr,
+    ) -> Self {
+        PeerAddress {
+            node_id,
+            noise_key,
+            socket,
+        }
+    }
+}
+
+impl fmt::Display for PeerAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}@{}",
+            self.node_id.to_hex(),
+            self.noise_key.to_hex(),
+            self.socket
+        )
+    }
+}
+
+impl FromStr for PeerAddress {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (keys, socket) = s.split_once('@').ok_or_else(|| {
+            format!(
+                "expected <node-id>.<noise-key>@<host:port>, got {:?}",
+                s
+            )
+        })?;
+        let (id, key) = keys.split_once('.').ok_or_else(|| {
+            format!(
+                "expected <node-id>.<noise-key>@<host:port>, got {:?}",
+                s
+            )
+        })?;
+        let node_id = chroma_crypto::noise::NodeId::from_hex(id)
+            .map_err(|e| format!("bad node id: {}", e))?;
+        let noise_key = chroma_crypto::noise::NoiseKey::from_hex(key)
+            .map_err(|e| format!("bad noise key: {}", e))?;
+        let socket: SocketAddr = socket
+            .parse()
+            .map_err(|e| format!("bad socket address: {}", e))?;
+        Ok(PeerAddress {
+            node_id,
+            noise_key,
+            socket,
+        })
+    }
+}
 
 pub const PEER_SCORE_GOOD: i32 = 10;
 pub const PEER_SCORE_BAD: i32 = -100;
@@ -12,6 +89,36 @@ pub const MAX_INBOUND_PEERS: usize = 16;
 pub const PEER_TIMEOUT_SECS: u64 = 30;
 pub const PING_INTERVAL_SECS: u64 = 5;
 pub const VERSION_TIMEOUT_SECS: u64 = 10;
+
+/// Per-peer rate limits (spec §5). Enforced over a rolling one-second window.
+pub const MSG_RATE_LIMIT: u32 = 100;
+pub const TX_RATE_LIMIT: u32 = 10;
+
+/// Counters for one peer's rolling rate-limit window.
+#[derive(Clone, Debug)]
+pub struct RateWindow {
+    started: Instant,
+    messages: u32,
+    transactions: u32,
+}
+
+impl RateWindow {
+    fn new() -> Self {
+        RateWindow {
+            started: Instant::now(),
+            messages: 0,
+            transactions: 0,
+        }
+    }
+
+    fn roll(&mut self, now: Instant) {
+        if now.duration_since(self.started) >= Duration::from_secs(1) {
+            self.started = now;
+            self.messages = 0;
+            self.transactions = 0;
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PeerState {
@@ -23,6 +130,19 @@ pub enum PeerState {
     Banned,
 }
 
+/// Outcome of claiming a connection slot for a peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConnectionSlot {
+    /// The slot was claimed; the caller owns this connection.
+    Accepted,
+    /// A connection to this peer is already live.
+    Duplicate,
+    /// The peer is banned.
+    Banned,
+    /// The relevant connection limit is already reached.
+    Full,
+}
+
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
     pub addr: SocketAddr,
@@ -31,10 +151,26 @@ pub struct PeerInfo {
     pub connected_at: Option<Instant>,
     pub last_seen: Option<Instant>,
     pub last_ping_nonce: Option<u64>,
+    /// When the outstanding ping was sent, for timeout detection.
+    pub last_ping_at: Option<Instant>,
     pub height: u32,
     pub version: u32,
     pub services: u64,
     pub ban_until: Option<Instant>,
+    /// True if the remote opened the connection to us.
+    pub inbound: bool,
+    /// The node identity this peer presented, once known.
+    pub node_id: Option<chroma_crypto::noise::NodeId>,
+    /// The static key that identity authorised. Needed to dial the peer, so
+    /// an entry without it can be talked to but not called back.
+    pub noise_key: Option<chroma_crypto::noise::NoiseKey>,
+    /// True once a handshake completed on this address at least once.
+    ///
+    /// Only these are worth passing to other nodes: an address we merely heard
+    /// about, or one we failed to reach, would just spread noise.
+    pub handshaked: bool,
+    /// Rolling counters backing the per-peer rate limits.
+    rate: RateWindow,
 }
 
 impl PeerInfo {
@@ -46,10 +182,74 @@ impl PeerInfo {
             connected_at: None,
             last_seen: None,
             last_ping_nonce: None,
+            last_ping_at: None,
             height: 0,
             version: 0,
             services: 0,
             ban_until: None,
+            inbound: false,
+            node_id: None,
+            noise_key: None,
+            handshaked: false,
+            rate: RateWindow::new(),
+        }
+    }
+
+    /// The address another node could dial this peer on.
+    ///
+    /// Both keys or nothing: XK needs the static key to connect at all, and
+    /// the identity to know whether it reached the right node, so half an
+    /// identity is not something to hand out or act on.
+    pub fn peer_address(&self) -> Option<PeerAddress> {
+        match (self.node_id, self.noise_key) {
+            (Some(node_id), Some(noise_key)) => {
+                Some(PeerAddress::new(node_id, noise_key, self.addr))
+            }
+            _ => None,
+        }
+    }
+
+    /// Count a received message against the peer's allowance.
+    ///
+    /// Returns false once the peer is over its limit for the current second.
+    /// Without this a single peer can make us spend unbounded work — signature
+    /// verification alone costs ~84 µs per transaction.
+    pub fn allow_message(&mut self) -> bool {
+        self.allow_message_at(Instant::now())
+    }
+
+    pub fn allow_message_at(&mut self, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.messages = self.rate.messages.saturating_add(1);
+        self.rate.messages <= MSG_RATE_LIMIT
+    }
+
+    /// Count a received transaction against the peer's separate, tighter
+    /// transaction allowance.
+    pub fn allow_transaction(&mut self) -> bool {
+        self.allow_transaction_at(Instant::now())
+    }
+
+    pub fn allow_transaction_at(&mut self, now: Instant) -> bool {
+        self.rate.roll(now);
+        self.rate.transactions = self.rate.transactions.saturating_add(1);
+        self.rate.transactions <= TX_RATE_LIMIT
+    }
+
+    /// True while a connection to this peer is live or being established.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.state,
+            PeerState::Connecting | PeerState::Connected | PeerState::Handshaking | PeerState::Ready
+        )
+    }
+
+    /// True if the peer has gone quiet for longer than `timeout`.
+    pub fn is_stale(&self, timeout: Duration) -> bool {
+        let reference = self.last_seen.or(self.connected_at);
+        match reference {
+            Some(t) => t.elapsed() > timeout,
+            None => false,
         }
     }
 
@@ -99,9 +299,122 @@ impl PeerManager {
         }
     }
 
+    /// Record a peer whose identity we already know, so it can be dialed.
+    pub fn add_known_peer(&mut self, peer: PeerAddress) {
+        let entry = self
+            .peers
+            .entry(peer.socket)
+            .or_insert_with(|| PeerInfo::new(peer.socket));
+        entry.node_id = Some(peer.node_id);
+        entry.noise_key = Some(peer.noise_key);
+    }
+
     pub fn remove_peer(&mut self, addr: &SocketAddr) {
         self.peers.remove(addr);
         self.channels.remove(addr);
+    }
+
+    /// Atomically claim a connection slot for `addr`.
+    ///
+    /// Checking "is this peer already connected?" and marking it connected must
+    /// happen under one lock acquisition, otherwise two simultaneous dials to
+    /// the same peer both observe "not connected" and both proceed.
+    pub fn begin_connection(&mut self, addr: SocketAddr, inbound: bool) -> ConnectionSlot {
+        if let Some(peer) = self.peers.get(&addr) {
+            if peer.is_banned() {
+                return ConnectionSlot::Banned;
+            }
+            if peer.is_active() {
+                return ConnectionSlot::Duplicate;
+            }
+        }
+
+        let limit_reached = if inbound {
+            self.inbound_count() >= MAX_INBOUND_PEERS
+        } else {
+            self.outbound_count() >= MAX_OUTBOUND_PEERS
+        };
+        if limit_reached {
+            return ConnectionSlot::Full;
+        }
+
+        let peer = self.peers.entry(addr).or_insert_with(|| PeerInfo::new(addr));
+        peer.state = PeerState::Connecting;
+        peer.inbound = inbound;
+        peer.connected_at = Some(Instant::now());
+        peer.last_seen = None;
+        peer.last_ping_nonce = None;
+        peer.last_ping_at = None;
+        ConnectionSlot::Accepted
+    }
+
+    /// Mark a peer's connection as closed.
+    ///
+    /// The `PeerInfo` is kept so the accumulated score and any ban survive the
+    /// disconnect — dropping the entry would let a misbehaving peer clear its
+    /// own ban simply by reconnecting.
+    pub fn mark_disconnected(&mut self, addr: &SocketAddr) {
+        self.channels.remove(addr);
+        if let Some(peer) = self.peers.get_mut(addr) {
+            if peer.state != PeerState::Banned {
+                peer.state = PeerState::Disconnected;
+            }
+            peer.last_ping_nonce = None;
+            peer.last_ping_at = None;
+        }
+    }
+
+    /// Number of live inbound connections.
+    pub fn inbound_count(&self) -> usize {
+        self.peers.values().filter(|p| p.inbound && p.is_active()).count()
+    }
+
+    /// Number of live outbound connections.
+    pub fn outbound_count(&self) -> usize {
+        self.peers.values().filter(|p| !p.inbound && p.is_active()).count()
+    }
+
+    /// Addresses worth telling other nodes about.
+    ///
+    /// Restricted to peers we have actually completed a handshake with and
+    /// that are not banned, so gossip spreads reachable nodes rather than
+    /// whatever a peer chose to claim.
+    pub fn shareable_addrs(&self, limit: usize, except: Option<SocketAddr>) -> Vec<PeerAddress> {
+        self.peers
+            .values()
+            .filter(|p| p.handshaked && !p.is_banned())
+            .filter(|p| Some(p.addr) != except)
+            .filter_map(|p| p.peer_address())
+            .take(limit)
+            .collect()
+    }
+
+    /// Peers we know of but are not connected to, for filling out our
+    /// outbound slots.
+    ///
+    /// Only those whose identity we know: Noise XK cannot dial an address
+    /// without knowing which node should answer it.
+    pub fn dialable_addrs(&self, limit: usize) -> Vec<PeerAddress> {
+        self.peers
+            .values()
+            .filter(|p| !p.is_active() && !p.is_banned())
+            .filter_map(|p| p.peer_address())
+            .take(limit)
+            .collect()
+    }
+
+    /// How many more outbound connections we would like.
+    pub fn outbound_deficit(&self) -> usize {
+        MAX_OUTBOUND_PEERS.saturating_sub(self.outbound_count())
+    }
+
+    /// Peers that have gone quiet for longer than `timeout` and should be cut.
+    pub fn stale_peers(&self, timeout: Duration) -> Vec<SocketAddr> {
+        self.peers
+            .values()
+            .filter(|p| p.is_active() && p.is_stale(timeout))
+            .map(|p| p.addr)
+            .collect()
     }
 
     pub fn get_peer(&self, addr: &SocketAddr) -> Option<&PeerInfo> {
@@ -166,11 +479,13 @@ impl PeerManager {
         }
     }
 
+    /// Drop entries for peers that are disconnected and not banned.
+    /// Banned peers are retained so that the ban outlives the connection.
     pub fn prune_disconnected(&mut self) {
         let addrs: Vec<SocketAddr> = self
             .peers
             .iter()
-            .filter(|(_, p)| p.state == PeerState::Disconnected)
+            .filter(|(_, p)| p.state == PeerState::Disconnected && !p.is_banned())
             .map(|(a, _)| *a)
             .collect();
         for addr in addrs {
@@ -287,6 +602,149 @@ mod tests {
         pm.prune_disconnected();
         assert!(pm.get_peer(&a1).is_some());
         assert!(pm.get_peer(&a2).is_none());
+    }
+
+    #[test]
+    fn test_begin_connection_rejects_duplicate() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+        // A second dial while the first is live must not open another socket.
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Duplicate);
+
+        // ...but reconnecting after a clean disconnect is allowed.
+        pm.mark_disconnected(&addr);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+    }
+
+    #[test]
+    fn test_begin_connection_rejects_banned() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        pm.add_peer(addr);
+        pm.ban_peer(&addr);
+        assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Banned);
+    }
+
+    #[test]
+    fn test_begin_connection_enforces_separate_limits() {
+        let mut pm = PeerManager::new();
+        for i in 0..MAX_OUTBOUND_PEERS {
+            let addr = test_addr(9000 + i as u16);
+            assert_eq!(pm.begin_connection(addr, false), ConnectionSlot::Accepted);
+        }
+        assert_eq!(
+            pm.begin_connection(test_addr(9999), false),
+            ConnectionSlot::Full
+        );
+        // The inbound budget is separate and still has room.
+        assert_eq!(
+            pm.begin_connection(test_addr(9998), true),
+            ConnectionSlot::Accepted
+        );
+
+        for i in 1..MAX_INBOUND_PEERS {
+            let addr = test_addr(10_000 + i as u16);
+            assert_eq!(pm.begin_connection(addr, true), ConnectionSlot::Accepted);
+        }
+        assert_eq!(
+            pm.begin_connection(test_addr(11_000), true),
+            ConnectionSlot::Full
+        );
+    }
+
+    #[test]
+    fn test_ban_survives_disconnect() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        pm.add_peer(addr);
+        pm.ban_peer(&addr);
+
+        // Disconnect must not erase the ban (remove_peer would have).
+        pm.mark_disconnected(&addr);
+        assert!(pm.get_peer(&addr).unwrap().is_banned());
+        pm.prune_disconnected();
+        assert!(
+            pm.get_peer(&addr).is_some_and(|p| p.is_banned()),
+            "a banned peer must not be pruned away"
+        );
+        assert_eq!(pm.begin_connection(addr, true), ConnectionSlot::Banned);
+    }
+
+    #[test]
+    fn test_mark_disconnected_clears_channel() {
+        let mut pm = PeerManager::new();
+        let addr = test_addr(8333);
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(4);
+        pm.begin_connection(addr, false);
+        pm.set_channel(addr, tx);
+        assert!(pm.get_channel(&addr).is_some());
+        pm.mark_disconnected(&addr);
+        assert!(pm.get_channel(&addr).is_none());
+        assert_eq!(pm.get_peer(&addr).unwrap().state, PeerState::Disconnected);
+    }
+
+    #[test]
+    fn test_stale_peers() {
+        let mut pm = PeerManager::new();
+        let fresh = test_addr(8333);
+        let quiet = test_addr(8334);
+        pm.begin_connection(fresh, false);
+        pm.begin_connection(quiet, false);
+        pm.get_peer_mut(&fresh).unwrap().state = PeerState::Ready;
+        pm.get_peer_mut(&fresh).unwrap().last_seen = Some(Instant::now());
+        pm.get_peer_mut(&quiet).unwrap().state = PeerState::Ready;
+        pm.get_peer_mut(&quiet).unwrap().last_seen =
+            Some(Instant::now() - Duration::from_secs(PEER_TIMEOUT_SECS + 5));
+
+        let stale = pm.stale_peers(Duration::from_secs(PEER_TIMEOUT_SECS));
+        assert_eq!(stale, vec![quiet]);
+    }
+
+    #[test]
+    fn test_message_rate_limit() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let now = Instant::now();
+
+        for i in 0..MSG_RATE_LIMIT {
+            assert!(
+                peer.allow_message_at(now),
+                "message {} should be within the allowance",
+                i
+            );
+        }
+        assert!(!peer.allow_message_at(now), "one past the limit must be refused");
+
+        // The window rolls, and the peer is allowed again.
+        let later = now + Duration::from_millis(1_100);
+        assert!(peer.allow_message_at(later));
+    }
+
+    #[test]
+    fn test_transaction_rate_limit_is_separate_and_tighter() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let now = Instant::now();
+
+        for _ in 0..TX_RATE_LIMIT {
+            assert!(peer.allow_transaction_at(now));
+        }
+        assert!(!peer.allow_transaction_at(now));
+
+        // Messages have their own, larger budget, untouched by the above.
+        assert!(peer.allow_message_at(now));
+    }
+
+    #[test]
+    fn test_rate_window_rolls_forward() {
+        let mut peer = PeerInfo::new(test_addr(8333));
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            for _ in 0..TX_RATE_LIMIT {
+                assert!(peer.allow_transaction_at(now));
+            }
+            assert!(!peer.allow_transaction_at(now));
+            now += Duration::from_secs(1);
+        }
     }
 
     #[test]

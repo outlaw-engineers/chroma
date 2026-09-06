@@ -21,12 +21,15 @@
 //! At non-retarget heights, the target carries forward unchanged.
 
 pub mod miner;
+pub mod params;
+
+pub use params::ChainParams;
 
 use std::collections::BTreeMap;
 
 use chroma_core::constants::{
-    DIFFICULTY_ADJUSTMENT_WINDOW, GENESIS_RANDOMX_SEED, GENESIS_TARGET_BITS,
-    GENESIS_TIMESTAMP, MAX_DIFFICULTY_DECREASE_FACTOR, MTP_WINDOW, TARGET_BLOCK_TIME_SECS,
+    DIFFICULTY_ADJUSTMENT_WINDOW, GENESIS_RANDOMX_SEED, MAX_DIFFICULTY_DECREASE_FACTOR,
+    MTP_WINDOW, TARGET_BLOCK_TIME_SECS,
 };
 use chroma_core::error::{CoreError, Result};
 use chroma_core::hash::Hash;
@@ -50,13 +53,22 @@ use chroma_state::State;
 /// - state_root = Hash::ZERO (empty state)
 /// - tx_merkle_root = Hash::ZERO (no transactions)
 pub fn build_genesis_block() -> Block {
+    build_genesis_block_with(&ChainParams::devnet())
+}
+
+/// Build the genesis block for a specific network.
+///
+/// Networks differ in their genesis target, so each has a different genesis
+/// hash — which is what keeps a regtest chain from ever being mistaken for a
+/// real one.
+pub fn build_genesis_block_with(params: &ChainParams) -> Block {
     let header = BlockHeader {
         version: 1,
         previous_hash: Hash::ZERO,
         state_root: Hash::ZERO,
         tx_merkle_root: Hash::ZERO,
-        timestamp: GENESIS_TIMESTAMP,
-        bits: CompactTarget(GENESIS_TARGET_BITS),
+        timestamp: params.genesis_timestamp,
+        bits: params.genesis_bits,
         height: BlockHeight::GENESIS,
         nonce: 0,
     };
@@ -81,38 +93,27 @@ pub fn genesis_randomx_seed() -> Hash {
 // Difficulty Retarget
 // ============================================================================
 
-/// Minimum target (highest difficulty).
-/// 0x00000000000000000000FFFF00000000000000000000000000000000000000000
-const MINIMUM_TARGET: [u8; 32] = {
-    let mut t = [0u8; 32];
-    t[10] = 0xFF;
-    t[11] = 0xFF;
-    t
-};
-
-/// Maximum target (lowest difficulty).
-/// ~4× genesis to allow one full difficulty decrease adjustment.
-/// CompactTarget for this is ~0x1E003FFF which is the genesis target × 4.
-const MAXIMUM_TARGET: [u8; 32] = {
-    let mut t = [0u8; 32];
-    t[3] = 0x03;
-    t[4] = 0xFF;
-    t[5] = 0xFF;
-    t[6] = 0xC0;
-    t
-};
-
 /// Determine the target bits for a given block height.
 pub fn calculate_target_for_height(
     height: u32,
     headers: &BTreeMap<u32, BlockHeader>,
 ) -> Result<CompactTarget> {
+    calculate_target_for_height_with(height, headers, &ChainParams::devnet())
+}
+
+/// Determine the target bits for a height under a specific network's rules.
+pub fn calculate_target_for_height_with(
+    height: u32,
+    headers: &BTreeMap<u32, BlockHeader>,
+    params: &ChainParams,
+) -> Result<CompactTarget> {
     if height == 0 {
-        return Ok(CompactTarget(GENESIS_TARGET_BITS));
+        return Ok(params.genesis_bits);
     }
 
-    // Only retarget at multiples of DIFFICULTY_ADJUSTMENT_WINDOW
-    if height % DIFFICULTY_ADJUSTMENT_WINDOW != 0 {
+    // Regtest holds the target still, so block production stays instant no
+    // matter how quickly blocks arrive.
+    if params.no_retargeting || height % DIFFICULTY_ADJUSTMENT_WINDOW != 0 {
         let prev = headers
             .get(&(height - 1))
             .ok_or_else(|| CoreError::InvalidDifficulty(format!("missing header for height {}", height - 1)))?;
@@ -140,13 +141,17 @@ pub fn calculate_target_for_height(
     let old_target = U256::from_be_bytes(&current.bits.to_full_target());
 
     // new_target = old_target × actual_time / target_time
-    let new_target =
-        mul_div(&old_target, actual_time, target_time)
-            .ok_or_else(|| CoreError::InvalidDifficulty("difficulty calculation overflow".into()))?;
+    let new_target = mul_div(&old_target, actual_time, target_time);
 
     // Clamp: max decrease = old / 4, max increase = old × 4
     let (min_target, _) = old_target.div_rem(&U256::from_u64(MAX_DIFFICULTY_DECREASE_FACTOR));
-    let max_target = old_target.shl(2);
+    // `shl` drops the bits it shifts past the top, which would turn a large
+    // target into a small one and read as a difficulty increase. Saturate, and
+    // let the network's absolute bound below decide the ceiling.
+    let max_target = match saturating_mul_u64(&old_target, 4) {
+        Some(target) => target,
+        None => U256::MAX,
+    };
 
     let clamped = if new_target < min_target {
         min_target
@@ -159,8 +164,8 @@ pub fn calculate_target_for_height(
     // Enforce absolute bounds (safety net beyond per-epoch clamping)
     // MINIMUM_TARGET = highest difficulty (smallest target)
     // MAXIMUM_TARGET = lowest difficulty (largest target, ~4× genesis)
-    let min_abs = U256::from_be_bytes(&MINIMUM_TARGET);
-    let max_abs = U256::from_be_bytes(&MAXIMUM_TARGET);
+    let min_abs = U256::from_be_bytes(&params.min_target);
+    let max_abs = U256::from_be_bytes(&params.max_target);
     let final_target = if clamped < min_abs {
         min_abs
     } else if clamped > max_abs {
@@ -173,48 +178,63 @@ pub fn calculate_target_for_height(
     Ok(CompactTarget::from_full_target(&target_bytes))
 }
 
-/// Multiply a U256 by a u64 and divide by a u64: (value * num) / den
-/// Returns None on overflow to avoid silent wrapping on consensus-critical values.
-fn mul_div(value: &U256, num: u64, den: u64) -> Option<U256> {
+/// Multiply a U256 by a u64 and divide by a u64: `(value * num) / den`,
+/// saturating at [`U256::MAX`].
+///
+/// Saturating rather than failing, because the only caller clamps the result
+/// into `[old/4, old*4]` and then into the network's absolute bounds. Any
+/// value large enough to overflow is far above those, so it clamps to the same
+/// place `U256::MAX` does — saturation is not an approximation here, it is the
+/// same answer.
+///
+/// Failing was: a target near the top of the range — which `params.max_target`
+/// explicitly permits — made every retarget return an error, so no block at a
+/// retarget height could be produced or validated and the chain stopped. A
+/// difficulty low enough to be a nuisance became a difficulty low enough to be
+/// fatal.
+fn mul_div(value: &U256, num: u64, den: u64) -> U256 {
     if den == 0 || num == 0 {
-        return Some(U256::ZERO);
+        return U256::ZERO;
     }
 
     // Split value into quotient and remainder of division by den
     let (q, r) = value.div_rem(&U256::from_u64(den));
 
     // q * num
-    let part1 = {
-        let mut result = U256::ZERO;
-        let mut addend = q;
-        let mut n = num;
-        while n > 0 {
-            if n & 1 == 1 {
-                result = result.checked_add(&addend)?;
-            }
-            addend = addend.shl(1);
-            n >>= 1;
-        }
-        result
+    let part1 = match saturating_mul_u64(&q, num) {
+        Some(product) => product,
+        None => return U256::MAX,
     };
 
-    // (r * num) / den
-    let part2 = {
-        let mut temp = U256::ZERO;
-        let mut addend = r;
-        let mut n = num;
-        while n > 0 {
-            if n & 1 == 1 {
-                temp = temp.checked_add(&addend)?;
-            }
-            addend = addend.shl(1);
-            n >>= 1;
-        }
-        let (q2, _) = temp.div_rem(&U256::from_u64(den));
-        q2
+    // (r * num) / den. `r < den`, so this cannot overflow on its own, but it
+    // is written the same way so one shape covers both.
+    let part2 = match saturating_mul_u64(&r, num) {
+        Some(product) => product.div_rem(&U256::from_u64(den)).0,
+        None => return U256::MAX,
     };
 
-    part1.checked_add(&part2)
+    part1.checked_add(&part2).unwrap_or(U256::MAX)
+}
+
+/// `value * num`, or `None` if it does not fit in 256 bits.
+fn saturating_mul_u64(value: &U256, num: u64) -> Option<U256> {
+    let mut result = U256::ZERO;
+    let mut addend = *value;
+    let mut n = num;
+    while n > 0 {
+        if n & 1 == 1 {
+            result = result.checked_add(&addend)?;
+        }
+        n >>= 1;
+        // Only double when there is another bit to consume: doubling past the
+        // last one is where a value near the top of the range overflowed for
+        // no reason.
+        if n > 0 {
+            let doubled = addend.checked_add(&addend)?;
+            addend = doubled;
+        }
+    }
+    Some(result)
 }
 
 // ============================================================================
@@ -250,22 +270,83 @@ impl ChainTip {
 // Chain State
 // ============================================================================
 
+/// Somewhere blocks can be fetched from by hash.
+///
+/// A reorg has to replay a branch the chain state never held in memory, so
+/// consensus needs a way to read blocks back without depending on the storage
+/// crate.
+pub trait BlockSource {
+    fn get_block(&self, hash: &Hash) -> Option<Block>;
+}
+
+/// A block source that holds nothing. Fine for a chain that only ever extends.
+pub struct NoBlockSource;
+
+impl BlockSource for NoBlockSource {
+    fn get_block(&self, _hash: &Hash) -> Option<Block> {
+        None
+    }
+}
+
+/// What happened to a block offered to the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockOutcome {
+    /// Extended the active chain.
+    Extended,
+    /// Valid, but on a branch with less work than the active chain.
+    SideBranch,
+    /// Replaced the active chain; `depth` blocks were rolled back.
+    Reorganized { depth: u32 },
+    /// Already known.
+    Duplicate,
+}
+
+/// One block in the index of everything we know about.
+#[derive(Clone, Debug)]
+pub struct BlockIndexEntry {
+    pub header: BlockHeader,
+    pub cumulative_work: U256,
+}
+
 /// Full chain state for consensus validation.
 pub struct ChainState {
-    /// All block headers indexed by height.
+    /// Consensus parameters for the network this chain belongs to.
+    pub params: ChainParams,
+    /// Headers of the *active* chain, indexed by height.
     pub headers: BTreeMap<u32, BlockHeader>,
+    /// Every block we have accepted, on any branch, keyed by hash.
+    pub index: std::collections::HashMap<Hash, BlockIndexEntry>,
     /// Best chain tip.
     pub tip: ChainTip,
     /// Account state at the tip.
     pub state: State,
     /// All known chain tips (for fork choice).
     pub tips: BTreeMap<Hash, ChainTip>,
+    /// Undo records for the most recent blocks of the active chain, oldest
+    /// first (spec §2.3).
+    ///
+    /// A reorg inside this window rolls the state back block by block instead
+    /// of rebuilding it from genesis, so its cost follows the depth of the
+    /// reorg rather than the length of the chain.
+    journal: std::collections::VecDeque<JournalEntry>,
+}
+
+/// One block's worth of rollback information.
+#[derive(Clone, Debug)]
+struct JournalEntry {
+    hash: Hash,
+    undo: chroma_state::UndoRecord,
 }
 
 impl ChainState {
     /// Create chain state with the genesis block.
     pub fn with_genesis() -> Self {
-        let genesis = build_genesis_block();
+        Self::with_params(ChainParams::devnet())
+    }
+
+    /// Create chain state with the genesis block of a specific network.
+    pub fn with_params(params: ChainParams) -> Self {
+        let genesis = build_genesis_block_with(&params);
         let genesis_hash = genesis.hash();
         let tip = ChainTip::new(&genesis);
 
@@ -275,71 +356,458 @@ impl ChainState {
         let mut tips = BTreeMap::new();
         tips.insert(genesis_hash, tip.clone());
 
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            genesis_hash,
+            BlockIndexEntry {
+                header: genesis.header.clone(),
+                cumulative_work: tip.cumulative_work,
+            },
+        );
+
         ChainState {
+            params,
             headers,
+            index,
             tip: tip.clone(),
             state: State::new(),
             tips,
+            journal: std::collections::VecDeque::new(),
         }
     }
 
     /// Validate and apply a new block to the best chain.
+    /// Validate a block and, if it now has the most work, make it the tip.
+    ///
+    /// Convenience for a chain that only ever extends; a reorg needs blocks
+    /// that are not in memory, so use [`ChainState::apply_block_with`].
     pub fn apply_block(&mut self, block: &Block) -> Result<()> {
+        self.apply_block_with(block, &NoBlockSource).map(|_| ())
+    }
+
+    /// Validate a block and apply the fork-choice rule.
+    ///
+    /// A block on a branch other than the active one is kept, but only becomes
+    /// the tip when its branch has more accumulated work (spec §2.1). Ties are
+    /// broken by the smaller tip hash.
+    pub fn apply_block_with(
+        &mut self,
+        block: &Block,
+        source: &dyn BlockSource,
+    ) -> Result<BlockOutcome> {
+        let hash = block.hash();
+        if self.index.contains_key(&hash) {
+            return Ok(BlockOutcome::Duplicate);
+        }
+
         let height = block.header.height.0;
+        if height == 0 {
+            return Err(CoreError::InvalidBlock(
+                "genesis is fixed by the network parameters".to_string(),
+            ));
+        }
 
-        let (previous_hash, previous_timestamp, current_supply) = if height == 0 {
-            (Hash::ZERO, 0u64, 0u64)
-        } else {
-            let prev = self.headers.get(&(height - 1)).ok_or_else(|| {
-                CoreError::InvalidBlock(format!("missing parent header at height {}", height - 1))
-            })?;
-            (prev.hash(), prev.timestamp, self.tip.supply)
-        };
+        let parent = self
+            .index
+            .get(&block.header.previous_hash)
+            .ok_or_else(|| {
+                CoreError::InvalidBlock(format!(
+                    "missing parent {} for block at height {}",
+                    block.header.previous_hash.to_hex(),
+                    height
+                ))
+            })?
+            .clone();
 
-        // Compute Median Time Past from the last MTP_WINDOW (7) block timestamps
-        let mtp = self.compute_median_time_past(height);
+        if parent.header.height.0 + 1 != height {
+            return Err(CoreError::InvalidBlock(format!(
+                "height {} does not follow parent at {}",
+                height, parent.header.height.0
+            )));
+        }
 
-        let expected_bits = calculate_target_for_height(height, &self.headers)?;
-
-        let ctx = BlockValidationContext {
-            previous_hash,
-            expected_height: BlockHeight(height),
-            previous_timestamp,
-            median_time_past: mtp,
-            expected_bits,
-            current_supply,
-            previous_state_root: self.tip.header.state_root,
-            network_time: block.header.timestamp,
-        };
-
-        chroma_block::validate_block(block, &ctx, &mut self.state)?;
-
-        let new_hash = block.hash();
         let block_work = U256::from_be_bytes(&chroma_crypto::randomx::calculate_work(
             &block.header.bits.to_full_target(),
         ));
-        let new_cumulative_work = self
-            .tip
+        let cumulative_work = parent
             .cumulative_work
             .checked_add(&block_work)
-            .ok_or_else(|| {
-                CoreError::Overflow("cumulative work overflow".into())
-            })?;
+            .ok_or_else(|| CoreError::Overflow("cumulative work overflow".into()))?;
 
-        self.headers.insert(height, block.header.clone());
+        let extends_tip = block.header.previous_hash == self.tip.hash;
+        let wins = Self::outranks(&cumulative_work, &hash, &self.tip.cumulative_work, &self.tip.hash);
 
-        let new_tip = ChainTip {
-            height: BlockHeight(height),
-            hash: new_hash,
+        if extends_tip {
+            // The common case: validate against the state we already hold.
+            let ctx = self.validation_context(block, &self.headers)?;
+            self.state.start_recording();
+            let outcome = chroma_block::validate_block(block, &ctx, &mut self.state);
+            let undo = self.state.finish_recording();
+            outcome?;
+            if let Some(undo) = undo {
+                self.push_journal(hash, undo);
+            }
+            self.record(block, cumulative_work);
+            self.headers.insert(height, block.header.clone());
+            self.set_tip(block, cumulative_work);
+            return Ok(BlockOutcome::Extended);
+        }
+
+        // A branch block. Validate it against its own branch's headers before
+        // deciding anything, so an invalid block never enters the index.
+        let branch_headers = self.branch_headers(&block.header.previous_hash);
+        let ctx = self.validation_context(block, &branch_headers)?;
+        let mut scratch = self.state_at(&block.header.previous_hash, source)?;
+        chroma_block::validate_block(block, &ctx, &mut scratch)?;
+
+        self.record(block, cumulative_work);
+
+        if !wins {
+            return Ok(BlockOutcome::SideBranch);
+        }
+
+        // This branch now has the most work: switch to it.
+        let depth = self.reorganize(block, cumulative_work, scratch);
+        Ok(BlockOutcome::Reorganized { depth })
+    }
+
+    /// Record how to undo the block that was just applied, dropping anything
+    /// older than the journal depth.
+    fn push_journal(&mut self, hash: Hash, undo: chroma_state::UndoRecord) {
+        use chroma_core::constants::REORG_JOURNAL_DEPTH;
+
+        self.journal.push_back(JournalEntry { hash, undo });
+        while self.journal.len() > REORG_JOURNAL_DEPTH as usize {
+            self.journal.pop_front();
+        }
+    }
+
+    /// How many blocks of the active chain can be rolled back without
+    /// rebuilding the state from genesis.
+    pub fn journal_depth(&self) -> usize {
+        self.journal.len()
+    }
+
+    /// Roll the active chain's state back to `target`, using the journal.
+    ///
+    /// Returns `None` when `target` is not within the journalled window, in
+    /// which case the caller has to rebuild instead.
+    fn unwind_to(&self, target: &Hash) -> Option<State> {
+        if *target == self.tip.hash {
+            return Some(self.state.clone());
+        }
+
+        // Walk back from the tip, undoing one block at a time, until the
+        // target is the block below the one just undone.
+        let mut state = self.state.clone();
+        for entry in self.journal.iter().rev() {
+            state.undo(&entry.undo);
+            let parent = self.index.get(&entry.hash)?.header.previous_hash;
+            if parent == *target {
+                return Some(state);
+            }
+        }
+        None
+    }
+
+    /// Fork-choice comparison: more work wins; on a tie, the smaller hash.
+    fn outranks(work: &U256, hash: &Hash, other_work: &U256, other_hash: &Hash) -> bool {
+        match work.cmp(other_work) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => hash.0 < other_hash.0,
+        }
+    }
+
+    fn record(&mut self, block: &Block, cumulative_work: U256) {
+        self.index.insert(
+            block.hash(),
+            BlockIndexEntry {
+                header: block.header.clone(),
+                cumulative_work,
+            },
+        );
+    }
+
+    fn set_tip(&mut self, block: &Block, cumulative_work: U256) {
+        let tip = ChainTip {
+            height: block.header.height,
+            hash: block.hash(),
             header: block.header.clone(),
-            cumulative_work: new_cumulative_work,
+            cumulative_work,
             supply: self.state.total_supply(),
         };
+        self.tip = tip.clone();
+        self.tips.insert(tip.hash, tip);
+    }
 
-        self.tip = new_tip.clone();
-        self.tips.insert(new_hash, new_tip);
+    /// Make `block`'s branch the active chain. Returns how many blocks of the
+    /// old chain were rolled back.
+    fn reorganize(&mut self, block: &Block, cumulative_work: U256, new_state: State) -> u32 {
+        let old_height = self.tip.height.0;
 
-        Ok(())
+        // Rebuild the active header map by walking the new branch back to
+        // genesis through the index.
+        let mut headers = BTreeMap::new();
+        let mut cursor = block.hash();
+        while let Some(entry) = self.index.get(&cursor) {
+            headers.insert(entry.header.height.0, entry.header.clone());
+            if entry.header.height.0 == 0 {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
+
+        let fork_height = self
+            .headers
+            .iter()
+            .filter(|(h, old)| headers.get(h).map(|new| new.hash() == old.hash()) == Some(true))
+            .map(|(h, _)| *h)
+            .max()
+            .unwrap_or(0);
+
+        self.headers = headers;
+        self.state = new_state;
+        // The journal described the chain we just left, so it no longer says
+        // how to undo anything. Keeping it would roll back into a branch that
+        // is not the active one.
+        self.journal.clear();
+        self.set_tip(block, cumulative_work);
+
+        old_height.saturating_sub(fork_height)
+    }
+
+    /// Headers along the branch ending at `tip_hash`, deep enough to compute
+    /// the next block's target and median time past.
+    fn branch_headers(&self, tip_hash: &Hash) -> BTreeMap<u32, BlockHeader> {
+        // The retarget reads the header a full window back, and the median
+        // covers MTP_WINDOW; take both plus slack.
+        let depth = DIFFICULTY_ADJUSTMENT_WINDOW as usize + MTP_WINDOW + 2;
+        let mut headers = BTreeMap::new();
+        let mut cursor = *tip_hash;
+        for _ in 0..depth {
+            match self.index.get(&cursor) {
+                Some(entry) => {
+                    headers.insert(entry.header.height.0, entry.header.clone());
+                    if entry.header.height.0 == 0 {
+                        break;
+                    }
+                    cursor = entry.header.previous_hash;
+                }
+                None => break,
+            }
+        }
+        headers
+    }
+
+    /// Rebuild the state at `hash` by unwinding to the fork point and
+    /// replaying that branch, when the fork point is inside the journal.
+    ///
+    /// Spec §2.3: reorgs within the journal window roll back; deeper ones fall
+    /// through to recomputing from genesis.
+    fn state_via_journal(
+        &self,
+        hash: &Hash,
+        source: &dyn BlockSource,
+    ) -> Result<Option<State>> {
+        // Collect the branch from `hash` down to the first block that is on
+        // the active chain.
+        let mut branch: Vec<Hash> = Vec::new();
+        let mut cursor = *hash;
+        let fork = loop {
+            let entry = match self.index.get(&cursor) {
+                Some(entry) => entry,
+                None => return Ok(None),
+            };
+            let height = entry.header.height.0;
+            if self.headers.get(&height).map(|h| h.hash()) == Some(cursor) {
+                break cursor;
+            }
+            branch.push(cursor);
+            if height == 0 {
+                return Ok(None);
+            }
+            cursor = entry.header.previous_hash;
+        };
+
+        let mut state = match self.unwind_to(&fork) {
+            Some(state) => state,
+            // The fork point is older than the journal keeps.
+            None => return Ok(None),
+        };
+
+        // Replay the branch forward. Its headers are needed for the target and
+        // median-time checks, so they are assembled as we go.
+        let mut headers = self.branch_headers(&fork);
+        branch.reverse();
+        for block_hash in branch {
+            let block = match source.get_block(&block_hash) {
+                Some(block) => block,
+                None => return Ok(None),
+            };
+            let ctx = self.validation_context(&block, &headers)?;
+            chroma_block::validate_block(&block, &ctx, &mut state)?;
+            headers.insert(block.header.height.0, block.header.clone());
+        }
+
+        Ok(Some(state))
+    }
+
+    /// The account state as of `hash`, rebuilt by replaying its branch.
+    ///
+    /// Replays from genesis. Spec §2.3 calls for a 2000-block journal so a
+    /// shallow reorg does not have to; that is an optimisation over this, not
+    /// a different answer.
+    fn state_at(&self, hash: &Hash, source: &dyn BlockSource) -> Result<State> {
+        if *hash == self.tip.hash {
+            return Ok(self.state.clone());
+        }
+
+        // The target may be an ancestor of the tip, or on a branch that leaves
+        // the active chain within the journalled window. Either way, unwinding
+        // to the fork point and replaying only the branch beats rebuilding
+        // from genesis.
+        if let Some(state) = self.state_via_journal(hash, source)? {
+            return Ok(state);
+        }
+
+        // Collect the branch, genesis first.
+        let mut chain: Vec<Hash> = Vec::new();
+        let mut cursor = *hash;
+        loop {
+            let entry = self.index.get(&cursor).ok_or_else(|| {
+                CoreError::InvalidBlock(format!("branch block {} is unknown", cursor.to_hex()))
+            })?;
+            chain.push(cursor);
+            if entry.header.height.0 == 0 {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
+        chain.reverse();
+
+        let mut state = State::new();
+        let mut headers: BTreeMap<u32, BlockHeader> = BTreeMap::new();
+
+        for block_hash in chain {
+            let entry = self
+                .index
+                .get(&block_hash)
+                .expect("collected from the index");
+            let height = entry.header.height.0;
+            if height == 0 {
+                headers.insert(0, entry.header.clone());
+                continue;
+            }
+
+            let block = source.get_block(&block_hash).ok_or_else(|| {
+                CoreError::InvalidBlock(format!(
+                    "cannot replay branch: block {} is not available",
+                    block_hash.to_hex()
+                ))
+            })?;
+
+            let ctx = self.validation_context(&block, &headers)?;
+            chroma_block::validate_block(&block, &ctx, &mut state)?;
+            headers.insert(height, entry.header.clone());
+        }
+
+        Ok(state)
+    }
+
+    /// The RandomX epoch seed for `height`, taken from the branch in
+    /// `headers`.
+    ///
+    /// Spec §3: the seed is the hash of the block at `epoch_start - lag`.
+    /// Before that block exists — and whenever the branch does not reach back
+    /// that far — the genesis seed stands in.
+    pub fn pow_seed_for(&self, height: u32, headers: &BTreeMap<u32, BlockHeader>) -> Hash {
+        use chroma_core::constants::{RANDOMX_EPOCH_LENGTH, RANDOMX_SEED_LAG};
+
+        match chroma_crypto::randomx::seed_height_for(
+            height,
+            RANDOMX_EPOCH_LENGTH,
+            RANDOMX_SEED_LAG,
+        ) {
+            Some(seed_height) => match headers.get(&seed_height) {
+                Some(header) => chroma_crypto::randomx::derive_seed(&header.hash()),
+                None => genesis_randomx_seed(),
+            },
+            None => genesis_randomx_seed(),
+        }
+    }
+
+    /// The epoch seed for a block, found along the branch it is building on.
+    ///
+    /// [`ChainState::pow_seed_for`] can only see the headers it is handed. For
+    /// the active chain that is every header, but a side branch is validated
+    /// against `branch_headers`, which reaches back far enough for the
+    /// retarget window and the median — about 19 blocks. The seed block is up
+    /// to `RANDOMX_EPOCH_LENGTH + RANDOMX_SEED_LAG` behind, so past height
+    /// 1000 the lookup missed and quietly fell back to the genesis seed.
+    /// Every valid block on a branch was then rejected, on every network that
+    /// uses RandomX, which is every network but regtest.
+    ///
+    /// The index holds every block we know, so the seed header is found by
+    /// walking the branch there rather than by carrying a thousand headers
+    /// into every validation.
+    fn pow_seed_on_branch(&self, block: &Block, headers: &BTreeMap<u32, BlockHeader>) -> Hash {
+        use chroma_core::constants::{RANDOMX_EPOCH_LENGTH, RANDOMX_SEED_LAG};
+
+        let seed_height = match chroma_crypto::randomx::seed_height_for(
+            block.header.height.0,
+            RANDOMX_EPOCH_LENGTH,
+            RANDOMX_SEED_LAG,
+        ) {
+            Some(height) => height,
+            None => return genesis_randomx_seed(),
+        };
+
+        if let Some(header) = headers.get(&seed_height) {
+            return chroma_crypto::randomx::derive_seed(&header.hash());
+        }
+
+        let mut cursor = block.header.previous_hash;
+        while let Some(entry) = self.index.get(&cursor) {
+            if entry.header.height.0 == seed_height {
+                return chroma_crypto::randomx::derive_seed(&entry.header.hash());
+            }
+            if entry.header.height.0 < seed_height {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
+
+        genesis_randomx_seed()
+    }
+
+    /// Build the validation context for `block` against a given header chain.
+    fn validation_context(
+        &self,
+        block: &Block,
+        headers: &BTreeMap<u32, BlockHeader>,
+    ) -> Result<BlockValidationContext> {
+        let height = block.header.height.0;
+        let parent = headers.get(&(height - 1)).ok_or_else(|| {
+            CoreError::InvalidBlock(format!("missing parent header at height {}", height - 1))
+        })?;
+
+        Ok(BlockValidationContext {
+            previous_hash: parent.hash(),
+            expected_height: BlockHeight(height),
+            previous_timestamp: parent.timestamp,
+            median_time_past: median_time_past(headers, height),
+            expected_bits: calculate_target_for_height_with(height, headers, &self.params)?,
+            current_supply: self.tip.supply,
+            previous_state_root: parent.state_root,
+            pow_algorithm: self.params.pow,
+            pow_seed: self.pow_seed_on_branch(block, headers),
+            // Wall-clock time, not the block's own timestamp. Passing the
+            // block's timestamp made the "not too far in the future" check
+            // compare the value against itself, so it always passed and
+            // spec §9's upper bound was never enforced.
+            network_time: now_secs(),
+        })
     }
 
     /// Select the best chain tip (greatest cumulative work).
@@ -350,20 +818,38 @@ impl ChainState {
     /// Compute Median Time Past from the last MTP_WINDOW (7) block timestamps.
     /// For height < MTP_WINDOW, uses timestamps from genesis to height-1.
     pub fn compute_median_time_past(&self, height: u32) -> u64 {
-        let mut timestamps: Vec<u64> = Vec::new();
-        let count = std::cmp::min(height as usize, MTP_WINDOW);
-        for i in 0..count {
-            let h = height - 1 - i as u32;
-            if let Some(header) = self.headers.get(&h) {
-                timestamps.push(header.timestamp);
-            }
-        }
-        if timestamps.is_empty() {
-            return 0;
-        }
-        timestamps.sort_unstable();
-        timestamps[timestamps.len() / 2]
+        median_time_past(&self.headers, height)
     }
+}
+
+/// Current wall-clock time in Unix seconds.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Median Time Past: the median timestamp of the `MTP_WINDOW` headers
+/// preceding `height`.
+///
+/// A block's timestamp must be strictly greater than this (spec §9). Shared
+/// by block validation and by headers-first sync, which validates timestamps
+/// against a header chain that has no blocks behind it yet.
+pub fn median_time_past(headers: &BTreeMap<u32, BlockHeader>, height: u32) -> u64 {
+    let mut timestamps: Vec<u64> = Vec::new();
+    let count = std::cmp::min(height as usize, MTP_WINDOW);
+    for i in 0..count {
+        let h = height - 1 - i as u32;
+        if let Some(header) = headers.get(&h) {
+            timestamps.push(header.timestamp);
+        }
+    }
+    if timestamps.is_empty() {
+        return 0;
+    }
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
 }
 
 // ============================================================================
@@ -373,6 +859,8 @@ impl ChainState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chroma_core::constants::{GENESIS_TARGET_BITS, GENESIS_TIMESTAMP};
+    use crate::params::{DEFAULT_MAX_TARGET as MAXIMUM_TARGET, DEFAULT_MIN_TARGET as MINIMUM_TARGET};
     use chroma_core::constants::MAX_DIFFICULTY_INCREASE_FACTOR;
 
     #[test]
@@ -594,27 +1082,27 @@ mod tests {
     #[test]
     fn test_mul_div_exact() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 3, 2).unwrap(), U256::from_u64(1500));
-        assert_eq!(mul_div(&a, 1, 2).unwrap(), U256::from_u64(500));
-        assert_eq!(mul_div(&a, 2, 2).unwrap(), U256::from_u64(1000));
+        assert_eq!(mul_div(&a, 3, 2), U256::from_u64(1500));
+        assert_eq!(mul_div(&a, 1, 2), U256::from_u64(500));
+        assert_eq!(mul_div(&a, 2, 2), U256::from_u64(1000));
     }
 
     #[test]
     fn test_mul_div_zero_denominator() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 3, 0).unwrap(), U256::ZERO);
+        assert_eq!(mul_div(&a, 3, 0), U256::ZERO);
     }
 
     #[test]
     fn test_mul_div_zero_numerator() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 0, 5).unwrap(), U256::ZERO);
+        assert_eq!(mul_div(&a, 0, 5), U256::ZERO);
     }
 
     #[test]
     fn test_mul_div_large_values() {
         let a = U256::from_u64(u64::MAX);
-        let result = mul_div(&a, 2, 3).unwrap();
+        let result = mul_div(&a, 2, 3);
         // u64::MAX * 2 / 3 ≈ 12297829382473034410
         let result_u64 = result.to_u64().unwrap();
         let expected = u64::MAX / 3 * 2;
@@ -622,10 +1110,59 @@ mod tests {
         assert!(diff < 2, "mul_div large: result={} expected={}", result_u64, expected);
     }
 
+    /// A target near the top of the range must not make the arithmetic give
+    /// up. `params.max_target` permits one, and returning an error there meant
+    /// no block at a retarget height could be produced or validated: a
+    /// difficulty low enough to be a nuisance became one low enough to stop
+    /// the chain.
+    #[test]
+    fn test_mul_div_saturates_instead_of_failing() {
+        // Doubling this once already leaves 256 bits.
+        let huge = U256::MAX;
+        assert_eq!(mul_div(&huge, 4, 1), U256::MAX);
+        assert_eq!(mul_div(&huge, 2, 1), U256::MAX);
+
+        // Halving it is still exact — saturation only applies where the true
+        // value does not fit.
+        let (half, _) = huge.div_rem(&U256::from_u64(2));
+        assert_eq!(mul_div(&huge, 1, 2), half);
+    }
+
+    /// The retarget must produce a usable target from a chain sitting at the
+    /// maximum, rather than an error.
+    #[test]
+    fn test_retarget_from_a_maximum_target() {
+        let params = ChainParams {
+            no_retargeting: false,
+            ..ChainParams::regtest()
+        };
+
+        let mut headers = BTreeMap::new();
+        for height in 0..DIFFICULTY_ADJUSTMENT_WINDOW {
+            let mut header = build_genesis_block_with(&params).header;
+            header.height = BlockHeight(height);
+            header.timestamp = 1_700_000_000 + height as u64;
+            headers.insert(height, header);
+        }
+
+        let bits = calculate_target_for_height_with(
+            DIFFICULTY_ADJUSTMENT_WINDOW,
+            &headers,
+            &params,
+        )
+        .expect("a retarget from the maximum target must not fail");
+
+        // Blocks arrived far faster than the target spacing, so the target
+        // should have come down rather than stayed put.
+        let old = U256::from_be_bytes(&params.genesis_bits.to_full_target());
+        let new = U256::from_be_bytes(&bits.to_full_target());
+        assert!(new < old, "faster blocks must raise the difficulty");
+    }
+
     #[test]
     fn test_mul_div_one_to_one() {
         let a = U256::from_u64(42);
-        assert_eq!(mul_div(&a, 1, 1).unwrap(), a);
+        assert_eq!(mul_div(&a, 1, 1), a);
     }
 
     #[test]

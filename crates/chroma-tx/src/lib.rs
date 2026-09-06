@@ -26,6 +26,18 @@ use chroma_crypto::schnorr::{compute_sighash, schnorr_sign, schnorr_verify, Publ
 // Transaction
 // ============================================================================
 
+/// Sentinel `sender_pubkey` marking a coinbase transaction.
+///
+/// A coinbase has no sender, so there is no key to put here. All-zero bytes
+/// are not a valid secp256k1 x-only public key, which is what makes the
+/// sentinel unforgeable: no signature can ever verify against it, so a
+/// coinbase-marked transaction outside slot 0 of a block is rejected by the
+/// ordinary signature check.
+pub const COINBASE_PUBKEY: [u8; 32] = [0u8; 32];
+
+/// Signature carried by a coinbase. There is nothing to sign against.
+pub const COINBASE_SIGNATURE: [u8; 64] = [0u8; 64];
+
 /// A signed transfer of CHR from sender to recipient.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Transaction {
@@ -94,8 +106,31 @@ impl Transaction {
         }
     }
 
+    /// True if this is a coinbase (protocol-level mint, no sender).
+    pub fn is_coinbase(&self) -> bool {
+        self.sender_pubkey.0 == COINBASE_PUBKEY
+    }
+
+    /// Build the coinbase paying `recipient`.
+    pub fn coinbase(recipient: Address, amount: Amount) -> Self {
+        Transaction {
+            sender_pubkey: PublicKey32(COINBASE_PUBKEY),
+            recipient,
+            amount,
+            nonce: Nonce(0),
+            signature: Signature64(COINBASE_SIGNATURE),
+        }
+    }
+
     /// Verify signature using the embedded sender public key.
+    ///
+    /// Always false for a coinbase: the sentinel key cannot verify anything.
+    /// Block validation exempts slot 0 explicitly, so this failing is what
+    /// stops a coinbase-marked transaction anywhere else from minting coins.
     pub fn verify_signature(&self) -> bool {
+        if self.is_coinbase() {
+            return false;
+        }
         let sighash = self.preimage().sighash();
         schnorr_verify(&self.sender_pubkey, &sighash, &self.signature)
     }
@@ -175,7 +210,11 @@ impl CanonicalEncode for Transaction {
 
 impl CanonicalDecode for Transaction {
     fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() < Self::SERIALIZED_SIZE {
+        // Exact length: `CanonicalDecode::decode` is specified as strict, and
+        // a transaction is fixed width. Accepting trailing bytes would let the
+        // same transaction be encoded many ways, each with a different hash.
+        // Use `decode_partial` to read one transaction out of a longer buffer.
+        if data.len() != Self::SERIALIZED_SIZE {
             return Err(CoreError::Serialization(format!(
                 "transaction: expected {} bytes, got {}",
                 Self::SERIALIZED_SIZE,
@@ -185,8 +224,15 @@ impl CanonicalDecode for Transaction {
 
         let mut pubkey_bytes = [0u8; 32];
         pubkey_bytes.copy_from_slice(&data[0..32]);
-        let sender_pubkey = PublicKey32::from_bytes(pubkey_bytes)
-            .map_err(|e| CoreError::Serialization(format!("invalid sender pubkey: {}", e)))?;
+        // The coinbase sentinel is deliberately not a valid curve point, so it
+        // has to bypass key parsing — otherwise every mined block would fail
+        // to decode and could be neither stored nor relayed.
+        let sender_pubkey = if pubkey_bytes == COINBASE_PUBKEY {
+            PublicKey32(COINBASE_PUBKEY)
+        } else {
+            PublicKey32::from_bytes(pubkey_bytes)
+                .map_err(|e| CoreError::Serialization(format!("invalid sender pubkey: {}", e)))?
+        };
 
         let mut recipient_bytes = [0u8; 20];
         recipient_bytes.copy_from_slice(&data[32..52]);
@@ -214,7 +260,17 @@ impl CanonicalDecode for Transaction {
     }
 
     fn decode_partial(data: &[u8]) -> Result<(Self, usize)> {
-        let tx = Transaction::decode(data)?;
+        // Take exactly one transaction off the front; the caller owns the
+        // rest. `decode` is strict about length, so it must be given a slice
+        // of exactly one transaction rather than the whole buffer.
+        if data.len() < Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "transaction: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let tx = Transaction::decode(&data[..Self::SERIALIZED_SIZE])?;
         Ok((tx, Self::SERIALIZED_SIZE))
     }
 }
@@ -500,6 +556,72 @@ mod tests {
         let encoded = tx.encode();
         assert_eq!(encoded.len(), Transaction::SERIALIZED_SIZE);
         assert_eq!(encoded.len(), 132);
+    }
+
+    #[test]
+    fn test_coinbase_round_trips() {
+        // The miner builds exactly this. Before the sentinel was recognised,
+        // it encoded fine and then failed to decode, so a mined block could be
+        // neither stored nor relayed.
+        let recipient = Address::from_hash160(Hash160([0xAB; 20]));
+        let coinbase = Transaction::coinbase(recipient, Amount(1_000_000));
+        assert!(coinbase.is_coinbase());
+
+        let bytes = coinbase.encode();
+        assert_eq!(bytes.len(), Transaction::SERIALIZED_SIZE);
+        let decoded = Transaction::decode(&bytes).expect("coinbase must decode");
+        assert_eq!(decoded, coinbase);
+        assert!(decoded.is_coinbase());
+        assert_eq!(decoded.recipient, recipient);
+        assert_eq!(decoded.amount, Amount(1_000_000));
+    }
+
+    #[test]
+    fn test_coinbase_never_verifies() {
+        // This is what keeps the sentinel from being a minting hole: a
+        // coinbase-marked transaction outside slot 0 fails the ordinary
+        // signature check that every non-coinbase transaction must pass.
+        let coinbase = Transaction::coinbase(
+            Address::from_hash160(Hash160([0x11; 20])),
+            Amount(1_000_000),
+        );
+        assert!(!coinbase.verify_signature());
+    }
+
+    #[test]
+    fn test_ordinary_transaction_is_not_coinbase() {
+        let secret = SecretKey32::generate();
+        let pubkey = PublicKey32::from_secret(&secret).unwrap();
+        let sender = Address::from_hash160(Hash160(hash160(&pubkey.0)));
+        let recipient = Address::from_hash160(Hash160([0x22; 20]));
+        let tx = create_transaction(&secret, sender, recipient, Amount(10), Nonce(0)).unwrap();
+        assert!(!tx.is_coinbase());
+        assert!(tx.verify_signature());
+    }
+
+    #[test]
+    fn test_decode_rejects_trailing_bytes() {
+        let recipient = Address::from_hash160(Hash160([0xCD; 20]));
+        let mut bytes = Transaction::coinbase(recipient, Amount(5)).encode();
+        bytes.push(0x00);
+        assert!(
+            Transaction::decode(&bytes).is_err(),
+            "trailing bytes would give one transaction several encodings"
+        );
+    }
+
+    #[test]
+    fn test_decode_partial_reads_one_of_many() {
+        let a = Transaction::coinbase(Address::from_hash160(Hash160([1; 20])), Amount(1));
+        let b = Transaction::coinbase(Address::from_hash160(Hash160([2; 20])), Amount(2));
+        let mut buf = a.encode();
+        buf.extend_from_slice(&b.encode());
+
+        let (first, used) = Transaction::decode_partial(&buf).unwrap();
+        assert_eq!(used, Transaction::SERIALIZED_SIZE);
+        assert_eq!(first, a);
+        let (second, _) = Transaction::decode_partial(&buf[used..]).unwrap();
+        assert_eq!(second, b);
     }
 
     #[test]

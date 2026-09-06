@@ -43,6 +43,13 @@ fn hash_to_height_key(hash: &Hash) -> Vec<u8> {
     key
 }
 
+/// Big-endian height so the index iterates in chain order.
+fn height_to_hash_key(height: u32) -> Vec<u8> {
+    let mut key = b"height_to_hash:".to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
 fn account_key(address: &Address) -> Vec<u8> {
     let mut key = b"accounts:".to_vec();
     key.extend_from_slice(address.as_hash160().as_bytes());
@@ -198,12 +205,47 @@ impl Storage {
             .insert(&key, encoded)
             .map_err(|e| CoreError::Storage(format!("put_block: {}", e)))?;
 
-        // Also store hash→height mapping
+        // Also store hash→height mapping. This one belongs to the block
+        // itself — a block's height is part of it — so it is safe to write for
+        // any block we hold.
         let height_key = hash_to_height_key(&hash);
         self.db
             .insert(height_key, block.header.height.0.to_le_bytes().to_vec())
             .map_err(|e| CoreError::Storage(format!("put_block height mapping: {}", e)))?;
 
+        // The reverse index is deliberately not written here. It names the
+        // active chain's block at a height, and blocks are stored before
+        // anyone knows whether they will be on the active chain — a losing
+        // branch is stored precisely so a later reorg can replay it. Writing
+        // it here let a side branch repoint the height at itself.
+        // [`Storage::mark_active`] is where that happens.
+        Ok(())
+    }
+
+    /// Retrieve the block hash stored at a height on the active chain.
+    pub fn get_hash_for_height(&self, height: u32) -> Result<Option<Hash>> {
+        match self
+            .db
+            .get(height_to_hash_key(height))
+            .map_err(|e| CoreError::Storage(format!("get_hash_for_height: {}", e)))?
+        {
+            Some(data) => {
+                let hash = Hash::from_slice(&data)
+                    .map_err(|e| CoreError::Storage(format!("hash index: {}", e)))?;
+                Ok(Some(hash))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Point the height index at `hash`, replacing whatever was there.
+    ///
+    /// A reorg reuses heights, so the index must be rewritten for the new
+    /// branch rather than only appended to.
+    pub fn set_hash_for_height(&self, height: u32, hash: &Hash) -> Result<()> {
+        self.db
+            .insert(height_to_hash_key(height), hash.as_bytes().to_vec())
+            .map_err(|e| CoreError::Storage(format!("set_hash_for_height: {}", e)))?;
         Ok(())
     }
 
@@ -242,25 +284,16 @@ impl Storage {
         }
     }
 
-    /// Get a block by height (looks up hash from tip chain, then fetches block).
-    /// This requires the block to be at a known height.
+    /// Get the block stored at a height on the active chain.
+    ///
+    /// Uses the height→hash index; previously this scanned every
+    /// `hash_to_height` entry in the database on each lookup, which made
+    /// serving a range of blocks quadratic in chain length.
     pub fn get_block_by_height(&self, height: u32) -> Result<Option<Block>> {
-        // We need to find the block hash at this height.
-        // Scan hash_to_height for matching height.
-        let height_bytes = height.to_le_bytes();
-        for entry in self
-            .db
-            .scan_prefix(b"hash_to_height:")
-        {
-            let (key, val) = entry.map_err(|e| CoreError::Storage(format!("scan: {}", e)))?;
-            if val.len() >= 4 && val[..4] == height_bytes {
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&key[15..]); // skip "hash_to_height:" prefix
-                let hash = Hash::from_bytes(hash_bytes);
-                return self.get_block_by_hash(&hash);
-            }
+        match self.get_hash_for_height(height)? {
+            Some(hash) => self.get_block_by_hash(&hash),
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     // ========================================================================
@@ -392,18 +425,127 @@ impl Storage {
     // Batch Operations
     // ========================================================================
 
-    /// Apply a full block to storage: header, full block, hash mapping.
-    pub fn apply_block(&self, block: &Block) -> Result<()> {
+    /// Record that a block is the active chain's block at its height.
+    ///
+    /// The height-keyed records — the header and the height→hash index —
+    /// describe the active chain, not everything we have stored. Two blocks
+    /// can exist at one height; only one of them is the answer to "what is at
+    /// height H", and the caller is the only one that knows which. A reorg
+    /// rewrites these for every height it moved.
+    pub fn mark_active(&self, block: &Block) -> Result<()> {
         let height = block.header.height.0;
         self.put_header(height, &block.header)?;
+        self.set_hash_for_height(height, &block.hash())?;
+        Ok(())
+    }
+
+    /// Forget the active-chain records above `height`.
+    ///
+    /// A reorg can move the tip to a chain that is shorter than the one it
+    /// replaced, since fork choice is on work and not on length. The heights
+    /// past the new tip would otherwise keep answering with blocks from the
+    /// chain that lost. The blocks themselves are left alone: they are still
+    /// reachable by hash, and a later reorg may need to replay them.
+    ///
+    /// Walks up from `height + 1` and stops at the first height with nothing
+    /// stored, so it costs what it removes rather than a scan of the chain.
+    pub fn clear_heights_above(&self, height: u32) -> Result<()> {
+        let mut h = height.saturating_add(1);
+        loop {
+            let removed = self
+                .db
+                .remove(height_to_hash_key(h))
+                .map_err(|e| CoreError::Storage(format!("clear_heights_above: {}", e)))?;
+            let removed_header = self
+                .db
+                .remove(header_key(h))
+                .map_err(|e| CoreError::Storage(format!("clear_heights_above: {}", e)))?;
+            if removed.is_none() && removed_header.is_none() {
+                return Ok(());
+            }
+            match h.checked_add(1) {
+                Some(next) => h = next,
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Store a block and mark it active, for one that extended the tip.
+    ///
+    /// A block that might be on a losing branch must be stored with
+    /// [`Storage::put_block`] instead, and marked active only if it wins.
+    pub fn apply_block(&self, block: &Block) -> Result<()> {
         self.put_block(block)?;
+        self.mark_active(block)?;
         Ok(())
     }
 
     /// Store all accounts from a State.
+    /// Persist every account, replacing whatever was stored before.
+    ///
+    /// This used to write only the supply despite its name, so balances were
+    /// never persisted at all and every `wallet balance` reported "account not
+    /// found" no matter how much had been mined.
+    ///
+    /// Stored accounts are cleared first: a reorg can remove an account
+    /// entirely, and leaving the old row behind would report a balance that
+    /// the active chain does not agree with. That makes this O(accounts) per
+    /// call; writing only what changed is the optimisation.
     pub fn put_state(&self, state: &State) -> Result<()> {
+        // One batch rather than an insert per account: this runs after every
+        // block, and issuing thousands of individual writes made it the most
+        // expensive thing in the block path by a wide margin (60 ms at 10k
+        // accounts, against 2 ms to recompute the state root).
+        let mut batch = sled::Batch::default();
+
+        let live: std::collections::HashSet<Vec<u8>> = state
+            .accounts()
+            .map(|(address, _)| account_key(&address))
+            .collect();
+
+        for entry in self.db.scan_prefix(b"accounts:") {
+            let (key, _) =
+                entry.map_err(|e| CoreError::Storage(format!("put_state scan: {}", e)))?;
+            let key = key.to_vec();
+            if !live.contains(&key) {
+                batch.remove(key);
+            }
+        }
+
+        for (address, account) in state.accounts() {
+            let mut value = Vec::with_capacity(16);
+            value.extend_from_slice(&account.balance.to_le_bytes());
+            value.extend_from_slice(&account.nonce.to_le_bytes());
+            batch.insert(account_key(&address), value);
+        }
+
+        self.db
+            .apply_batch(batch)
+            .map_err(|e| CoreError::Storage(format!("put_state: {}", e)))?;
         self.put_supply(state.total_supply())?;
         Ok(())
+    }
+
+    /// Load every stored account into a `State`.
+    ///
+    /// Lets a restart resume from the persisted state instead of revalidating
+    /// the whole chain. The caller must check the resulting state root against
+    /// the stored tip before trusting it.
+    pub fn load_state(&self) -> Result<State> {
+        let mut state = State::new();
+        for entry in self.db.scan_prefix(b"accounts:") {
+            let (key, value) =
+                entry.map_err(|e| CoreError::Storage(format!("load_state scan: {}", e)))?;
+            if key.len() != b"accounts:".len() + 20 {
+                continue;
+            }
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&key[b"accounts:".len()..]);
+            let account = Account::decode_stored(&value)?;
+            state.restore_account(&Address::from_hash160(chroma_core::hash::Hash160(addr)), account);
+        }
+        state.restore_supply(self.get_supply()?);
+        Ok(state)
     }
 
     /// Flush all pending writes to disk.
@@ -453,6 +595,81 @@ mod tests {
         }
     }
 
+    /// A block is stored before anyone knows whether it will be on the active
+    /// chain — a losing branch is stored precisely so a later reorg can replay
+    /// it. Storing one must not repoint its height at itself: `put_block` used
+    /// to write the height→hash index, so a side branch arriving at a height
+    /// silently became the answer for that height, and a restart replayed the
+    /// wrong block.
+    #[test]
+    fn test_storing_a_side_branch_does_not_take_over_its_height() {
+        let storage = Storage::open_temporary().unwrap();
+
+        let active = test_block(7);
+        storage.apply_block(&active).unwrap();
+
+        // Same height, different block: a competing branch.
+        let mut rival = test_block(7);
+        rival.header.nonce = 99;
+        assert_ne!(rival.hash(), active.hash());
+        storage.put_block(&rival).unwrap();
+
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(active.hash()),
+            "the active chain's block must still be the answer for its height"
+        );
+        assert_eq!(
+            storage.get_header(7).unwrap().map(|h| h.hash()),
+            Some(active.hash()),
+            "the stored header at a height is the active chain's"
+        );
+
+        // The rival is still readable by hash, which is what a reorg needs.
+        assert_eq!(
+            storage.get_block_by_hash(&rival.hash()).unwrap().map(|b| b.hash()),
+            Some(rival.hash())
+        );
+
+        // ...and it takes over once it is the one that won.
+        storage.mark_active(&rival).unwrap();
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(rival.hash())
+        );
+    }
+
+    /// Fork choice is on work, not length, so a reorg can leave the tip lower
+    /// than it was. The heights above it must stop answering with the chain
+    /// that lost.
+    #[test]
+    fn test_clearing_heights_above_a_lower_tip() {
+        let storage = Storage::open_temporary().unwrap();
+
+        for height in 1..=5 {
+            storage.apply_block(&test_block(height)).unwrap();
+        }
+        assert!(storage.get_block_by_height(5).unwrap().is_some());
+
+        storage.clear_heights_above(3).unwrap();
+
+        assert!(storage.get_block_by_height(3).unwrap().is_some());
+        for height in 4..=5 {
+            assert!(
+                storage.get_block_by_height(height).unwrap().is_none(),
+                "height {} is above the tip and must not answer",
+                height
+            );
+            assert!(storage.get_header(height).unwrap().is_none());
+        }
+
+        // The blocks themselves survive: a later reorg may replay them.
+        assert!(storage
+            .get_block_by_hash(&test_block(5).hash())
+            .unwrap()
+            .is_some());
+    }
+
     fn test_address(n: u8) -> Address {
         let mut h = [0u8; 20];
         h[0] = n;
@@ -463,6 +680,140 @@ mod tests {
     fn test_open_and_close() {
         let storage = Storage::open_temporary().unwrap();
         let _ = storage;
+    }
+
+    #[test]
+    fn test_put_state_persists_accounts() {
+        // put_state used to write only the supply, so balances never reached
+        // disk and every balance query reported "account not found".
+        let storage = Storage::open_temporary().unwrap();
+        let mut state = State::new();
+        state.apply_subsidy(&test_address(1), 1).unwrap();
+        state.apply_subsidy(&test_address(2), 2).unwrap();
+
+        storage.put_state(&state).unwrap();
+
+        let a = storage.get_account(&test_address(1)).unwrap().unwrap();
+        assert_eq!(a.balance, 1_000_000);
+        let b = storage.get_account(&test_address(2)).unwrap().unwrap();
+        assert_eq!(b.balance, 1_000_000);
+        assert_eq!(storage.get_supply().unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn test_put_state_drops_accounts_the_chain_no_longer_has() {
+        // A reorg can remove an account entirely; the stored row must go with
+        // it, or the balance query answers from an abandoned branch.
+        let storage = Storage::open_temporary().unwrap();
+
+        let mut before = State::new();
+        before.apply_subsidy(&test_address(1), 1).unwrap();
+        storage.put_state(&before).unwrap();
+        assert!(storage.get_account(&test_address(1)).unwrap().is_some());
+
+        let mut after = State::new();
+        after.apply_subsidy(&test_address(2), 1).unwrap();
+        storage.put_state(&after).unwrap();
+
+        assert!(
+            storage.get_account(&test_address(1)).unwrap().is_none(),
+            "the abandoned branch's account must not survive"
+        );
+        assert!(storage.get_account(&test_address(2)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_load_state_round_trips() {
+        let storage = Storage::open_temporary().unwrap();
+        let mut state = State::new();
+        for i in 1..=5u8 {
+            state.apply_subsidy(&test_address(i), i as u32).unwrap();
+        }
+        storage.put_state(&state).unwrap();
+
+        let loaded = storage.load_state().unwrap();
+        assert_eq!(loaded.account_count(), state.account_count());
+        assert_eq!(loaded.total_supply(), state.total_supply());
+        assert_eq!(
+            loaded.compute_state_root(),
+            state.compute_state_root(),
+            "a restored state must commit to the same root"
+        );
+        for i in 1..=5u8 {
+            assert_eq!(
+                loaded.get_account(&test_address(i)).balance,
+                state.get_account(&test_address(i)).balance
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_state_of_empty_database() {
+        let storage = Storage::open_temporary().unwrap();
+        let loaded = storage.load_state().unwrap();
+        assert_eq!(loaded.account_count(), 0);
+        assert_eq!(loaded.total_supply(), 0);
+        assert_eq!(loaded.compute_state_root(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_height_index_round_trip() {
+        let storage = Storage::open_temporary().unwrap();
+        let block = test_block(7);
+        storage.apply_block(&block).unwrap();
+
+        assert_eq!(
+            storage.get_hash_for_height(7).unwrap(),
+            Some(block.hash()),
+            "a block marked active must answer for its height"
+        );
+        assert_eq!(
+            storage.get_block_by_height(7).unwrap().map(|b| b.hash()),
+            Some(block.hash())
+        );
+        assert!(storage.get_block_by_height(8).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_height_index_is_rewritable_for_reorg() {
+        // A reorg reuses heights, so the index has to be repointable rather
+        // than append-only.
+        let storage = Storage::open_temporary().unwrap();
+
+        let mut original = test_block(3);
+        original.header.nonce = 1;
+        storage.put_block(&original).unwrap();
+
+        let mut replacement = test_block(3);
+        replacement.header.nonce = 2;
+        storage.put_block(&replacement).unwrap();
+        assert_ne!(original.hash(), replacement.hash());
+
+        storage
+            .set_hash_for_height(3, &replacement.hash())
+            .unwrap();
+        assert_eq!(
+            storage.get_block_by_height(3).unwrap().map(|b| b.hash()),
+            Some(replacement.hash()),
+            "the height index must follow the active branch"
+        );
+
+        // The displaced block is still retrievable by hash.
+        assert!(storage.get_block_by_hash(&original.hash()).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_height_index_survives_many_blocks() {
+        let storage = Storage::open_temporary().unwrap();
+        for h in 0..50u32 {
+            storage.apply_block(&test_block(h)).unwrap();
+        }
+        for h in 0..50u32 {
+            assert_eq!(
+                storage.get_block_by_height(h).unwrap().map(|b| b.header.height.0),
+                Some(h)
+            );
+        }
     }
 
     #[test]

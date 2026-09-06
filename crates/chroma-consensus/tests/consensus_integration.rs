@@ -171,17 +171,16 @@ fn test_block_assembly_and_mining() {
     let ctx = BlockAssemblyContext {
         height: BlockHeight(1),
         previous_hash: genesis.hash(),
-        previous_timestamp: genesis.header.timestamp,
-        state_root: Hash::ZERO,
+        timestamp: genesis.header.timestamp + 10,
         bits: easy_bits(),
         coinbase_recipient: alice_addr(),
     };
 
-    let mut block = assemble_block(&ctx, &[]).unwrap();
+    let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
     assert_eq!(block.transactions.len(), 1);
     assert_eq!(block.transactions[0].amount.0, BLOCK_REWARD_UNITS);
 
-    mine_block_with_limit(&mut block, 10_000_000).unwrap();
+    mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let target = block.header.bits.to_full_target();
     assert!(chroma_crypto::randomx::hash_meets_target(&block.header.hash(), &target));
@@ -191,7 +190,7 @@ fn test_block_assembly_and_mining() {
 
 #[test]
 fn test_block_reward_exact_amount() {
-    let mut state = State::new();
+    let state = State::new();
     let subsidy = state.block_subsidy(0).unwrap();
     assert_eq!(subsidy, BLOCK_REWARD_UNITS);
 }
@@ -465,6 +464,7 @@ fn test_wire_message_roundtrip() {
         timestamp: 1767225600,
         height: 42,
         nonce: 0xDEADBEEF,
+        listen_port: 8333,
     };
     let msg = Message::new(MessageType::Version, version.encode());
     let encoded = msg.encode();
@@ -478,6 +478,7 @@ fn test_wire_message_roundtrip() {
     assert_eq!(decoded_version.version, 1);
     assert_eq!(decoded_version.height, 42);
     assert_eq!(decoded_version.nonce, 0xDEADBEEF);
+    assert_eq!(decoded_version.listen_port, 8333);
 }
 
 #[test]
@@ -684,7 +685,7 @@ fn test_end_to_end_devnet() {
     use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext};
     use chroma_consensus::ChainState;
 
-    let mut chain = ChainState::with_genesis();
+    let chain = ChainState::with_genesis();
 
     let wallet = chroma_wallet::Wallet::generate("devnet-test");
     let recipient = wallet.address();
@@ -697,20 +698,18 @@ fn test_end_to_end_devnet() {
     let sender = Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)));
     state.apply_subsidy(&sender, 0).unwrap();
 
-    let state_root = state.compute_state_root();
 
     let genesis = chain.best_tip().clone();
     let ctx = BlockAssemblyContext {
         height: BlockHeight(1),
         previous_hash: genesis.hash,
-        previous_timestamp: genesis.header.timestamp,
-        state_root,
+        timestamp: genesis.header.timestamp + 10,
         bits: easy_bits(),
         coinbase_recipient: recipient,
     };
 
-    let mut block = assemble_block(&ctx, &[]).unwrap();
-    mine_block_with_limit(&mut block, 10_000_000).unwrap();
+    let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
+    mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
     let target = block.header.bits.to_full_target();
     assert!(
@@ -780,6 +779,8 @@ fn test_mtp_enforced_in_block_validation() {
         current_supply: 0,
         previous_state_root: Hash::ZERO,
         network_time: genesis.header.timestamp + 2000,
+        pow_algorithm: chroma_crypto::randomx::PowAlgorithm::Blake3,
+        pow_seed: chroma_core::hash::Hash::ZERO,
     };
 
     let block = Block {
@@ -918,23 +919,25 @@ fn test_chain_state_loads_from_storage() {
     let mut tips = BTreeMap::new();
     tips.insert(loaded_tip.hash, chain_tip.clone());
 
-    let chain = ChainState {
-        headers,
-        tip: chain_tip,
-        state: chroma_state::State::new(),
-        tips,
-    };
+    // What the round trip has to preserve is the tip: the same block, at the
+    // same height, with the work that was recorded for it.
+    assert_eq!(chain_tip.height, BlockHeight(0));
+    assert_eq!(chain_tip.hash, genesis_hash);
+    assert!(chain_tip.cumulative_work > U256::ZERO);
+    assert_eq!(headers.get(&0).map(|h| h.hash()), Some(genesis_hash));
+    assert!(tips.contains_key(&genesis_hash));
 
-    assert_eq!(chain.tip.height, BlockHeight(0));
-    assert_eq!(chain.tip.hash, genesis_hash);
-    assert!(chain.best_tip().cumulative_work > U256::ZERO);
+    // ...and a chain built from the same parameters agrees with it.
+    let chain = ChainState::with_params(chroma_consensus::ChainParams::devnet());
+    assert_eq!(chain.tip.hash, chain_tip.hash);
+    assert_eq!(chain.best_tip().cumulative_work, chain_tip.cumulative_work);
 }
 
 #[test]
 fn test_devnet_multi_block_mining_and_storage() {
     use chroma_storage::Storage;
     use chroma_consensus::{
-        build_genesis_block, ChainState, calculate_target_for_height,
+        build_genesis_block, ChainState,
         miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext},
     };
     use chroma_core::types::{BlockHeight, Address, CompactTarget};
@@ -969,7 +972,7 @@ fn test_devnet_multi_block_mining_and_storage() {
     let blocks_to_mine = 3u32;
 
     for expected_height in 1..=blocks_to_mine {
-        let (prev_hash, prev_ts, state_root) = {
+        let (prev_hash, prev_ts, _state_root) = {
             let tip = chain.best_tip();
             (tip.hash, tip.header.timestamp, tip.header.state_root)
         };
@@ -977,15 +980,14 @@ fn test_devnet_multi_block_mining_and_storage() {
         let ctx = BlockAssemblyContext {
             height: BlockHeight(expected_height),
             previous_hash: prev_hash,
-            previous_timestamp: prev_ts,
-            state_root,
+            timestamp: prev_ts + 10,
             bits: easy_bits,
             coinbase_recipient: miner_addr.clone(),
         };
 
-        let mut block = assemble_block(&ctx, &[]).unwrap();
+        let mut block = assemble_block(&ctx, &[], &State::new()).unwrap();
         block.header.timestamp = prev_ts + 10;
-        mine_block_with_limit(&mut block, 10_000_000).unwrap();
+        mine_block_with_limit(&mut block, 10_000_000, &chroma_consensus::miner::PowContext::blake3()).unwrap();
 
         let block_hash = block.hash();
         chain.headers.insert(expected_height, block.header.clone());
