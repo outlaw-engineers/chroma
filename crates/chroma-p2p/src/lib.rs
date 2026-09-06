@@ -172,6 +172,18 @@ fn run_mining_thread(rx: std::sync::mpsc::Receiver<MineRequest>) {
     }
 }
 
+/// Summarise a chain tip for a client asking where the node stands.
+fn chroma_p2p_wire_chain_info(
+    cs: &chroma_consensus::ChainState,
+) -> crate::wire::ChainInfoMessage {
+    crate::wire::ChainInfoMessage {
+        height: cs.tip.height.0,
+        tip: cs.tip.hash,
+        bits: cs.tip.header.bits.0,
+        supply: cs.tip.supply,
+    }
+}
+
 /// Check that a data directory belongs to the network we are about to run.
 ///
 /// A data directory holds one network's chain, and nothing about the files
@@ -1738,7 +1750,40 @@ impl Node {
                 Ok(true)
             }
 
-            MessageType::Reject | MessageType::NotFound => Ok(true),
+            // Chain and account queries. A client cannot read the database
+            // while the node holds it, so it asks over the connection it
+            // already has — the same one it submits transactions on.
+            MessageType::GetChainInfo => {
+                let info = {
+                    let cs = ctx.chain_state.read().await;
+                    chroma_p2p_wire_chain_info(&cs)
+                };
+                Self::send(out_tx, Message::new(MessageType::ChainInfo, info.encode())).await?;
+                Ok(true)
+            }
+
+            MessageType::GetAccount => {
+                let request = crate::wire::GetAccountMessage::decode(&msg.payload)?;
+                let answer = {
+                    let cs = ctx.chain_state.read().await;
+                    let account = cs.state.get_account(&request.address);
+                    crate::wire::AccountMessage {
+                        address: request.address,
+                        exists: cs.state.has_account(&request.address),
+                        balance: account.balance,
+                        nonce: account.nonce,
+                    }
+                };
+                Self::send(out_tx, Message::new(MessageType::Account, answer.encode())).await?;
+                Ok(true)
+            }
+
+            // Answers to queries we did not ask, and the two notices that
+            // carry nothing to act on.
+            MessageType::ChainInfo
+            | MessageType::Account
+            | MessageType::Reject
+            | MessageType::NotFound => Ok(true),
         }
     }
 
