@@ -189,3 +189,62 @@ fn real_networks_are_configured_for_randomx() {
         "regtest stays cheap on purpose"
     );
 }
+
+/// Headers-first sync must check proof of work with the network's own
+/// function, not with the header's identity hash.
+///
+/// Those are different values on a RandomX network: a block is identified by
+/// BLAKE3 of its header, but what has to meet the target is the RandomX hash
+/// keyed by the epoch seed. Checking the identity hash rejected every honestly
+/// mined header — and penalized the peer that sent it — so headers-first sync
+/// could not advance on mainnet, testnet or devnet. Only regtest, whose proof
+/// of work is BLAKE3, agreed with it.
+///
+/// This lives here rather than beside the syncer's other tests because it
+/// needs a real RandomX solution, which those cannot afford to mine.
+#[test]
+fn syncer_accepts_a_genuinely_mined_randomx_header() {
+    let params = randomx_params();
+    let genesis = build_genesis_block_with(&params);
+    let state = State::new();
+
+    let pow = PowContext {
+        algorithm: PowAlgorithm::RandomX,
+        seed: chroma_consensus::genesis_randomx_seed(),
+    };
+    // Regtest's target is easy enough that a header's identity hash often
+    // clears it by luck, and such a header proves nothing here: the point is a
+    // header the old check would have rejected. So keep mining, moving the
+    // timestamp, until the RandomX hash is a solution and the identity hash is
+    // not — about half of attempts.
+    let mut block = None;
+    for offset in 0..32u64 {
+        let ctx = BlockAssemblyContext {
+            height: BlockHeight(1),
+            previous_hash: genesis.hash(),
+            timestamp: genesis.header.timestamp + 10 + offset,
+            bits: genesis.header.bits,
+            coinbase_recipient: payout(),
+        };
+        let mut candidate = assemble_block(&ctx, &[], &state).unwrap();
+        mine_block_with_limit(&mut candidate, 200, &pow)
+            .expect("a solution should be a few hashes away");
+
+        let target = candidate.header.bits.to_full_target();
+        if !chroma_crypto::randomx::hash_meets_target(&candidate.hash(), &target) {
+            block = Some(candidate);
+            break;
+        }
+    }
+    let block = block.expect("a header whose identity hash misses the target");
+
+    let mut syncer = chroma_p2p::sync::ChainSyncer::with_params(params);
+    let batch = syncer.absorb_headers(std::slice::from_ref(&block.header));
+    assert!(
+        batch.is_clean(),
+        "an honestly mined header must be accepted: {:?}",
+        batch.rejected
+    );
+    assert_eq!(batch.accepted, 1);
+    assert_eq!(syncer.best_hash, block.hash());
+}

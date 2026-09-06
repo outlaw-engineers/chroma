@@ -98,6 +98,29 @@ impl ChainSyncer {
         }
     }
 
+    /// The RandomX epoch seed a header at `height` must have been mined
+    /// against.
+    ///
+    /// Derived from the header chain we already hold, which is the same rule
+    /// consensus applies; a height whose seed block we do not have yet falls
+    /// back to the genesis seed, exactly as validation does, so the two cannot
+    /// disagree about a header they both accept.
+    fn pow_seed_for(&self, height: u32) -> Hash {
+        use chroma_core::constants::{RANDOMX_EPOCH_LENGTH, RANDOMX_SEED_LAG};
+
+        match chroma_crypto::randomx::seed_height_for(
+            height,
+            RANDOMX_EPOCH_LENGTH,
+            RANDOMX_SEED_LAG,
+        ) {
+            Some(seed_height) => match self.headers.get(&seed_height) {
+                Some(header) => chroma_crypto::randomx::derive_seed(&header.hash()),
+                None => chroma_consensus::genesis_randomx_seed(),
+            },
+            None => chroma_consensus::genesis_randomx_seed(),
+        }
+    }
+
     /// Headers we can serve to a peer that asked for what follows `after`.
     ///
     /// Returns up to `MAX_HEADERS_PER_RESPONSE` headers in ascending height
@@ -211,8 +234,35 @@ impl ChainSyncer {
 
             // Proof of work is what makes a header chain expensive to forge,
             // so it is checked here rather than deferred to block download.
+            //
+            // Against the network's proof-of-work function, not the header's
+            // BLAKE3 hash. Those are different values on every network that
+            // uses RandomX: the block's identity is BLAKE3 of the header, but
+            // what has to meet the target is the RandomX hash keyed by the
+            // epoch seed. Checking the identity hash rejected every honestly
+            // mined header — and penalized the peer that sent it — on all
+            // three real networks. Only regtest, whose proof of work is
+            // BLAKE3, agreed with it.
+            use chroma_core::serialize::CanonicalEncode;
+            let seed = self.pow_seed_for(height);
+            let pow = match chroma_crypto::randomx::pow_hash(
+                self.params.pow,
+                &seed,
+                &header.encode(),
+            ) {
+                Ok(pow) => pow,
+                Err(e) => {
+                    return HeaderBatch {
+                        accepted,
+                        rejected: Some(format!(
+                            "cannot compute proof of work at height {}: {}",
+                            height, e
+                        )),
+                    }
+                }
+            };
             let target = header.bits.to_full_target();
-            if !chroma_crypto::randomx::hash_meets_target(&header.hash(), &target) {
+            if !chroma_crypto::randomx::hash_meets_target(&pow, &target) {
                 return HeaderBatch {
                     accepted,
                     rejected: Some(format!("header at height {} does not meet its target", height)),
@@ -311,6 +361,19 @@ mod tests {
         }
     }
 
+    /// A syncer on the network these test headers are mined for.
+    ///
+    /// The helpers below search for a Blake3 hash under the target, so the
+    /// syncer has to be on regtest, whose proof of work is Blake3. Pointing a
+    /// RandomX network at Blake3-mined headers is what the old check
+    /// effectively did, and it is why every real network rejected honest
+    /// headers.
+    fn test_syncer(genesis: BlockHeader) -> ChainSyncer {
+        let mut syncer = ChainSyncer::with_genesis(genesis);
+        syncer.params = chroma_consensus::ChainParams::regtest();
+        syncer
+    }
+
     /// Build a header on top of `parent` and search for a nonce that satisfies
     /// its target.
     fn mine_on(parent: &BlockHeader) -> BlockHeader {
@@ -349,7 +412,7 @@ mod tests {
     #[test]
     fn test_absorb_valid_chain() {
         let (genesis, chain) = mined_chain(4);
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
 
         let batch = syncer.absorb_headers(&chain);
         assert!(batch.is_clean(), "unexpected rejection: {:?}", batch.rejected);
@@ -362,7 +425,7 @@ mod tests {
     fn test_absorb_is_idempotent() {
         // A peer resending an overlapping range is normal, not misbehaviour.
         let (genesis, chain) = mined_chain(3);
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
 
         assert_eq!(syncer.absorb_headers(&chain).accepted, 3);
         let again = syncer.absorb_headers(&chain);
@@ -376,7 +439,7 @@ mod tests {
         let (genesis, mut chain) = mined_chain(3);
         chain[2].previous_hash = Hash::blake3(b"not the parent");
 
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         let batch = syncer.absorb_headers(&chain);
         assert_eq!(batch.accepted, 2, "the valid prefix should still be kept");
         assert!(batch.rejected.unwrap().contains("does not link"));
@@ -389,7 +452,7 @@ mod tests {
         // Break the proof of work without touching anything else.
         chain[1].nonce = chain[1].nonce.wrapping_add(1);
 
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         let batch = syncer.absorb_headers(&chain);
         assert_eq!(batch.accepted, 1);
         assert!(batch.rejected.unwrap().contains("does not meet its target"));
@@ -400,7 +463,7 @@ mod tests {
         let (genesis, mut chain) = mined_chain(1);
         chain[0].bits = CompactTarget(0x1e00ffff);
 
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         let batch = syncer.absorb_headers(&chain);
         assert_eq!(batch.accepted, 0);
         assert!(batch.rejected.unwrap().contains("declares bits"));
@@ -424,7 +487,7 @@ mod tests {
         }
         assert!(mined);
 
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         let batch = syncer.absorb_headers(&[stale]);
         assert_eq!(batch.accepted, 0);
         assert!(batch.rejected.unwrap().contains("MTP"));
@@ -433,7 +496,7 @@ mod tests {
     #[test]
     fn test_absorb_rejects_second_genesis() {
         let (genesis, _) = mined_chain(0);
-        let mut syncer = ChainSyncer::with_genesis(genesis.clone());
+        let mut syncer = test_syncer(genesis.clone());
 
         let mut impostor = genesis.clone();
         impostor.timestamp += 1;
@@ -445,7 +508,7 @@ mod tests {
     #[test]
     fn test_absorb_rejects_orphan() {
         let (genesis, chain) = mined_chain(3);
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
 
         // Offer only the last header: its parent is unknown to us.
         let batch = syncer.absorb_headers(&chain[2..]);
@@ -457,7 +520,7 @@ mod tests {
     fn test_headers_after_serves_the_range() {
         let (genesis, chain) = mined_chain(4);
         let genesis_hash = genesis.hash();
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         syncer.absorb_headers(&chain);
 
         let from_genesis = syncer.headers_after(&genesis_hash, &Hash::ZERO);
@@ -483,7 +546,7 @@ mod tests {
     fn test_headers_after_honours_stop_hash() {
         let (genesis, chain) = mined_chain(4);
         let genesis_hash = genesis.hash();
-        let mut syncer = ChainSyncer::with_genesis(genesis);
+        let mut syncer = test_syncer(genesis);
         syncer.absorb_headers(&chain);
 
         let stopped = syncer.headers_after(&genesis_hash, &chain[1].hash());

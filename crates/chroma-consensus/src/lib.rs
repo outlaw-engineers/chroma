@@ -141,13 +141,17 @@ pub fn calculate_target_for_height_with(
     let old_target = U256::from_be_bytes(&current.bits.to_full_target());
 
     // new_target = old_target × actual_time / target_time
-    let new_target =
-        mul_div(&old_target, actual_time, target_time)
-            .ok_or_else(|| CoreError::InvalidDifficulty("difficulty calculation overflow".into()))?;
+    let new_target = mul_div(&old_target, actual_time, target_time);
 
     // Clamp: max decrease = old / 4, max increase = old × 4
     let (min_target, _) = old_target.div_rem(&U256::from_u64(MAX_DIFFICULTY_DECREASE_FACTOR));
-    let max_target = old_target.shl(2);
+    // `shl` drops the bits it shifts past the top, which would turn a large
+    // target into a small one and read as a difficulty increase. Saturate, and
+    // let the network's absolute bound below decide the ceiling.
+    let max_target = match saturating_mul_u64(&old_target, 4) {
+        Some(target) => target,
+        None => U256::MAX,
+    };
 
     let clamped = if new_target < min_target {
         min_target
@@ -174,48 +178,63 @@ pub fn calculate_target_for_height_with(
     Ok(CompactTarget::from_full_target(&target_bytes))
 }
 
-/// Multiply a U256 by a u64 and divide by a u64: (value * num) / den
-/// Returns None on overflow to avoid silent wrapping on consensus-critical values.
-fn mul_div(value: &U256, num: u64, den: u64) -> Option<U256> {
+/// Multiply a U256 by a u64 and divide by a u64: `(value * num) / den`,
+/// saturating at [`U256::MAX`].
+///
+/// Saturating rather than failing, because the only caller clamps the result
+/// into `[old/4, old*4]` and then into the network's absolute bounds. Any
+/// value large enough to overflow is far above those, so it clamps to the same
+/// place `U256::MAX` does — saturation is not an approximation here, it is the
+/// same answer.
+///
+/// Failing was: a target near the top of the range — which `params.max_target`
+/// explicitly permits — made every retarget return an error, so no block at a
+/// retarget height could be produced or validated and the chain stopped. A
+/// difficulty low enough to be a nuisance became a difficulty low enough to be
+/// fatal.
+fn mul_div(value: &U256, num: u64, den: u64) -> U256 {
     if den == 0 || num == 0 {
-        return Some(U256::ZERO);
+        return U256::ZERO;
     }
 
     // Split value into quotient and remainder of division by den
     let (q, r) = value.div_rem(&U256::from_u64(den));
 
     // q * num
-    let part1 = {
-        let mut result = U256::ZERO;
-        let mut addend = q;
-        let mut n = num;
-        while n > 0 {
-            if n & 1 == 1 {
-                result = result.checked_add(&addend)?;
-            }
-            addend = addend.shl(1);
-            n >>= 1;
-        }
-        result
+    let part1 = match saturating_mul_u64(&q, num) {
+        Some(product) => product,
+        None => return U256::MAX,
     };
 
-    // (r * num) / den
-    let part2 = {
-        let mut temp = U256::ZERO;
-        let mut addend = r;
-        let mut n = num;
-        while n > 0 {
-            if n & 1 == 1 {
-                temp = temp.checked_add(&addend)?;
-            }
-            addend = addend.shl(1);
-            n >>= 1;
-        }
-        let (q2, _) = temp.div_rem(&U256::from_u64(den));
-        q2
+    // (r * num) / den. `r < den`, so this cannot overflow on its own, but it
+    // is written the same way so one shape covers both.
+    let part2 = match saturating_mul_u64(&r, num) {
+        Some(product) => product.div_rem(&U256::from_u64(den)).0,
+        None => return U256::MAX,
     };
 
-    part1.checked_add(&part2)
+    part1.checked_add(&part2).unwrap_or(U256::MAX)
+}
+
+/// `value * num`, or `None` if it does not fit in 256 bits.
+fn saturating_mul_u64(value: &U256, num: u64) -> Option<U256> {
+    let mut result = U256::ZERO;
+    let mut addend = *value;
+    let mut n = num;
+    while n > 0 {
+        if n & 1 == 1 {
+            result = result.checked_add(&addend)?;
+        }
+        n >>= 1;
+        // Only double when there is another bit to consume: doubling past the
+        // last one is where a value near the top of the range overflowed for
+        // no reason.
+        if n > 0 {
+            let doubled = addend.checked_add(&addend)?;
+            addend = doubled;
+        }
+    }
+    Some(result)
 }
 
 // ============================================================================
@@ -718,6 +737,50 @@ impl ChainState {
         }
     }
 
+    /// The epoch seed for a block, found along the branch it is building on.
+    ///
+    /// [`ChainState::pow_seed_for`] can only see the headers it is handed. For
+    /// the active chain that is every header, but a side branch is validated
+    /// against `branch_headers`, which reaches back far enough for the
+    /// retarget window and the median — about 19 blocks. The seed block is up
+    /// to `RANDOMX_EPOCH_LENGTH + RANDOMX_SEED_LAG` behind, so past height
+    /// 1000 the lookup missed and quietly fell back to the genesis seed.
+    /// Every valid block on a branch was then rejected, on every network that
+    /// uses RandomX, which is every network but regtest.
+    ///
+    /// The index holds every block we know, so the seed header is found by
+    /// walking the branch there rather than by carrying a thousand headers
+    /// into every validation.
+    fn pow_seed_on_branch(&self, block: &Block, headers: &BTreeMap<u32, BlockHeader>) -> Hash {
+        use chroma_core::constants::{RANDOMX_EPOCH_LENGTH, RANDOMX_SEED_LAG};
+
+        let seed_height = match chroma_crypto::randomx::seed_height_for(
+            block.header.height.0,
+            RANDOMX_EPOCH_LENGTH,
+            RANDOMX_SEED_LAG,
+        ) {
+            Some(height) => height,
+            None => return genesis_randomx_seed(),
+        };
+
+        if let Some(header) = headers.get(&seed_height) {
+            return chroma_crypto::randomx::derive_seed(&header.hash());
+        }
+
+        let mut cursor = block.header.previous_hash;
+        while let Some(entry) = self.index.get(&cursor) {
+            if entry.header.height.0 == seed_height {
+                return chroma_crypto::randomx::derive_seed(&entry.header.hash());
+            }
+            if entry.header.height.0 < seed_height {
+                break;
+            }
+            cursor = entry.header.previous_hash;
+        }
+
+        genesis_randomx_seed()
+    }
+
     /// Build the validation context for `block` against a given header chain.
     fn validation_context(
         &self,
@@ -738,7 +801,7 @@ impl ChainState {
             current_supply: self.tip.supply,
             previous_state_root: parent.state_root,
             pow_algorithm: self.params.pow,
-            pow_seed: self.pow_seed_for(height, headers),
+            pow_seed: self.pow_seed_on_branch(block, headers),
             // Wall-clock time, not the block's own timestamp. Passing the
             // block's timestamp made the "not too far in the future" check
             // compare the value against itself, so it always passed and
@@ -1019,27 +1082,27 @@ mod tests {
     #[test]
     fn test_mul_div_exact() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 3, 2).unwrap(), U256::from_u64(1500));
-        assert_eq!(mul_div(&a, 1, 2).unwrap(), U256::from_u64(500));
-        assert_eq!(mul_div(&a, 2, 2).unwrap(), U256::from_u64(1000));
+        assert_eq!(mul_div(&a, 3, 2), U256::from_u64(1500));
+        assert_eq!(mul_div(&a, 1, 2), U256::from_u64(500));
+        assert_eq!(mul_div(&a, 2, 2), U256::from_u64(1000));
     }
 
     #[test]
     fn test_mul_div_zero_denominator() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 3, 0).unwrap(), U256::ZERO);
+        assert_eq!(mul_div(&a, 3, 0), U256::ZERO);
     }
 
     #[test]
     fn test_mul_div_zero_numerator() {
         let a = U256::from_u64(1000);
-        assert_eq!(mul_div(&a, 0, 5).unwrap(), U256::ZERO);
+        assert_eq!(mul_div(&a, 0, 5), U256::ZERO);
     }
 
     #[test]
     fn test_mul_div_large_values() {
         let a = U256::from_u64(u64::MAX);
-        let result = mul_div(&a, 2, 3).unwrap();
+        let result = mul_div(&a, 2, 3);
         // u64::MAX * 2 / 3 ≈ 12297829382473034410
         let result_u64 = result.to_u64().unwrap();
         let expected = u64::MAX / 3 * 2;
@@ -1047,10 +1110,59 @@ mod tests {
         assert!(diff < 2, "mul_div large: result={} expected={}", result_u64, expected);
     }
 
+    /// A target near the top of the range must not make the arithmetic give
+    /// up. `params.max_target` permits one, and returning an error there meant
+    /// no block at a retarget height could be produced or validated: a
+    /// difficulty low enough to be a nuisance became one low enough to stop
+    /// the chain.
+    #[test]
+    fn test_mul_div_saturates_instead_of_failing() {
+        // Doubling this once already leaves 256 bits.
+        let huge = U256::MAX;
+        assert_eq!(mul_div(&huge, 4, 1), U256::MAX);
+        assert_eq!(mul_div(&huge, 2, 1), U256::MAX);
+
+        // Halving it is still exact — saturation only applies where the true
+        // value does not fit.
+        let (half, _) = huge.div_rem(&U256::from_u64(2));
+        assert_eq!(mul_div(&huge, 1, 2), half);
+    }
+
+    /// The retarget must produce a usable target from a chain sitting at the
+    /// maximum, rather than an error.
+    #[test]
+    fn test_retarget_from_a_maximum_target() {
+        let params = ChainParams {
+            no_retargeting: false,
+            ..ChainParams::regtest()
+        };
+
+        let mut headers = BTreeMap::new();
+        for height in 0..DIFFICULTY_ADJUSTMENT_WINDOW {
+            let mut header = build_genesis_block_with(&params).header;
+            header.height = BlockHeight(height);
+            header.timestamp = 1_700_000_000 + height as u64;
+            headers.insert(height, header);
+        }
+
+        let bits = calculate_target_for_height_with(
+            DIFFICULTY_ADJUSTMENT_WINDOW,
+            &headers,
+            &params,
+        )
+        .expect("a retarget from the maximum target must not fail");
+
+        // Blocks arrived far faster than the target spacing, so the target
+        // should have come down rather than stayed put.
+        let old = U256::from_be_bytes(&params.genesis_bits.to_full_target());
+        let new = U256::from_be_bytes(&bits.to_full_target());
+        assert!(new < old, "faster blocks must raise the difficulty");
+    }
+
     #[test]
     fn test_mul_div_one_to_one() {
         let a = U256::from_u64(42);
-        assert_eq!(mul_div(&a, 1, 1).unwrap(), a);
+        assert_eq!(mul_div(&a, 1, 1), a);
     }
 
     #[test]

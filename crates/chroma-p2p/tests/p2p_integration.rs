@@ -245,12 +245,25 @@ impl RawPeer {
 }
 
 /// Poll a condition until it holds or the timeout expires.
-async fn wait_for<F, Fut>(what: &str, mut f: F)
+async fn wait_for<F, Fut>(what: &str, f: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    wait_for_within(what, Duration::from_secs(10), f).await
+}
+
+/// `wait_for` with a deadline of its own, for the tests that have to watch a
+/// chain grow. Once the median time past catches up with the wall clock a
+/// regtest node produces about a block a second — the proof of work is free,
+/// but a block still has to be stamped later than the median of the last
+/// seven.
+async fn wait_for_within<F, Fut>(what: &str, timeout: Duration, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if f().await {
             return;
@@ -1420,5 +1433,193 @@ async fn node_identity_is_stable_across_restarts() {
         .with_mining(false);
     assert_ne!(Node::new(config).node_id(), first);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Things only a network other than regtest would have caught
+// ---------------------------------------------------------------------------
+
+/// The miner has to build each block against *its own* target, not its
+/// parent's. Those differ at every retarget height, and validation computes
+/// the target the same way the miner should — so mining with the parent's
+/// bits meant the node's own `apply_block` rejected every tenth block it
+/// found, and the chain could not pass height 10.
+///
+/// Regtest freezes difficulty, which is why the whole suite missed this. This
+/// test keeps regtest's cheap proof of work and turns retargeting back on.
+#[tokio::test]
+async fn miner_passes_a_retarget_height() {
+    let dir = temp_dir("retarget_miner");
+    let params = chroma_consensus::ChainParams {
+        no_retargeting: false,
+        ..chroma_consensus::ChainParams::regtest()
+    };
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir.clone())
+        .with_mining(true);
+    let mut node = Node::new(config);
+    node.run().await.expect("node failed to start");
+
+    // The first retarget is at height 10, so anything past it proves the
+    // miner and the validator agree about what the target there is.
+    let target_height = chroma_core::constants::DIFFICULTY_ADJUSTMENT_WINDOW + 1;
+    wait_for_within(
+        "the miner to pass the first retarget height",
+        Duration::from_secs(60),
+        || async { node.chain_height() >= target_height },
+    )
+    .await;
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block is filed under the hash of its header, and nothing in the header
+/// commits to the transactions handed over with it. So a block must not reach
+/// storage until it has been validated: otherwise a peer can file a forged
+/// body under a real block's hash, `have_block` answers yes from then on and
+/// the real block is never requested again, while reorg replay reads the
+/// forgery back out.
+#[tokio::test]
+async fn an_invalid_block_is_not_stored() {
+    let (mut node, _addr, dir) = start_regtest_node("forged_block", false, vec![]).await;
+
+    let mut peer = RawPeer::connect(&node, 40_050).await;
+    peer.handshake().await;
+
+    // A well-formed block that does not validate: the coinbase is missing, so
+    // nothing about it can be accepted.
+    let genesis = chroma_consensus::build_genesis_block_with(&chroma_consensus::ChainParams::regtest());
+    let forged = chroma_block::Block {
+        header: chroma_block::BlockHeader {
+            version: 1,
+            previous_hash: genesis.hash(),
+            state_root: chroma_core::hash::Hash::ZERO,
+            tx_merkle_root: chroma_core::hash::Hash::ZERO,
+            timestamp: genesis.header.timestamp + 10,
+            bits: genesis.header.bits,
+            height: chroma_core::types::BlockHeight(1),
+            nonce: 0,
+        },
+        transactions: vec![],
+    };
+    let forged_hash = forged.hash();
+
+    peer.send(Message::new(
+        MessageType::Block,
+        chroma_block::Block::encode_block(&forged),
+    ))
+    .await;
+
+    // Give the node time to take it, reject it, and settle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        node.storage()
+            .get_height_for_hash(&forged_hash)
+            .unwrap()
+            .is_none(),
+        "a block that failed validation must not be recorded as one we have"
+    );
+    assert!(
+        node.storage()
+            .get_block_by_hash(&forged_hash)
+            .unwrap()
+            .is_none(),
+        "a block that failed validation must not be readable back"
+    );
+    assert_eq!(node.chain_height(), 0, "the chain must not have moved");
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The syncer's header chain is keyed by height and its best hash moves at the
+/// tip height, so only blocks on the *active* chain belong in it. A valid
+/// block on a losing branch used to be inserted all the same, repointing the
+/// header chain at a block the node had not chosen — after which honest header
+/// batches looked like they conflicted, and every peer sending them was
+/// penalized for it.
+#[tokio::test]
+async fn a_losing_branch_does_not_move_the_syncer() {
+    use chroma_consensus::miner::{assemble_block, mine_block_with_limit, BlockAssemblyContext, PowContext};
+
+    let (mut node, _addr, dir) = start_regtest_node("side_branch_syncer", false, vec![]).await;
+
+    let params = chroma_consensus::ChainParams::regtest();
+    let genesis = chroma_consensus::build_genesis_block_with(&params);
+    let pow = PowContext {
+        algorithm: params.pow,
+        seed: chroma_consensus::genesis_randomx_seed(),
+    };
+
+    // Two valid blocks on top of genesis, differing only in who gets paid, so
+    // they carry the same work and one of them has to lose.
+    let build = |payout: u8| {
+        let ctx = BlockAssemblyContext {
+            height: chroma_core::types::BlockHeight(1),
+            previous_hash: genesis.hash(),
+            timestamp: genesis.header.timestamp + 10,
+            bits: genesis.header.bits,
+            coinbase_recipient: Address::from_hash160(Hash160([payout; 20])),
+        };
+        let mut block = assemble_block(&ctx, &[], &chroma_state::State::new()).unwrap();
+        mine_block_with_limit(&mut block, 1_000_000, &pow).expect("regtest work is trivial");
+        block
+    };
+    let (first, second) = {
+        let a = build(0x11);
+        let b = build(0x22);
+        // Equal work is tie-broken on the smaller hash, so the larger-hashed
+        // block is the one guaranteed to lose.
+        if a.hash().as_bytes() < b.hash().as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    };
+
+    let mut peer = RawPeer::connect(&node, 40_051).await;
+    peer.handshake().await;
+
+    peer.send(Message::new(
+        MessageType::Block,
+        chroma_block::Block::encode_block(&first),
+    ))
+    .await;
+    wait_for("the first block to be accepted", || async {
+        node.chain_height() == 1
+    })
+    .await;
+
+    let syncer = node.syncer();
+    assert_eq!(
+        syncer.read().await.best_hash,
+        first.hash(),
+        "the accepted block is the header chain's tip"
+    );
+
+    // The loser: valid, but with more work behind the block already chosen.
+    peer.send(Message::new(
+        MessageType::Block,
+        chroma_block::Block::encode_block(&second),
+    ))
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        node.chain_height(),
+        1,
+        "a losing branch must not change the tip"
+    );
+    assert_eq!(
+        syncer.read().await.best_hash,
+        first.hash(),
+        "a losing branch must not repoint the header chain"
+    );
+
+    node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

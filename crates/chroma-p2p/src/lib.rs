@@ -495,6 +495,12 @@ impl Node {
         self.mempool.clone()
     }
 
+    /// The headers-first sync state. Exposed so tests can check that the
+    /// header chain follows the active chain and nothing else.
+    pub fn syncer(&self) -> Arc<RwLock<ChainSyncer>> {
+        self.syncer.clone()
+    }
+
     pub fn peer_manager(&self) -> Arc<RwLock<PeerManager>> {
         self.peer_manager.clone()
     }
@@ -1691,16 +1697,24 @@ impl Node {
         while let Some(candidate) = queue.pop() {
             let candidate_hash = candidate.hash();
 
-            let applied = {
+            let (applied, on_active_chain) = {
                 let mut cs = ctx.chain_state.write().await;
                 let source = StorageBlocks(ctx.storage.as_ref());
-                // Store first: a reorg replays the branch out of storage, so
-                // the block has to be readable before it can be chosen. Only
-                // the block itself though — whether it is the active chain's
-                // block at its height is what we are about to find out.
-                let _ = ctx.storage.put_block(&candidate);
                 match cs.apply_block_with(&candidate, &source) {
                     Ok(outcome) => {
+                        // Stored only now that it has been validated. A block
+                        // is keyed by the hash of its header, and nothing in
+                        // the header commits to the transactions we were
+                        // handed with it, so storing before validating let a
+                        // peer file a forged body under a real block's hash:
+                        // `have_block` would then answer yes forever and the
+                        // real block would never be asked for again, while
+                        // reorg replay read the forgery back out.
+                        //
+                        // A losing branch is still stored — it validated, and
+                        // a later reorg replays it out of storage.
+                        let _ = ctx.storage.put_block(&candidate);
+
                         // Height-keyed records follow the active chain. A
                         // block that extended it owns its height; a reorg
                         // rewrites every height it moved; a side branch is
@@ -1731,13 +1745,16 @@ impl Node {
                         let _ = ctx.storage.put_tip(&persisted);
                         let _ = ctx.storage.put_state(&cs.state);
                         let _ = ctx.storage.flush();
-                        true
+                        (
+                            true,
+                            !matches!(outcome, chroma_consensus::BlockOutcome::SideBranch),
+                        )
                     }
                     Err(e) => {
                         let _ = ctx
                             .event_tx
                             .send(NodeEvent::Error(format!("block validation failed: {}", e)));
-                        false
+                        (false, false)
                     }
                 }
             };
@@ -1752,7 +1769,12 @@ impl Node {
                 continue;
             }
 
-            {
+            // Only a block on the active chain belongs in the syncer's
+            // header chain: `insert_header` is keyed by height and moves the
+            // best hash at the tip height, so a losing branch block would
+            // repoint it and make honest header batches look like they
+            // conflict — costing the peer that sent them 20 points each.
+            if on_active_chain {
                 let mut syncer = ctx.syncer.write().await;
                 syncer.insert_header(candidate.header.clone());
             }
@@ -1905,11 +1927,30 @@ impl Node {
                 let cs = chain_state.read().await;
                 let tip = &cs.tip;
                 let next_height = tip.height.0 + 1;
+                // The next block's target, not the parent's. At a retarget
+                // height those differ, and validation computes the same value
+                // this way — so mining with the parent's bits meant our own
+                // apply_block rejected every tenth block we found. Regtest
+                // does not retarget, which is why nothing noticed.
+                let bits = match chroma_consensus::calculate_target_for_height_with(
+                    next_height,
+                    &cs.headers,
+                    &cs.params,
+                ) {
+                    Ok(bits) => bits,
+                    Err(e) => {
+                        let _ = event_tx.send(NodeEvent::Error(format!(
+                            "cannot compute target at height {}: {}",
+                            next_height, e
+                        )));
+                        tip.header.bits
+                    }
+                };
                 (
                     next_height,
                     tip.hash,
                     cs.compute_median_time_past(next_height),
-                    tip.header.bits,
+                    bits,
                     cs.state.clone(),
                     // The proof-of-work function and epoch seed have to match
                     // what validation will use, or every block we find is
