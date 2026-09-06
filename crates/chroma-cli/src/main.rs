@@ -33,6 +33,15 @@ enum Commands {
         /// omitted, so two nodes never mine identical blocks by accident.
         #[arg(long)]
         miner_address: Option<String>,
+        /// Keep a transaction index, so `tx get` and `tx history` can be
+        /// answered.
+        ///
+        /// Off by default: nothing in consensus or relay looks a transaction
+        /// up by hash, so this is a cost for serving other people's queries.
+        /// Turning it on indexes what the chain already holds on the next
+        /// start; there is no separate reindex step.
+        #[arg(long)]
+        index_transactions: bool,
     },
     Wallet {
         #[command(subcommand)]
@@ -96,6 +105,31 @@ enum TxCommands {
         nonce: Option<u64>,
         #[arg(long, default_value = "chroma_data")]
         data_dir: PathBuf,
+    },
+    /// Look a transaction up by its hash.
+    ///
+    /// Answerable only by a node started with --index-transactions.
+    Get {
+        /// The transaction hash, 64 hex characters.
+        #[arg(long)]
+        hash: String,
+        #[arg(long)]
+        node: Option<chroma_p2p::peer::PeerAddress>,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+    },
+    /// List the transactions touching an address.
+    History {
+        /// Address as bech32m (chr1...) or 0x hex.
+        #[arg(long)]
+        address: String,
+        /// How many of the most recent to show.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        node: Option<chroma_p2p::peer::PeerAddress>,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
     },
 }
 
@@ -211,6 +245,18 @@ fn bech32_to_address(s: &str) -> Option<chroma_core::types::Address> {
             chroma_core::hash::Hash160(h),
         ))
     }
+}
+
+/// Parse a 64-character hex hash.
+fn parse_hash(s: &str) -> Option<chroma_core::hash::Hash> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(s).ok()?;
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&bytes);
+    Some(chroma_core::hash::Hash(raw))
 }
 
 /// Parse an amount written in CHR into units.
@@ -663,7 +709,15 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Node { listen, connect, data_dir, network, no_mining, miner_address } => {
+        Commands::Node {
+            listen,
+            connect,
+            data_dir,
+            network,
+            no_mining,
+            miner_address,
+            index_transactions,
+        } => {
             println!("Starting Chroma node on {}", listen);
             println!("Data directory: {}", data_dir.display());
             for peer in &connect {
@@ -720,7 +774,8 @@ async fn main() -> anyhow::Result<()> {
                 .with_data_dir(data_dir.clone())
                 .with_connect_addrs(connect)
                 .with_node_secret(node_secret)
-                .with_mining(!no_mining);
+                .with_mining(!no_mining)
+                .with_transaction_index(index_transactions);
             let config = match miner_address {
                 Some(text) => match bech32_to_address(&text) {
                     Some(addr) => config.with_miner_address(addr),
@@ -1084,6 +1139,125 @@ async fn main() -> anyhow::Result<()> {
                         last_error.map(|e| e.to_string()).unwrap_or_default()
                     );
                     std::process::exit(1);
+                }
+            }
+            TxCommands::Get { hash, node, network } => {
+                use chroma_p2p::wire::{
+                    GetTransactionMessage, LookupStatus, Message, MessageType, TransactionAtMessage,
+                };
+
+                let tx_hash = match parse_hash(&hash) {
+                    Some(h) => h,
+                    None => {
+                        eprintln!("Invalid --hash: expected 64 hex characters");
+                        std::process::exit(1);
+                    }
+                };
+
+                let mut client = connect_to_node(node, &network).await?;
+                let reply = client
+                    .ask(
+                        Message::new(
+                            MessageType::GetTransaction,
+                            GetTransactionMessage { tx_hash }.encode(),
+                        ),
+                        MessageType::TransactionAt,
+                    )
+                    .await?;
+                let found = TransactionAtMessage::decode(&reply.payload)?;
+
+                match found.status {
+                    LookupStatus::NotIndexed => {
+                        eprintln!("That node keeps no transaction index, so it cannot answer.");
+                        eprintln!("Start a node with --index-transactions, or ask another one.");
+                        std::process::exit(1);
+                    }
+                    LookupStatus::NotFound => {
+                        println!("No transaction with that hash on this node.");
+                    }
+                    LookupStatus::Found => {
+                        println!("Transaction: {}", found.tx_hash.to_hex());
+                        println!("Block:       {}", found.block_hash.to_hex());
+                        println!("Height:      {}", found.height);
+                        println!("Position:    {}", found.position);
+                        if let Some(tx) = &found.transaction {
+                            println!("From:        {}", address_to_bech32(&tx.sender_address()));
+                            println!("To:          {}", address_to_bech32(&tx.recipient));
+                            println!(
+                                "Amount:      {} CHR ({} units)",
+                                format_chr(tx.amount.0),
+                                tx.amount.0
+                            );
+                            println!("Nonce:       {}", tx.nonce.0);
+                        }
+                        if !found.on_active_chain {
+                            println!();
+                            println!("This block lost a fork. The transaction was mined, but not");
+                            println!("on the chain the network is following, so it did not move");
+                            println!("anything. It may be mined again on the winning chain.");
+                        }
+                    }
+                }
+            }
+            TxCommands::History {
+                address,
+                limit,
+                node,
+                network,
+            } => {
+                use chroma_p2p::wire::{
+                    GetHistoryMessage, HistoryMessage, LookupStatus, Message, MessageType,
+                };
+
+                let addr = match bech32_to_address(&address) {
+                    Some(a) => a,
+                    None => {
+                        eprintln!("Invalid address: expected bech32m (chr1...) or 0x hex");
+                        std::process::exit(1);
+                    }
+                };
+
+                let mut client = connect_to_node(node, &network).await?;
+                let reply = client
+                    .ask(
+                        Message::new(
+                            MessageType::GetHistory,
+                            GetHistoryMessage {
+                                address: addr,
+                                limit,
+                            }
+                            .encode(),
+                        ),
+                        MessageType::History,
+                    )
+                    .await?;
+                let history = HistoryMessage::decode(&reply.payload)?;
+
+                if history.status == LookupStatus::NotIndexed {
+                    eprintln!("That node keeps no transaction index, so it cannot answer.");
+                    eprintln!("Start a node with --index-transactions, or ask another one.");
+                    std::process::exit(1);
+                }
+
+                if history.entries.is_empty() {
+                    println!("No transactions for {}", address_to_bech32(&addr));
+                } else {
+                    println!(
+                        "Showing {} of {} transaction(s) for {}",
+                        history.entries.len(),
+                        history.total,
+                        address_to_bech32(&addr)
+                    );
+                    println!();
+                    println!("{:>8}  {:>3}  TRANSACTION", "HEIGHT", "POS");
+                    for entry in &history.entries {
+                        println!(
+                            "{:>8}  {:>3}  {}",
+                            entry.height,
+                            entry.position,
+                            entry.tx_hash.to_hex()
+                        );
+                    }
                 }
             }
         },

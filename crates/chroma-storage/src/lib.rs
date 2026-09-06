@@ -56,13 +56,64 @@ fn account_key(address: &Address) -> Vec<u8> {
     key
 }
 
+/// Where a transaction sits, keyed by its hash.
+///
+/// The value names the **block hash**, never the height. That one choice is
+/// what keeps this index out of the reorg path: a block that loses a fork is
+/// still a block we hold, so the entry never becomes wrong — it merely points
+/// at something that is no longer on the active chain, which the existing
+/// height/hash pair answers on its own. An index keyed by height would have to
+/// be rewritten on every reorg, and every rewrite is a chance for the index
+/// and the chain to disagree.
+fn tx_index_key(tx_hash: &Hash) -> Vec<u8> {
+    let mut key = b"txindex:".to_vec();
+    key.extend_from_slice(tx_hash.as_bytes());
+    key
+}
+
+/// One address's involvement in one transaction.
+///
+/// Keyed by block hash for the same reason as [`tx_index_key`]. Ordering is
+/// not in the key, so a history read sorts what it finds; the alternative —
+/// putting the height in the key to get chain order for free — brings back
+/// the rewrite-on-reorg this design exists to avoid.
+fn tx_address_key(address: &Address, block_hash: &Hash, position: u32) -> Vec<u8> {
+    let mut key = b"txaddr:".to_vec();
+    key.extend_from_slice(address.as_hash160().as_bytes());
+    key.extend_from_slice(block_hash.as_bytes());
+    key.extend_from_slice(&position.to_be_bytes());
+    key
+}
+
+fn tx_address_prefix(address: &Address) -> Vec<u8> {
+    let mut key = b"txaddr:".to_vec();
+    key.extend_from_slice(address.as_hash160().as_bytes());
+    key
+}
+
 const TIP_KEY: &[u8] = b"tip";
+/// Active-chain height the transaction index has been walked to.
+///
+/// Without it, a database that ran for a while with indexing off has holes,
+/// and a lookup cannot tell "no such transaction" from "never indexed". The
+/// difference matters enough to keep one number for it.
+const INDEXED_THROUGH_KEY: &[u8] = b"indexed_through";
 const SUPPLY_KEY: &[u8] = b"supply";
 const GENESIS_HASH_KEY: &[u8] = b"genesis_hash";
 
 // ============================================================================
 // Chain Tip Metadata
 // ============================================================================
+
+/// One transaction as the index holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedTx {
+    pub tx_hash: Hash,
+    pub block_hash: Hash,
+    pub height: u32,
+    /// Where in the block it sits. Position 0 is the coinbase.
+    pub position: u32,
+}
 
 /// Persisted chain tip metadata.
 #[derive(Clone, Debug)]
@@ -477,6 +528,164 @@ impl Storage {
     pub fn apply_block(&self, block: &Block) -> Result<()> {
         self.put_block(block)?;
         self.mark_active(block)?;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Transaction index
+    // ========================================================================
+
+    /// Record where every transaction in `block` sits, and which addresses it
+    /// touched.
+    ///
+    /// Safe to call for a block on any branch, and that is how it is used:
+    /// indexing every block we accept means a reorg needs no work here at all.
+    /// A losing branch's entries stay, point at a block that is still on disk,
+    /// and are filtered out by the active-chain check at read time.
+    ///
+    /// One batch, so a half-written index cannot survive a crash.
+    pub fn index_block(&self, block: &Block) -> Result<()> {
+        let block_hash = block.hash();
+        let height = block.header.height.0;
+        let mut batch = sled::Batch::default();
+
+        for (position, tx) in block.transactions.iter().enumerate() {
+            let position = position as u32;
+            let tx_hash = Hash::blake3(&tx.encode());
+
+            let mut location = Vec::with_capacity(36);
+            location.extend_from_slice(block_hash.as_bytes());
+            location.extend_from_slice(&position.to_le_bytes());
+            batch.insert(tx_index_key(&tx_hash), location);
+
+            let mut value = Vec::with_capacity(36);
+            value.extend_from_slice(tx_hash.as_bytes());
+            value.extend_from_slice(&height.to_le_bytes());
+
+            // The coinbase has no sender: its public key is a sentinel, and
+            // the address it hashes to belongs to nobody. Indexing it would
+            // put every block ever mined into one meaningless history.
+            if !tx.is_coinbase() {
+                batch.insert(
+                    tx_address_key(&tx.sender_address(), &block_hash, position),
+                    value.clone(),
+                );
+            }
+            // A transfer to oneself writes one entry, not two: the key is the
+            // same, and it did happen once.
+            batch.insert(
+                tx_address_key(&tx.recipient, &block_hash, position),
+                value,
+            );
+        }
+
+        self.db
+            .apply_batch(batch)
+            .map_err(|e| CoreError::Storage(format!("index_block: {}", e)))
+    }
+
+    /// Where a transaction is, if the index has it.
+    ///
+    /// The block named may be on a branch that lost. Ask
+    /// [`Storage::is_on_active_chain`] before treating it as confirmed.
+    pub fn transaction_location(&self, tx_hash: &Hash) -> Result<Option<(Hash, u32)>> {
+        let raw = self
+            .db
+            .get(tx_index_key(tx_hash))
+            .map_err(|e| CoreError::Storage(format!("transaction_location: {}", e)))?;
+        let raw = match raw {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if raw.len() != 36 {
+            return Err(CoreError::Storage(
+                "transaction_location: malformed entry".to_string(),
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&raw[..32]);
+        let mut position = [0u8; 4];
+        position.copy_from_slice(&raw[32..36]);
+        Ok(Some((Hash(hash), u32::from_le_bytes(position))))
+    }
+
+    /// Whether a block we hold is the one the active chain has at its height.
+    pub fn is_on_active_chain(&self, block_hash: &Hash) -> Result<bool> {
+        let height = match self.get_height_for_hash(block_hash)? {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        Ok(self.get_hash_for_height(height)? == Some(*block_hash))
+    }
+
+    /// Every transaction the index has for an address, in chain order.
+    ///
+    /// Sorted here rather than by the key, which is what buys the index its
+    /// freedom from reorgs (see [`tx_address_key`]). The cost is one pass over
+    /// the address's own entries, which is what listing them costs anyway.
+    ///
+    /// With `active_only`, entries whose block lost a fork are left out. Those
+    /// are the transactions someone might otherwise believe had happened.
+    pub fn transactions_for_address(
+        &self,
+        address: &Address,
+        active_only: bool,
+    ) -> Result<Vec<IndexedTx>> {
+        let mut found = Vec::new();
+        for entry in self.db.scan_prefix(tx_address_prefix(address)) {
+            let (key, value) = entry
+                .map_err(|e| CoreError::Storage(format!("transactions_for_address: {}", e)))?;
+            let prefix = b"txaddr:".len() + 20;
+            if key.len() != prefix + 32 + 4 || value.len() != 36 {
+                continue;
+            }
+
+            let mut block_hash = [0u8; 32];
+            block_hash.copy_from_slice(&key[prefix..prefix + 32]);
+            let block_hash = Hash(block_hash);
+            let mut position = [0u8; 4];
+            position.copy_from_slice(&key[prefix + 32..]);
+
+            if active_only && !self.is_on_active_chain(&block_hash)? {
+                continue;
+            }
+
+            let mut tx_hash = [0u8; 32];
+            tx_hash.copy_from_slice(&value[..32]);
+            let mut height = [0u8; 4];
+            height.copy_from_slice(&value[32..36]);
+
+            found.push(IndexedTx {
+                tx_hash: Hash(tx_hash),
+                block_hash,
+                height: u32::from_le_bytes(height),
+                position: u32::from_be_bytes(position),
+            });
+        }
+        found.sort_by_key(|tx| (tx.height, tx.position));
+        Ok(found)
+    }
+
+    /// The active-chain height the index has been walked to, if ever.
+    pub fn get_indexed_through(&self) -> Result<Option<u32>> {
+        let raw = self
+            .db
+            .get(INDEXED_THROUGH_KEY)
+            .map_err(|e| CoreError::Storage(format!("get_indexed_through: {}", e)))?;
+        match raw {
+            Some(v) if v.len() == 4 => {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(&v);
+                Ok(Some(u32::from_le_bytes(buf)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn put_indexed_through(&self, height: u32) -> Result<()> {
+        self.db
+            .insert(INDEXED_THROUGH_KEY, height.to_le_bytes().to_vec())
+            .map_err(|e| CoreError::Storage(format!("put_indexed_through: {}", e)))?;
         Ok(())
     }
 
@@ -1003,5 +1212,179 @@ mod tests {
             assert_eq!(acc.balance, (i as u64) * 1_000_000);
             assert_eq!(acc.nonce, i as u64);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction index
+    // -----------------------------------------------------------------------
+
+    fn indexed_block(height: u32, nonce_salt: u64) -> (Block, chroma_tx::Transaction) {
+        use chroma_core::types::{Amount, Nonce};
+        use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
+
+        let secret = SecretKey32::from_bytes([0x41; 32]).unwrap();
+        let pubkey = PublicKey32::from_secret(&secret).unwrap();
+        let sender = Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)));
+        let recipient = Address::from_hash160(Hash160([0x55; 20]));
+
+        let coinbase = chroma_tx::Transaction::coinbase(sender, Amount(1_000_000));
+        let transfer = chroma_tx::create_transaction(
+            &secret,
+            sender,
+            recipient,
+            Amount(10),
+            Nonce(nonce_salt),
+        )
+        .unwrap();
+
+        let mut header = test_header(height);
+        header.nonce = nonce_salt;
+        (
+            Block {
+                header,
+                transactions: vec![coinbase, transfer.clone()],
+            },
+            transfer,
+        )
+    }
+
+    fn sender_address() -> Address {
+        use chroma_crypto::schnorr::{PublicKey32, SecretKey32};
+        let secret = SecretKey32::from_bytes([0x41; 32]).unwrap();
+        let pubkey = PublicKey32::from_secret(&secret).unwrap();
+        Address::from_hash160(Hash160(chroma_crypto::hash::hash160(&pubkey.0)))
+    }
+
+    #[test]
+    fn a_transaction_can_be_found_by_its_hash() {
+        let storage = Storage::open_temporary().unwrap();
+        let (block, transfer) = indexed_block(1, 0);
+        let tx_hash = Hash::blake3(&transfer.encode());
+
+        storage.apply_block(&block).unwrap();
+        storage.index_block(&block).unwrap();
+
+        let (found_block, position) = storage
+            .transaction_location(&tx_hash)
+            .unwrap()
+            .expect("indexed");
+        assert_eq!(found_block, block.hash());
+        assert_eq!(position, 1, "position 0 is the coinbase");
+    }
+
+    #[test]
+    fn an_unindexed_transaction_is_simply_absent() {
+        let storage = Storage::open_temporary().unwrap();
+        let (block, transfer) = indexed_block(1, 0);
+        storage.apply_block(&block).unwrap();
+        // No index_block call.
+        assert_eq!(
+            storage
+                .transaction_location(&Hash::blake3(&transfer.encode()))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_index_survives_a_reorg_without_being_rewritten() {
+        // The point of keying on the block hash. Two blocks compete for one
+        // height; both are indexed when they arrive, and nothing has to be
+        // undone when the winner changes — the active-chain check answers it.
+        let storage = Storage::open_temporary().unwrap();
+        let (first, first_tx) = indexed_block(1, 1);
+        let (second, second_tx) = indexed_block(1, 2);
+        assert_ne!(first.hash(), second.hash());
+
+        storage.apply_block(&first).unwrap();
+        storage.index_block(&first).unwrap();
+        storage.put_block(&second).unwrap();
+        storage.index_block(&second).unwrap();
+
+        assert!(storage.is_on_active_chain(&first.hash()).unwrap());
+        assert!(!storage.is_on_active_chain(&second.hash()).unwrap());
+
+        // The reorg: the second block takes the height.
+        storage.mark_active(&second).unwrap();
+
+        assert!(!storage.is_on_active_chain(&first.hash()).unwrap());
+        assert!(storage.is_on_active_chain(&second.hash()).unwrap());
+
+        // Both lookups still resolve; only their standing changed.
+        for tx in [&first_tx, &second_tx] {
+            assert!(storage
+                .transaction_location(&Hash::blake3(&tx.encode()))
+                .unwrap()
+                .is_some());
+        }
+
+        // Two entries per block for this address: it is paid by the coinbase
+        // and it sends the transfer.
+        let history = storage
+            .transactions_for_address(&sender_address(), true)
+            .unwrap();
+        assert_eq!(history.len(), 2, "only the winning block's entries count");
+        assert!(history.iter().all(|tx| tx.block_hash == second.hash()));
+
+        let all = storage
+            .transactions_for_address(&sender_address(), false)
+            .unwrap();
+        assert_eq!(all.len(), 4, "the losing branch is still on record");
+    }
+
+    #[test]
+    fn history_comes_back_in_chain_order() {
+        let storage = Storage::open_temporary().unwrap();
+        // Indexed out of order on purpose: the key carries no height, so the
+        // ordering has to come from the sort.
+        for height in [3u32, 1, 2] {
+            let (block, _) = indexed_block(height, height as u64);
+            storage.apply_block(&block).unwrap();
+            storage.index_block(&block).unwrap();
+        }
+        let history = storage
+            .transactions_for_address(&sender_address(), true)
+            .unwrap();
+        let heights: Vec<u32> = history.iter().map(|tx| tx.height).collect();
+        assert_eq!(heights, vec![1, 1, 2, 2, 3, 3], "coinbase then transfer, per block");
+        let positions: Vec<u32> = history.iter().map(|tx| tx.position).collect();
+        assert_eq!(positions, vec![0, 1, 0, 1, 0, 1], "and in block order within a height");
+    }
+
+    #[test]
+    fn a_coinbase_is_indexed_for_its_recipient_only() {
+        // Its sender is a sentinel key belonging to nobody, and putting every
+        // block ever mined into that address's history would be noise.
+        let storage = Storage::open_temporary().unwrap();
+        let (block, _) = indexed_block(1, 0);
+        storage.apply_block(&block).unwrap();
+        storage.index_block(&block).unwrap();
+
+        let coinbase_hash = Hash::blake3(&block.transactions[0].encode());
+        let (_, position) = storage
+            .transaction_location(&coinbase_hash)
+            .unwrap()
+            .expect("the coinbase is indexed");
+        assert_eq!(position, 0);
+
+        let sentinel = block.transactions[0].sender_address();
+        assert!(storage
+            .transactions_for_address(&sentinel, false)
+            .unwrap()
+            .is_empty());
+
+        // The miner sees it, because the coinbase pays them.
+        let mined = storage
+            .transactions_for_address(&sender_address(), true)
+            .unwrap();
+        assert!(mined.iter().any(|tx| tx.tx_hash == coinbase_hash));
+    }
+
+    #[test]
+    fn the_indexed_height_is_remembered() {
+        let storage = Storage::open_temporary().unwrap();
+        assert_eq!(storage.get_indexed_through().unwrap(), None, "never run");
+        storage.put_indexed_through(42).unwrap();
+        assert_eq!(storage.get_indexed_through().unwrap(), Some(42));
     }
 }

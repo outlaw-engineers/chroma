@@ -401,6 +401,7 @@ dependencies = [
  "blake3",
  "chroma-block",
  "chroma-core",
+ "chroma-crypto",
  "chroma-state",
  "chroma-tx",
  "proptest",

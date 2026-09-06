@@ -32,6 +32,13 @@ pub enum MessageType {
     /// Ask a node for one account's balance and nonce.
     GetAccount = 0x11,
     Account = 0x12,
+    /// Ask a node where one transaction was mined. Answerable only by a node
+    /// keeping the index.
+    GetTransaction = 0x13,
+    TransactionAt = 0x14,
+    /// Ask a node for the transactions touching one address.
+    GetHistory = 0x15,
+    History = 0x16,
 }
 
 impl MessageType {
@@ -55,6 +62,10 @@ impl MessageType {
             0x10 => Ok(MessageType::ChainInfo),
             0x11 => Ok(MessageType::GetAccount),
             0x12 => Ok(MessageType::Account),
+            0x13 => Ok(MessageType::GetTransaction),
+            0x14 => Ok(MessageType::TransactionAt),
+            0x15 => Ok(MessageType::GetHistory),
+            0x16 => Ok(MessageType::History),
             _ => Err(CoreError::Serialization(format!("unknown message type: 0x{:02X}", v))),
         }
     }
@@ -726,6 +737,309 @@ impl RejectMessage {
     }
 }
 
+// ============================================================================
+// Transaction lookup
+// ============================================================================
+
+/// How many history entries one answer may carry.
+///
+/// Bounded so the reply cannot approach `MAX_MESSAGE_SIZE`: an entry is 72
+/// bytes, so a thousand of them is 72 KB. A miner's address gains an entry
+/// every ten seconds, and answering with all of them is not a service anyone
+/// wants on either end of the connection.
+pub const MAX_HISTORY_ENTRIES: u32 = 1000;
+
+/// Why a lookup came back without an answer.
+///
+/// "Not found" and "this node does not keep the index" are different facts,
+/// and a client told only the first would conclude a transaction never
+/// happened when the truth is that nobody looked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupStatus {
+    Found = 0,
+    NotFound = 1,
+    NotIndexed = 2,
+}
+
+impl LookupStatus {
+    fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(LookupStatus::Found),
+            1 => Ok(LookupStatus::NotFound),
+            2 => Ok(LookupStatus::NotIndexed),
+            _ => Err(CoreError::Serialization(format!(
+                "lookup status: unknown value {}",
+                v
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetTransactionMessage {
+    pub tx_hash: Hash,
+}
+
+impl GetTransactionMessage {
+    pub const SERIALIZED_SIZE: usize = 32;
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.tx_hash.as_bytes().to_vec()
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "gettransaction: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(data);
+        Ok(GetTransactionMessage { tx_hash: Hash(raw) })
+    }
+}
+
+/// Where a transaction was mined, and the transaction itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionAtMessage {
+    pub status: LookupStatus,
+    pub tx_hash: Hash,
+    pub block_hash: Hash,
+    pub height: u32,
+    pub position: u32,
+    /// False when the block that carries it lost a fork. The transaction is
+    /// real and was mined, but not on the chain anyone is following.
+    pub on_active_chain: bool,
+    pub transaction: Option<chroma_tx::Transaction>,
+}
+
+impl TransactionAtMessage {
+    /// The whole answer when a transaction was found.
+    pub const FOUND_SIZE: usize = 1 + 32 + 32 + 4 + 4 + 1 + chroma_tx::Transaction::SERIALIZED_SIZE;
+
+    pub fn missing(status: LookupStatus) -> Self {
+        TransactionAtMessage {
+            status,
+            tx_hash: Hash::ZERO,
+            block_hash: Hash::ZERO,
+            height: 0,
+            position: 0,
+            on_active_chain: false,
+            transaction: None,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        use chroma_core::serialize::CanonicalEncode;
+
+        if self.status != LookupStatus::Found {
+            return vec![self.status as u8];
+        }
+        let mut buf = Vec::with_capacity(Self::FOUND_SIZE);
+        buf.push(self.status as u8);
+        buf.extend_from_slice(self.tx_hash.as_bytes());
+        buf.extend_from_slice(self.block_hash.as_bytes());
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        buf.extend_from_slice(&self.position.to_le_bytes());
+        buf.push(self.on_active_chain as u8);
+        match &self.transaction {
+            Some(tx) => buf.extend_from_slice(&tx.encode()),
+            None => buf.extend_from_slice(&[0u8; chroma_tx::Transaction::SERIALIZED_SIZE]),
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        use chroma_core::serialize::CanonicalDecode;
+
+        if data.is_empty() {
+            return Err(CoreError::Serialization(
+                "transactionat: empty payload".to_string(),
+            ));
+        }
+        let status = LookupStatus::from_u8(data[0])?;
+        if status != LookupStatus::Found {
+            return Ok(Self::missing(status));
+        }
+        if data.len() != Self::FOUND_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "transactionat: expected {} bytes, got {}",
+                Self::FOUND_SIZE,
+                data.len()
+            )));
+        }
+        let mut tx_hash = [0u8; 32];
+        tx_hash.copy_from_slice(&data[1..33]);
+        let mut block_hash = [0u8; 32];
+        block_hash.copy_from_slice(&data[33..65]);
+        let mut height = [0u8; 4];
+        height.copy_from_slice(&data[65..69]);
+        let mut position = [0u8; 4];
+        position.copy_from_slice(&data[69..73]);
+        let on_active_chain = data[73] != 0;
+        let transaction = chroma_tx::Transaction::decode(&data[74..])?;
+
+        Ok(TransactionAtMessage {
+            status,
+            tx_hash: Hash(tx_hash),
+            block_hash: Hash(block_hash),
+            height: u32::from_le_bytes(height),
+            position: u32::from_le_bytes(position),
+            on_active_chain,
+            transaction: Some(transaction),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetHistoryMessage {
+    pub address: chroma_core::types::Address,
+    /// Entries wanted, from the newest end. Clamped to `MAX_HISTORY_ENTRIES`.
+    pub limit: u32,
+}
+
+impl GetHistoryMessage {
+    pub const SERIALIZED_SIZE: usize = 20 + 4;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::SERIALIZED_SIZE);
+        buf.extend_from_slice(self.address.as_hash160().as_bytes());
+        buf.extend_from_slice(&self.limit.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "gethistory: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(&data[..20]);
+        let mut limit = [0u8; 4];
+        limit.copy_from_slice(&data[20..24]);
+        Ok(GetHistoryMessage {
+            address: chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(raw)),
+            limit: u32::from_le_bytes(limit),
+        })
+    }
+}
+
+/// One transaction in an address's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub tx_hash: Hash,
+    pub block_hash: Hash,
+    pub height: u32,
+    pub position: u32,
+}
+
+impl HistoryEntry {
+    pub const SERIALIZED_SIZE: usize = 32 + 32 + 4 + 4;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryMessage {
+    pub status: LookupStatus,
+    /// How many the node holds in total, which may exceed what it sent.
+    pub total: u32,
+    pub entries: Vec<HistoryEntry>,
+}
+
+impl HistoryMessage {
+    pub fn not_indexed() -> Self {
+        HistoryMessage {
+            status: LookupStatus::NotIndexed,
+            total: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        if self.status == LookupStatus::NotIndexed {
+            return vec![self.status as u8];
+        }
+        let mut buf = Vec::with_capacity(9 + self.entries.len() * HistoryEntry::SERIALIZED_SIZE);
+        buf.push(LookupStatus::Found as u8);
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            buf.extend_from_slice(entry.tx_hash.as_bytes());
+            buf.extend_from_slice(entry.block_hash.as_bytes());
+            buf.extend_from_slice(&entry.height.to_le_bytes());
+            buf.extend_from_slice(&entry.position.to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.is_empty() {
+            return Err(CoreError::Serialization(
+                "history: empty payload".to_string(),
+            ));
+        }
+        let status = LookupStatus::from_u8(data[0])?;
+        if status == LookupStatus::NotIndexed {
+            return Ok(Self::not_indexed());
+        }
+        if data.len() < 9 {
+            return Err(CoreError::Serialization(
+                "history: truncated header".to_string(),
+            ));
+        }
+        let mut total = [0u8; 4];
+        total.copy_from_slice(&data[1..5]);
+        let mut count = [0u8; 4];
+        count.copy_from_slice(&data[5..9]);
+        let count = u32::from_le_bytes(count) as usize;
+
+        if count > MAX_HISTORY_ENTRIES as usize {
+            return Err(CoreError::Serialization(format!(
+                "history: {} entries, more than the {} allowed",
+                count, MAX_HISTORY_ENTRIES
+            )));
+        }
+        let expected = 9 + count * HistoryEntry::SERIALIZED_SIZE;
+        if data.len() != expected {
+            return Err(CoreError::Serialization(format!(
+                "history: expected {} bytes for {} entries, got {}",
+                expected,
+                count,
+                data.len()
+            )));
+        }
+
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let at = 9 + i * HistoryEntry::SERIALIZED_SIZE;
+            let mut tx_hash = [0u8; 32];
+            tx_hash.copy_from_slice(&data[at..at + 32]);
+            let mut block_hash = [0u8; 32];
+            block_hash.copy_from_slice(&data[at + 32..at + 64]);
+            let mut height = [0u8; 4];
+            height.copy_from_slice(&data[at + 64..at + 68]);
+            let mut position = [0u8; 4];
+            position.copy_from_slice(&data[at + 68..at + 72]);
+            entries.push(HistoryEntry {
+                tx_hash: Hash(tx_hash),
+                block_hash: Hash(block_hash),
+                height: u32::from_le_bytes(height),
+                position: u32::from_le_bytes(position),
+            });
+        }
+
+        Ok(HistoryMessage {
+            status: LookupStatus::Found,
+            total: u32::from_le_bytes(total),
+            entries,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,14 +1474,14 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrips() {
-        for i in 0x01..=0x12 {
+        for i in 0x01..=0x16 {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(MessageType::from_u8(mt as u8).unwrap(), mt);
         }
         assert!(MessageType::from_u8(0x00).is_err());
         // The first code past the ones defined. Kept as an explicit bound so
         // adding a type without extending the loop above fails here.
-        assert!(MessageType::from_u8(0x13).is_err());
+        assert!(MessageType::from_u8(0x17).is_err());
     }
 
     #[test]
@@ -1248,5 +1562,102 @@ mod tests {
         let (msg2, pos2) = Message::decode(&buf[pos1..]).unwrap();
         assert_eq!(msg2.msg_type, MessageType::Pong);
         assert_eq!(pos1 + pos2, buf.len());
+    }
+
+    #[test]
+    fn test_get_transaction_roundtrip() {
+        let msg = GetTransactionMessage {
+            tx_hash: Hash::blake3(b"a transaction"),
+        };
+        assert_eq!(
+            GetTransactionMessage::decode(&msg.encode()).unwrap(),
+            msg
+        );
+        assert!(GetTransactionMessage::decode(&[0u8; 31]).is_err());
+    }
+
+    #[test]
+    fn test_transaction_at_roundtrip() {
+        // A real public key: decode validates it, and an arbitrary 32 bytes
+        // is almost never a point on the curve.
+        let secret = chroma_crypto::schnorr::SecretKey32::from_bytes([0x33; 32]).unwrap();
+        let pubkey = chroma_crypto::schnorr::PublicKey32::from_secret(&secret).unwrap();
+        let tx = chroma_tx::Transaction {
+            sender_pubkey: pubkey,
+            recipient: chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(
+                [4u8; 20],
+            )),
+            amount: chroma_core::types::Amount(1234),
+            nonce: chroma_core::types::Nonce(7),
+            signature: chroma_crypto::schnorr::Signature64([5u8; 64]),
+        };
+        let msg = TransactionAtMessage {
+            status: LookupStatus::Found,
+            tx_hash: Hash::blake3(b"tx"),
+            block_hash: Hash::blake3(b"block"),
+            height: 918,
+            position: 3,
+            on_active_chain: true,
+            transaction: Some(tx),
+        };
+        assert_eq!(TransactionAtMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+
+    #[test]
+    fn a_missing_transaction_says_which_kind_of_missing() {
+        // "not found" and "this node keeps no index" have to stay apart on
+        // the wire: told only the first, a client concludes a transaction
+        // never happened when in fact nobody looked.
+        for status in [LookupStatus::NotFound, LookupStatus::NotIndexed] {
+            let msg = TransactionAtMessage::missing(status);
+            let decoded = TransactionAtMessage::decode(&msg.encode()).unwrap();
+            assert_eq!(decoded.status, status);
+            assert!(decoded.transaction.is_none());
+        }
+    }
+
+    #[test]
+    fn test_get_history_roundtrip() {
+        let msg = GetHistoryMessage {
+            address: chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(
+                [9u8; 20],
+            )),
+            limit: 50,
+        };
+        assert_eq!(GetHistoryMessage::decode(&msg.encode()).unwrap(), msg);
+        assert!(GetHistoryMessage::decode(&[0u8; 23]).is_err());
+    }
+
+    #[test]
+    fn test_history_roundtrip() {
+        let entries: Vec<HistoryEntry> = (0..4u32)
+            .map(|i| HistoryEntry {
+                tx_hash: Hash::blake3(&i.to_le_bytes()),
+                block_hash: Hash::blake3(b"block"),
+                height: 100 + i,
+                position: i,
+            })
+            .collect();
+        let msg = HistoryMessage {
+            status: LookupStatus::Found,
+            total: 900,
+            entries,
+        };
+        let decoded = HistoryMessage::decode(&msg.encode()).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.total, 900, "how many the node holds, not how many it sent");
+
+        let none = HistoryMessage::not_indexed();
+        assert_eq!(HistoryMessage::decode(&none.encode()).unwrap(), none);
+    }
+
+    #[test]
+    fn history_refuses_a_count_it_would_never_send() {
+        // A peer claiming more entries than the cap allows would have us
+        // allocate for them before reading a single one.
+        let mut payload = vec![LookupStatus::Found as u8];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&(MAX_HISTORY_ENTRIES + 1).to_le_bytes());
+        assert!(HistoryMessage::decode(&payload).is_err());
     }
 }

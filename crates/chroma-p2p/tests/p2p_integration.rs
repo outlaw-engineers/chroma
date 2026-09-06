@@ -81,6 +81,20 @@ async fn start_regtest_node(
     (node, addr, dir)
 }
 
+/// Start a regtest node that mines and keeps a transaction index.
+async fn start_indexing_node(tag: &str) -> (Node, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let params = chroma_consensus::ChainParams::regtest();
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir.clone())
+        .with_mining(true)
+        .with_transaction_index(true);
+    let mut node = Node::new(config);
+    node.run().await.expect("node failed to start");
+    (node, dir)
+}
+
 /// A minimal peer implementation driven by the test, so we can control exactly
 /// what goes on the wire and observe exactly what comes back.
 pub struct RawPeer {
@@ -1795,6 +1809,160 @@ async fn a_node_answers_chain_and_account_queries() {
     let account = AccountMessage::decode(&reply.payload).unwrap();
     assert!(!account.exists, "never seen, which is not the same as empty");
     assert_eq!(account.balance, 0);
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction index
+// ---------------------------------------------------------------------------
+
+/// A node keeping the index answers where a transaction was mined, over the
+/// same connection a peer uses for everything else.
+#[tokio::test]
+async fn an_indexing_node_answers_transaction_lookups() {
+    use chroma_p2p::wire::{
+        GetTransactionMessage, LookupStatus, MessageType, TransactionAtMessage,
+    };
+
+    let (mut node, dir) = start_indexing_node("txindex").await;
+    let mut peer = RawPeer::connect(&node, 40_020).await;
+    peer.handshake().await;
+
+    // Mine a block so there is a coinbase to look up: it is a transaction
+    // like any other as far as the index is concerned.
+    wait_for_within(
+        "the node to mine a block",
+        Duration::from_secs(60),
+        || async { node.chain_height() >= 1 },
+    )
+    .await;
+
+    let coinbase_hash = {
+        let cs = node.chain_state();
+        let cs = cs.read().await;
+        let block = node
+            .storage()
+            .get_block_by_hash(&cs.tip.hash)
+            .unwrap()
+            .expect("the tip is stored");
+        chroma_core::hash::Hash::blake3(&block.transactions[0].encode())
+    };
+
+    peer.send(Message::new(
+        MessageType::GetTransaction,
+        GetTransactionMessage {
+            tx_hash: coinbase_hash,
+        }
+        .encode(),
+    ))
+    .await;
+
+    let reply = peer.recv_expect(MessageType::TransactionAt).await;
+    let found = TransactionAtMessage::decode(&reply.payload).unwrap();
+
+    assert_eq!(found.status, LookupStatus::Found);
+    assert_eq!(found.tx_hash, coinbase_hash);
+    assert_eq!(found.position, 0, "the coinbase leads its block");
+    assert!(found.on_active_chain);
+    assert!(found.transaction.is_some());
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A node without the index says so, rather than saying the transaction does
+/// not exist. Those are different facts and a client acts differently on them.
+#[tokio::test]
+async fn a_node_without_the_index_says_so() {
+    use chroma_p2p::wire::{
+        GetHistoryMessage, GetTransactionMessage, HistoryMessage, LookupStatus, MessageType,
+        TransactionAtMessage,
+    };
+
+    let (mut node, _addr, dir) = start_node("noindex").await;
+    let mut peer = RawPeer::connect(&node, 40_021).await;
+    peer.handshake().await;
+
+    peer.send(Message::new(
+        MessageType::GetTransaction,
+        GetTransactionMessage {
+            tx_hash: chroma_core::hash::Hash::blake3(b"anything"),
+        }
+        .encode(),
+    ))
+    .await;
+    let reply = peer.recv_expect(MessageType::TransactionAt).await;
+    assert_eq!(
+        TransactionAtMessage::decode(&reply.payload).unwrap().status,
+        LookupStatus::NotIndexed
+    );
+
+    peer.send(Message::new(
+        MessageType::GetHistory,
+        GetHistoryMessage {
+            address: Address::from_hash160(Hash160([0x11; 20])),
+            limit: 10,
+        }
+        .encode(),
+    ))
+    .await;
+    let reply = peer.recv_expect(MessageType::History).await;
+    assert_eq!(
+        HistoryMessage::decode(&reply.payload).unwrap().status,
+        LookupStatus::NotIndexed
+    );
+
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The miner's address accumulates a history, one coinbase per block.
+#[tokio::test]
+async fn history_comes_back_for_the_mining_address() {
+    use chroma_p2p::wire::{GetHistoryMessage, HistoryMessage, LookupStatus, MessageType};
+
+    let (mut node, dir) = start_indexing_node("txhistory").await;
+    let mut peer = RawPeer::connect(&node, 40_022).await;
+    peer.handshake().await;
+
+    wait_for_within(
+        "the node to mine three blocks",
+        Duration::from_secs(90),
+        || async { node.chain_height() >= 3 },
+    )
+    .await;
+
+    let miner = node.miner_address();
+    peer.send(Message::new(
+        MessageType::GetHistory,
+        GetHistoryMessage {
+            address: miner,
+            limit: 100,
+        }
+        .encode(),
+    ))
+    .await;
+
+    let reply = peer.recv_expect(MessageType::History).await;
+    let history = HistoryMessage::decode(&reply.payload).unwrap();
+
+    assert_eq!(history.status, LookupStatus::Found);
+    assert!(
+        history.entries.len() >= 3,
+        "one coinbase per block, got {}",
+        history.entries.len()
+    );
+    assert!(
+        history.entries.iter().all(|e| e.position == 0),
+        "every entry is a coinbase"
+    );
+    // Chain order, which the index does not get from its keys.
+    let heights: Vec<u32> = history.entries.iter().map(|e| e.height).collect();
+    let mut sorted = heights.clone();
+    sorted.sort_unstable();
+    assert_eq!(heights, sorted);
 
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

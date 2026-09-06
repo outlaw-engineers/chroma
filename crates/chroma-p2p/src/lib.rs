@@ -279,6 +279,12 @@ pub struct NodeConfig {
     /// same timestamp produce byte-identical blocks, so they never actually
     /// compete — which silently hides whether fork choice works at all.
     pub miner_address: chroma_core::types::Address,
+    /// Keep a transaction index.
+    ///
+    /// Off by default. The node does not need it — nothing in consensus or
+    /// relay looks a transaction up by hash — so the cost belongs to whoever
+    /// wants to answer other people's queries, not to everyone.
+    pub index_transactions: bool,
 }
 
 impl NodeConfig {
@@ -293,7 +299,13 @@ impl NodeConfig {
             params: chroma_consensus::ChainParams::devnet(),
             miner_address: random_address(),
             node_secret: None,
+            index_transactions: false,
         }
+    }
+
+    pub fn with_transaction_index(mut self, on: bool) -> Self {
+        self.index_transactions = on;
+        self
     }
 
     pub fn with_node_secret(mut self, secret: [u8; 32]) -> Self {
@@ -429,6 +441,8 @@ struct ConnectionContext {
     /// the handler holds a clone of it, so the writer task would never see the
     /// channel close and the socket would linger until the idle timeout.
     shutdown_tx: broadcast::Sender<()>,
+    /// Whether this node keeps a transaction index (see `NodeConfig`).
+    index_transactions: bool,
 }
 
 impl ConnectionContext {
@@ -481,6 +495,10 @@ impl Node {
             syncer.insert_header(header.clone());
         }
 
+        if config.index_transactions {
+            Self::catch_up_index(&storage, chain_state.tip.height.0);
+        }
+
         Node {
             config,
             peer_manager: Arc::new(RwLock::new(PeerManager::new())),
@@ -500,6 +518,56 @@ impl Node {
             tasks: Vec::new(),
             local_addr: None,
         }
+    }
+
+    /// Bring the transaction index up to the tip.
+    ///
+    /// A database that ran with indexing off has holes, and a lookup into a
+    /// holed index cannot tell "no such transaction" from "that stretch was
+    /// never indexed". Rather than a separate reindex command to remember to
+    /// run, the marker says how far the active chain has been walked and this
+    /// walks the rest on the next start — so turning the flag on is the whole
+    /// procedure.
+    ///
+    /// Only the active chain is walked. Side branches from the unindexed
+    /// stretch stay unindexed, which costs a query about a block that lost a
+    /// fork before indexing began.
+    fn catch_up_index(storage: &chroma_storage::Storage, tip_height: u32) {
+        let done = storage.get_indexed_through().unwrap_or(None);
+        let from = match done {
+            Some(h) if h >= tip_height => return,
+            Some(h) => h + 1,
+            None => 0,
+        };
+        if from > tip_height {
+            return;
+        }
+
+        println!(
+            "Indexing transactions from height {} to {}...",
+            from, tip_height
+        );
+        let mut indexed = 0u32;
+        for height in from..=tip_height {
+            match storage.get_block_by_height(height) {
+                Ok(Some(block)) => {
+                    if storage.index_block(&block).is_ok() {
+                        indexed += 1;
+                    }
+                }
+                // A height we cannot read is not a reason to stop: the marker
+                // stays behind it, so the next start tries again.
+                _ => {
+                    eprintln!("Cannot index height {}: block not stored.", height);
+                    let _ = storage.put_indexed_through(height.saturating_sub(1));
+                    let _ = storage.flush();
+                    return;
+                }
+            }
+        }
+        let _ = storage.put_indexed_through(tip_height);
+        let _ = storage.flush();
+        println!("Indexed {} block(s).", indexed);
     }
 
     fn init_chain_state(
@@ -647,6 +715,11 @@ impl Node {
         chain
     }
 
+    /// The address this node pays its block rewards to.
+    pub fn miner_address(&self) -> chroma_core::types::Address {
+        self.config.miner_address
+    }
+
     pub fn storage(&self) -> &chroma_storage::Storage {
         &self.storage
     }
@@ -735,6 +808,7 @@ impl Node {
             identity_nonce: self.identity_nonce,
             identity: self.identity.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
+            index_transactions: self.config.index_transactions,
         };
 
         {
@@ -789,10 +863,11 @@ impl Node {
             let peer_mgr = self.peer_manager.clone();
             let miner_tx = outbound_tx.clone();
             let miner_syncer = self.syncer.clone();
+            let index_transactions = self.config.index_transactions;
             self.tasks.push(tokio::spawn(async move {
                 Self::run_miner(
                     storage, chain_state, event_tx, height, miner_address, miner_pool, peer_mgr,
-                    miner_tx, miner_syncer, shutdown,
+                    miner_tx, miner_syncer, index_transactions, shutdown,
                 )
                 .await;
             }));
@@ -1821,9 +1896,105 @@ impl Node {
                 Ok(true)
             }
 
+            MessageType::GetTransaction => {
+                use crate::wire::{LookupStatus, TransactionAtMessage};
+
+                let request = crate::wire::GetTransactionMessage::decode(&msg.payload)?;
+                let answer = if !ctx.index_transactions {
+                    // Not the same as "no such transaction". A client told
+                    // only that would conclude it never happened, when the
+                    // truth is that this node never looked.
+                    TransactionAtMessage::missing(LookupStatus::NotIndexed)
+                } else {
+                    match ctx.storage.transaction_location(&request.tx_hash) {
+                        Ok(Some((block_hash, position))) => {
+                            let block = ctx.storage.get_block_by_hash(&block_hash).ok().flatten();
+                            match block {
+                                Some(block) => {
+                                    let transaction =
+                                        block.transactions.get(position as usize).cloned();
+                                    let on_active_chain = ctx
+                                        .storage
+                                        .is_on_active_chain(&block_hash)
+                                        .unwrap_or(false);
+                                    match transaction {
+                                        Some(tx) => TransactionAtMessage {
+                                            status: LookupStatus::Found,
+                                            tx_hash: request.tx_hash,
+                                            block_hash,
+                                            height: block.header.height.0,
+                                            position,
+                                            on_active_chain,
+                                            transaction: Some(tx),
+                                        },
+                                        // The index names a position the block
+                                        // does not have. Report it as missing
+                                        // rather than inventing an answer.
+                                        None => {
+                                            TransactionAtMessage::missing(LookupStatus::NotFound)
+                                        }
+                                    }
+                                }
+                                None => TransactionAtMessage::missing(LookupStatus::NotFound),
+                            }
+                        }
+                        _ => TransactionAtMessage::missing(LookupStatus::NotFound),
+                    }
+                };
+                Self::send(
+                    out_tx,
+                    Message::new(MessageType::TransactionAt, answer.encode()),
+                )
+                .await?;
+                Ok(true)
+            }
+
+            MessageType::GetHistory => {
+                use crate::wire::{
+                    HistoryEntry, HistoryMessage, LookupStatus, MAX_HISTORY_ENTRIES,
+                };
+
+                let request = crate::wire::GetHistoryMessage::decode(&msg.payload)?;
+                let answer = if !ctx.index_transactions {
+                    HistoryMessage::not_indexed()
+                } else {
+                    // Active chain only. A transaction on a branch that lost
+                    // did happen, but showing it in a history reads as money
+                    // that moved, and on the chain everyone follows it did not.
+                    let found = ctx
+                        .storage
+                        .transactions_for_address(&request.address, true)
+                        .unwrap_or_default();
+                    let total = found.len() as u32;
+                    let limit = request.limit.clamp(1, MAX_HISTORY_ENTRIES) as usize;
+                    // From the newest end: a miner's address gains an entry
+                    // every ten seconds, and the recent ones are the ones
+                    // anybody is asking about.
+                    let start = found.len().saturating_sub(limit);
+                    let entries = found[start..]
+                        .iter()
+                        .map(|tx| HistoryEntry {
+                            tx_hash: tx.tx_hash,
+                            block_hash: tx.block_hash,
+                            height: tx.height,
+                            position: tx.position,
+                        })
+                        .collect();
+                    HistoryMessage {
+                        status: LookupStatus::Found,
+                        total,
+                        entries,
+                    }
+                };
+                Self::send(out_tx, Message::new(MessageType::History, answer.encode())).await?;
+                Ok(true)
+            }
+
             // Answers to queries we did not ask, and the two notices that
             // carry nothing to act on.
             MessageType::ChainInfo
+            | MessageType::TransactionAt
+            | MessageType::History
             | MessageType::Account
             | MessageType::Reject
             | MessageType::NotFound => Ok(true),
@@ -1959,6 +2130,24 @@ impl Node {
                         // A losing branch is still stored — it validated, and
                         // a later reorg replays it out of storage.
                         let _ = ctx.storage.put_block(&candidate);
+
+                        // Indexed on whichever branch it landed on, for the
+                        // same reason it is stored on either: the index names
+                        // block hashes, so an entry for a block that later
+                        // loses stays true. It points at a block we still
+                        // hold, and whether that block is on the active chain
+                        // is a separate question the height records answer.
+                        // Indexing only winners would mean rewriting the index
+                        // on every reorg, which is the work keying it this way
+                        // exists to avoid.
+                        if ctx.index_transactions {
+                            let _ = ctx.storage.index_block(&candidate);
+                            if outcome == chroma_consensus::BlockOutcome::Extended {
+                                let _ = ctx
+                                    .storage
+                                    .put_indexed_through(candidate.header.height.0);
+                            }
+                        }
 
                         // Height-keyed records follow the active chain. A
                         // block that extended it owns its height; a reorg
@@ -2154,6 +2343,11 @@ impl Node {
         }
     }
 
+    // Ten parameters and now eleven. Grouping them into a struct would make
+    // the signature shorter and the call site no clearer: they are ten
+    // unrelated handles, and naming the bag they travel in explains nothing
+    // about any of them.
+    #[allow(clippy::too_many_arguments)]
     async fn run_miner(
         storage: Arc<chroma_storage::Storage>,
         chain_state: Arc<RwLock<chroma_consensus::ChainState>>,
@@ -2164,6 +2358,7 @@ impl Node {
         peer_manager: Arc<RwLock<PeerManager>>,
         outbound_tx: mpsc::UnboundedSender<OutboundCommand>,
         syncer: Arc<RwLock<ChainSyncer>>,
+        index_transactions: bool,
         mut shutdown: broadcast::Receiver<()>,
     ) {
         use chroma_consensus::miner::{
@@ -2300,6 +2495,11 @@ impl Node {
                                         supply: tip.supply,
                                     };
                                     let _ = storage.apply_block(&block);
+                                    if index_transactions {
+                                        let _ = storage.index_block(&block);
+                                        let _ = storage
+                                            .put_indexed_through(block.header.height.0);
+                                    }
                                     let _ = storage.put_tip(&persisted);
                                     let _ = storage.put_state(&cs.state);
                                     let _ = storage.flush();

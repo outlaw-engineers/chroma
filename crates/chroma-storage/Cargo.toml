@@ -28,3 +28,7 @@ sled = "0.34"
 
 [dev-dependencies]
 proptest = "1.5"
+# Tests build real signed transactions to index. default-features off for the
+# same reason as every other edge into chroma-crypto: RandomX must not be
+# switched back on for the whole graph by a dependency that forgot to say so.
+chroma-crypto = { path = "../chroma-crypto", default-features = false }
