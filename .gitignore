@@ -1,2 +1,4 @@
 **/target/
 **/test_dbs/
+chroma_data/
+**/chroma_data/
