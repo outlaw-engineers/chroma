@@ -321,7 +321,7 @@ chroma/
 * Upgrade mechanism（v1では仕様をfreezeし、別途設計する）
 * DNS Seed Operatorのgovernance
 * Light Client Protocol
-* RPC/API仕様
+* RPC/API仕様（草案は [`protocol/RPC.md`](RPC.md)。プロトコルの一部ではない）
 * Wallet Seed Phrase（Protocolでは規定しない。UX上の方式は別途検討する。
   リファレンス実装はBIP-39を用いる）
 * Testnet parameters（Mainnetとは異なる可能性がある）
