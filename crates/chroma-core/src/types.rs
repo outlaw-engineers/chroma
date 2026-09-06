@@ -315,6 +315,50 @@ impl CompactTarget {
     /// Difficulty 1 (genesis)
     pub const DIFFICULTY_1: CompactTarget = CompactTarget(0x1d00ffff);
 
+    /// Roughly how many hashes a block at this target costs, as a power of
+    /// two.
+    ///
+    /// A hash satisfies the target with probability `target / 2^256`, so the
+    /// expected number of tries is `2^256 / target` — this returns the log2 of
+    /// that. Counting the target's leading zeros instead is the usual
+    /// shorthand, but it is off by one whenever the target is close to a power
+    /// of two, which the genesis target is exactly: it would report 2^11 for a
+    /// target the spec defines as costing 2^12.
+    ///
+    /// This is the number worth showing a person. `Difficulty` is a ratio
+    /// against Bitcoin's difficulty 1 in integer arithmetic, so it reports 0
+    /// for every target easier than that — which is where this chain starts.
+    pub fn expected_hashes_log2(&self) -> u32 {
+        use crate::u256::U256;
+
+        let target = U256::from_be_bytes(&self.to_full_target());
+        if target.is_zero() {
+            return 256;
+        }
+        // `U256::MAX` is one short of 2^256, and for a target that is an exact
+        // power of two — which the genesis target is — that one unit is the
+        // difference between 4095 and 4096, so between reporting 2^11 and
+        // 2^12. Adding it back before taking the logarithm restores it.
+        let (tries, _) = U256::MAX.div_rem(&target);
+        let tries = match tries.checked_add(&U256::from_u64(1)) {
+            Some(tries) => tries,
+            None => return 256,
+        };
+
+        // log2 of the quotient: its position counted from the top.
+        let bytes = tries.to_be_bytes();
+        let mut leading = 0u32;
+        for byte in bytes.iter() {
+            if *byte == 0 {
+                leading += 8;
+            } else {
+                leading += byte.leading_zeros();
+                break;
+            }
+        }
+        255 - leading
+    }
+
     /// Convert to full 256-bit target
     pub fn to_full_target(&self) -> [u8; 32] {
         let bits = self.0;

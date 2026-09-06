@@ -180,24 +180,8 @@ mod tests {
     /// retarget needs blocks before it can loosen.
     #[test]
     fn test_genesis_difficulty_is_reachable() {
-        let target = ChainParams::mainnet().genesis_bits.to_full_target();
-        let leading_zero_bits: u32 = {
-            let mut n = 0;
-            for byte in target.iter() {
-                if *byte == 0 {
-                    n += 8;
-                } else {
-                    n += byte.leading_zeros();
-                    break;
-                }
-            }
-            n
-        };
-        assert_eq!(
-            leading_zero_bits, 11,
-            "expected about 2^12 hashes per block, got 2^{}",
-            leading_zero_bits
-        );
+        let cost = ChainParams::mainnet().genesis_bits.expected_hashes_log2();
+        assert_eq!(cost, 12, "expected about 2^12 hashes per block, got 2^{}", cost);
     }
     use super::*;
     use chroma_core::hash::Hash;

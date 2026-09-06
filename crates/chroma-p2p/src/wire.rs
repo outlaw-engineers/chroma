@@ -26,6 +26,12 @@ pub enum MessageType {
     Block = 0x0C,
     NotFound = 0x0D,
     Reject = 0x0E,
+    /// Ask a node where its chain stands.
+    GetChainInfo = 0x0F,
+    ChainInfo = 0x10,
+    /// Ask a node for one account's balance and nonce.
+    GetAccount = 0x11,
+    Account = 0x12,
 }
 
 impl MessageType {
@@ -45,6 +51,10 @@ impl MessageType {
             0x0C => Ok(MessageType::Block),
             0x0D => Ok(MessageType::NotFound),
             0x0E => Ok(MessageType::Reject),
+            0x0F => Ok(MessageType::GetChainInfo),
+            0x10 => Ok(MessageType::ChainInfo),
+            0x11 => Ok(MessageType::GetAccount),
+            0x12 => Ok(MessageType::Account),
             _ => Err(CoreError::Serialization(format!("unknown message type: 0x{:02X}", v))),
         }
     }
@@ -551,6 +561,123 @@ impl AddrMessage {
     }
 }
 
+/// Where a node's chain stands: what a client needs to show chain status
+/// without opening the database, which it cannot do while the node holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainInfoMessage {
+    pub height: u32,
+    pub tip: Hash,
+    pub bits: u32,
+    pub supply: u64,
+}
+
+impl ChainInfoMessage {
+    pub const SERIALIZED_SIZE: usize = 4 + 32 + 4 + 8;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::SERIALIZED_SIZE);
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        buf.extend_from_slice(self.tip.as_bytes());
+        buf.extend_from_slice(&self.bits.to_le_bytes());
+        buf.extend_from_slice(&self.supply.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "chaininfo: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let mut tip = [0u8; 32];
+        tip.copy_from_slice(&data[4..36]);
+        Ok(ChainInfoMessage {
+            height: u32::from_le_bytes(data[0..4].try_into().unwrap()),
+            tip: Hash::from_bytes(tip),
+            bits: u32::from_le_bytes(data[36..40].try_into().unwrap()),
+            supply: u64::from_le_bytes(data[40..48].try_into().unwrap()),
+        })
+    }
+}
+
+/// Which account a client is asking about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetAccountMessage {
+    pub address: chroma_core::types::Address,
+}
+
+impl GetAccountMessage {
+    pub const SERIALIZED_SIZE: usize = 20;
+
+    pub fn encode(&self) -> Vec<u8> {
+        self.address.as_hash160().as_bytes().to_vec()
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "getaccount: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(data);
+        Ok(GetAccountMessage {
+            address: chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(raw)),
+        })
+    }
+}
+
+/// The answer. `exists` distinguishes an account holding nothing from one the
+/// chain has never seen — the balance is zero either way, and which it is
+/// tells a user whether they are looking in the right place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountMessage {
+    pub address: chroma_core::types::Address,
+    pub exists: bool,
+    pub balance: u64,
+    pub nonce: u64,
+}
+
+impl AccountMessage {
+    pub const SERIALIZED_SIZE: usize = 20 + 1 + 8 + 8;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::SERIALIZED_SIZE);
+        buf.extend_from_slice(self.address.as_hash160().as_bytes());
+        buf.push(u8::from(self.exists));
+        buf.extend_from_slice(&self.balance.to_le_bytes());
+        buf.extend_from_slice(&self.nonce.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() != Self::SERIALIZED_SIZE {
+            return Err(CoreError::Serialization(format!(
+                "account: expected {} bytes, got {}",
+                Self::SERIALIZED_SIZE,
+                data.len()
+            )));
+        }
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(&data[..20]);
+        if data[20] > 1 {
+            return Err(CoreError::Serialization(
+                "account: exists flag is not a boolean".to_string(),
+            ));
+        }
+        Ok(AccountMessage {
+            address: chroma_core::types::Address::from_hash160(chroma_core::hash::Hash160(raw)),
+            exists: data[20] == 1,
+            balance: u64::from_le_bytes(data[21..29].try_into().unwrap()),
+            nonce: u64::from_le_bytes(data[29..37].try_into().unwrap()),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RejectMessage {
     pub message: String,
@@ -1033,12 +1160,72 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrips() {
-        for i in 0x01..=0x0E {
+        for i in 0x01..=0x12 {
             let mt = MessageType::from_u8(i).unwrap();
             assert_eq!(MessageType::from_u8(mt as u8).unwrap(), mt);
         }
         assert!(MessageType::from_u8(0x00).is_err());
-        assert!(MessageType::from_u8(0x0F).is_err());
+        // The first code past the ones defined. Kept as an explicit bound so
+        // adding a type without extending the loop above fails here.
+        assert!(MessageType::from_u8(0x13).is_err());
+    }
+
+    #[test]
+    fn test_chain_info_roundtrip() {
+        let info = ChainInfoMessage {
+            height: 152,
+            tip: Hash::blake3(b"tip"),
+            bits: 0x1f100000,
+            supply: 152_000_000,
+        };
+        assert_eq!(ChainInfoMessage::decode(&info.encode()).unwrap(), info);
+        assert!(ChainInfoMessage::decode(&[0u8; 4]).is_err());
+        let mut long = info.encode();
+        long.push(0);
+        assert!(ChainInfoMessage::decode(&long).is_err());
+    }
+
+    #[test]
+    fn test_account_roundtrip() {
+        use chroma_core::hash::Hash160;
+        use chroma_core::types::Address;
+
+        let account = AccountMessage {
+            address: Address::from_hash160(Hash160([7u8; 20])),
+            exists: true,
+            balance: 21_000_000,
+            nonce: 3,
+        };
+        assert_eq!(AccountMessage::decode(&account.encode()).unwrap(), account);
+
+        let absent = AccountMessage {
+            exists: false,
+            balance: 0,
+            nonce: 0,
+            ..account
+        };
+        assert_eq!(AccountMessage::decode(&absent.encode()).unwrap(), absent);
+
+        // The flag is a boolean on the wire, so anything else is a peer
+        // sending something we did not agree to.
+        let mut bad = account.encode();
+        bad[20] = 2;
+        assert!(AccountMessage::decode(&bad).is_err());
+
+        assert!(AccountMessage::decode(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn test_get_account_roundtrip() {
+        use chroma_core::hash::Hash160;
+        use chroma_core::types::Address;
+
+        let request = GetAccountMessage {
+            address: Address::from_hash160(Hash160([9u8; 20])),
+        };
+        assert_eq!(GetAccountMessage::decode(&request.encode()).unwrap(), request);
+        assert!(GetAccountMessage::decode(&[0u8; 19]).is_err());
+        assert!(GetAccountMessage::decode(&[0u8; 21]).is_err());
     }
 
     #[test]

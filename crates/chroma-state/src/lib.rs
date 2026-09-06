@@ -164,6 +164,16 @@ impl State {
     }
 
     /// Every account, in key order.
+    /// Whether the chain has ever recorded this account.
+    ///
+    /// `get_account` answers zero for an address it has never seen, which is
+    /// the right default for arithmetic and the wrong one for a person: "0
+    /// CHR" and "no such account" look identical, and the second usually
+    /// means the address was mistyped or the wrong chain is being asked.
+    pub fn has_account(&self, address: &Address) -> bool {
+        self.accounts.contains_key(address.as_hash160().as_bytes())
+    }
+
     pub fn accounts(&self) -> impl Iterator<Item = (Address, Account)> + '_ {
         self.accounts.iter().map(|(key, account)| {
             (

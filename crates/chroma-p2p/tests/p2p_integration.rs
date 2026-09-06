@@ -1663,6 +1663,16 @@ async fn a_data_directory_belongs_to_one_network() {
         node.shutdown().await;
     }
 
+    // `shutdown` stops the node's tasks, but detached connection handlers can
+    // hold a clone of the storage for a moment longer, and sled's lock goes
+    // with the last one. The check treats a database it cannot open as
+    // nothing to contradict — correct in production, where the node is about
+    // to fail on the same lock — so wait for the lock rather than race it.
+    wait_for("the storage lock to be released", || async {
+        chroma_p2p::check_data_dir_network(&dir, devnet).is_err()
+    })
+    .await;
+
     // Reopening it as regtest is fine; as devnet it is not.
     assert!(chroma_p2p::check_data_dir_network(&dir, regtest).is_ok());
     let err = chroma_p2p::check_data_dir_network(&dir, devnet)
@@ -1680,5 +1690,71 @@ async fn a_data_directory_belongs_to_one_network() {
         err
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A client cannot read the database while the node holds it, so anything it
+/// needs to know about the chain has to come from the node. Before these
+/// messages existed, `wallet balance` and `block height` opened the directory
+/// directly and therefore could not be used while a node was running — which
+/// is every moment anyone would want to ask.
+#[tokio::test]
+async fn a_node_answers_chain_and_account_queries() {
+    use chroma_p2p::wire::{
+        AccountMessage, ChainInfoMessage, GetAccountMessage, MessageType,
+    };
+
+    let dir = temp_dir("queries");
+    let params = chroma_consensus::ChainParams::regtest();
+    let payout = Address::from_hash160(Hash160([0x42; 20]));
+    let config = NodeConfig::new("127.0.0.1:0".parse().unwrap(), chroma_core::hash::Hash::ZERO)
+        .with_params(params)
+        .with_data_dir(dir.clone())
+        .with_miner_address(payout)
+        .with_mining(true);
+    let mut node = Node::new(config);
+    node.run().await.expect("node failed to start");
+
+    wait_for("the miner to produce a block", || async {
+        node.chain_height() >= 2
+    })
+    .await;
+
+    let mut peer = RawPeer::connect(&node, 40_060).await;
+    peer.handshake().await;
+
+    // Where the chain stands.
+    peer.send(Message::new(MessageType::GetChainInfo, vec![])).await;
+    let reply = peer.recv_expect(MessageType::ChainInfo).await;
+    let info = ChainInfoMessage::decode(&reply.payload).unwrap();
+    assert!(info.height >= 2, "the node reported height {}", info.height);
+    assert_eq!(info.supply, info.height as u64 * 1_000_000);
+    assert_eq!(info.bits, params.genesis_bits.0, "regtest does not retarget");
+
+    // The account the rewards went to.
+    peer.send(Message::new(
+        MessageType::GetAccount,
+        GetAccountMessage { address: payout }.encode(),
+    ))
+    .await;
+    let reply = peer.recv_expect(MessageType::Account).await;
+    let account = AccountMessage::decode(&reply.payload).unwrap();
+    assert_eq!(account.address, payout);
+    assert!(account.exists, "the miner has been paid, so it exists");
+    assert!(account.balance >= 2_000_000);
+
+    // An address the chain has never seen answers zero, and says so.
+    let stranger = Address::from_hash160(Hash160([0x99; 20]));
+    peer.send(Message::new(
+        MessageType::GetAccount,
+        GetAccountMessage { address: stranger }.encode(),
+    ))
+    .await;
+    let reply = peer.recv_expect(MessageType::Account).await;
+    let account = AccountMessage::decode(&reply.payload).unwrap();
+    assert!(!account.exists, "never seen, which is not the same as empty");
+    assert_eq!(account.balance, 0);
+
+    node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

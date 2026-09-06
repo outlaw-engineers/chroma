@@ -52,33 +52,57 @@ DNS の1文字列は 255 バイトまでで、1エントリは約 165 バイト�
 
 ## 現在の内容
 
-**未公開。** devnet のブートストラップノードのアドレスが確定していないため、
-現時点でこのレコードは存在しない。ノードは3回失敗した時点で引くのをやめ
-（`MAX_SEED_FAILURES`）、`--connect` で指定された相手だけを使う。
+公開済み。2026-09-06 時点で `seed.chroma.org.uk` は次の1件を返す。
 
-公開する内容が決まったら、ゾーンに次の形で登録し、この節を実際の値で
-置き換える。
+```text
+chroma-seed=5cc5f77adecf6dbd84099f817b61316413796062335098e5def585060ae920e2.3294a531ce21999360177a696bf344b21b304e642f70c35350d9bd638b766661@60.151.51.203:8333
+```
+
+このファイルは記録であって定義ではない。実際に何が公開されているかは
+[確認](#確認)の手順で引くこと。レコードを変更したらここも書き換える。
+
+**注意:** 現在の登録先は、まだマージされていないジェネシスパラメータの上で
+動いている mainnet ノードである。`GENESIS_TARGET_BITS` が変われば
+ジェネシスハッシュが変わり、このノードは繋がらない別チェーンになる。
+パラメータが確定するまでは、ここが指す先は暫定と考えること。
+
+ノードを増やす場合は TXT レコードを増やす。ゾーンファイルなら次の形。
 
 ```zone
-; <node-id>.<noise-key> は各ノードの起動ログ "Node identity: ..." から
-; そのままコピーする
+; <node-id>.<noise-key> は `chroma node-id` の出力からそのままコピーする
 seed	3600	IN	TXT	"chroma-seed=<node-id>.<noise-key>@203.0.113.10:8333"
 seed	3600	IN	TXT	"chroma-seed=<node-id>.<noise-key>@198.51.100.20:8333"
 ```
 
 ## ノードIDの取得
 
-ノードは起動時に、`--connect` にそのまま渡せる形で自分の identity を表示する。
+`chroma node-id` が、そのまま貼れる形で出力する。ノードを起動する必要はない。
+データディレクトリに鍵が無ければ作る。
 
 ```console
-$ chroma node --listen 0.0.0.0:8333 --data-dir /var/lib/chroma
-Node identity: 9e7775e7...d035.4a1c9b02...77e1@0.0.0.0:8333
+$ chroma node-id --data-dir /var/lib/chroma --listen 203.0.113.10:8333
+Key file: /var/lib/chroma/node_key
+Node ID:  2a6dc29f...96b5
+Noise key:f58dae1f...3072
+
+As a peer would dial it:
+  2a6dc29f...96b5.f58dae1f...3072@203.0.113.10:8333
+
+As a DNS seed TXT record (substitute the public address):
+  chroma-seed=2a6dc29f...96b5.f58dae1f...3072@203.0.113.10:8333
 ```
 
-鍵はデータディレクトリの `node_key`（16進数32バイト、パーミッション 600）に
-保存され、再起動しても変わらない。このファイルは ed25519 の種で、X25519
-静的鍵もここから導出されるので、バックアップはこれ1つでよい。逆にこれを
-失う、あるいは意図的に作り直すとノードIDが変わり、このレコードと
+起動中のノードの identity は起動ログにも、鍵ファイルのパス付きで出る。
+
+```text
+Node identity (from /var/lib/chroma/node_key): 2a6dc29f...96b5.f58dae1f...3072@0.0.0.0:8333
+```
+
+鍵は `<data-dir>/node_key`（16進数32バイト、パーミッション 600）に保存される。
+これは ed25519 の種で、X25519 静的鍵もここから導出されるので、バックアップは
+これ1つでよい。**identity はデータディレクトリに紐づく**ので、別の
+`--data-dir` で起動すれば別の identity になる（1台で複数ノードを動かすため）。
+この鍵を失う、あるいは作り直すとノードIDが変わり、このレコードと
 `--connect` の指定はすべて無効になる。
 
 ## 確認

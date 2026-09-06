@@ -172,6 +172,18 @@ fn run_mining_thread(rx: std::sync::mpsc::Receiver<MineRequest>) {
     }
 }
 
+/// Summarise a chain tip for a client asking where the node stands.
+fn chroma_p2p_wire_chain_info(
+    cs: &chroma_consensus::ChainState,
+) -> crate::wire::ChainInfoMessage {
+    crate::wire::ChainInfoMessage {
+        height: cs.tip.height.0,
+        tip: cs.tip.hash,
+        bits: cs.tip.header.bits.0,
+        supply: cs.tip.supply,
+    }
+}
+
 /// Check that a data directory belongs to the network we are about to run.
 ///
 /// A data directory holds one network's chain, and nothing about the files
@@ -699,7 +711,11 @@ impl Node {
 
         let discovered = self
             .discovery
-            .discover_peers(self.peer_manager.clone(), &self.config.connect_addrs)
+            .discover_peers(
+                self.peer_manager.clone(),
+                &self.config.connect_addrs,
+                self.config.params.network,
+            )
             .await;
 
         let outbound_rx = self.outbound_rx.take().expect("run() called twice");
@@ -1734,7 +1750,40 @@ impl Node {
                 Ok(true)
             }
 
-            MessageType::Reject | MessageType::NotFound => Ok(true),
+            // Chain and account queries. A client cannot read the database
+            // while the node holds it, so it asks over the connection it
+            // already has — the same one it submits transactions on.
+            MessageType::GetChainInfo => {
+                let info = {
+                    let cs = ctx.chain_state.read().await;
+                    chroma_p2p_wire_chain_info(&cs)
+                };
+                Self::send(out_tx, Message::new(MessageType::ChainInfo, info.encode())).await?;
+                Ok(true)
+            }
+
+            MessageType::GetAccount => {
+                let request = crate::wire::GetAccountMessage::decode(&msg.payload)?;
+                let answer = {
+                    let cs = ctx.chain_state.read().await;
+                    let account = cs.state.get_account(&request.address);
+                    crate::wire::AccountMessage {
+                        address: request.address,
+                        exists: cs.state.has_account(&request.address),
+                        balance: account.balance,
+                        nonce: account.nonce,
+                    }
+                };
+                Self::send(out_tx, Message::new(MessageType::Account, answer.encode())).await?;
+                Ok(true)
+            }
+
+            // Answers to queries we did not ask, and the two notices that
+            // carry nothing to act on.
+            MessageType::ChainInfo
+            | MessageType::Account
+            | MessageType::Reject
+            | MessageType::NotFound => Ok(true),
         }
     }
 
@@ -2070,6 +2119,10 @@ impl Node {
         };
         use chroma_core::types::BlockHeight;
 
+        // Remembered so a retarget is reported as a change rather than
+        // repeated on every block.
+        let mut last_bits: Option<chroma_core::types::CompactTarget> = None;
+
         // The search runs on a thread of its own: it is pure CPU work, and
         // the fast-mode hasher it uses cannot cross threads. Dropping this
         // sender when the loop ends is what stops that thread.
@@ -2223,6 +2276,28 @@ impl Node {
                                     }
                                     let _ = event_tx.send(NodeEvent::BlockMined(block_hash, height));
                                     println!("Mined block #{}: {}", height, block_hash.to_hex());
+
+                                    // Only when it moves. Every block would be
+                                    // noise, but a retarget is what an operator
+                                    // wants to see, and there is no other way
+                                    // to watch it: the database cannot be read
+                                    // while the node holds it.
+                                    if Some(block.header.bits) != last_bits {
+                                        match last_bits {
+                                            Some(previous) => println!(
+                                                "Difficulty: 2^{} -> 2^{} hashes per block (bits {:#010x})",
+                                                previous.expected_hashes_log2(),
+                                                block.header.bits.expected_hashes_log2(),
+                                                block.header.bits.0
+                                            ),
+                                            None => println!(
+                                                "Difficulty: about 2^{} hashes per block (bits {:#010x})",
+                                                block.header.bits.expected_hashes_log2(),
+                                                block.header.bits.0
+                                            ),
+                                        }
+                                        last_bits = Some(block.header.bits);
+                                    }
 
                                     // Announce it, or the block never leaves
                                     // this node and the network forks.
